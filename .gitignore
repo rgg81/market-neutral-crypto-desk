@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-.env
 state/
+memory/
+.env
+uv.lock
