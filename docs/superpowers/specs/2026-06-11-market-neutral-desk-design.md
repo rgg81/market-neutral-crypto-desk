@@ -81,7 +81,7 @@ A **hard constraint** in portfolio construction, not telemetry.
 
 - **Dollar-neutral:** |Σ long$ − Σ short$| ≤ `dollar_band` (default 2–3% of per-side budget).
 - **Beta-neutral:** |Σᵢ wᵢ·βᵢ_BTC| ≤ `beta_band` (default 0.05 in equity-normalized β-$ terms), where βᵢ is each name's **rolling** beta to BTC (e.g. 30–60d, re-estimated each weekly cycle and monitored daily).
-- **BTC hedge leg:** a dedicated BTC-perp position absorbs the residual portfolio beta after the alpha legs are sized, so the alpha legs can stay dollar-balanced while net β ≈ 0.
+- **BTC hedge leg:** a dedicated BTC-perp position absorbs the residual portfolio beta. It is **sized jointly with the alpha legs inside the per-side budgets** (not added on top) — the optimizer solves dollar-balance, beta-neutrality, and gross ≈ $20k together, so the hedge consumes part of a side's budget rather than expanding gross exposure.
 - **Stress policy:** when realized correlations spike toward 1.0 (regime classifier flags it), tighten bands and increase the BTC hedge weight; the every-cycle reviewer re-derives the residual and HALTs if out of band.
 
 ---
