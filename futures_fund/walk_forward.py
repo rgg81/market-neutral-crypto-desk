@@ -6,6 +6,9 @@ threshold, not an in-sample grid win.
 """
 from __future__ import annotations
 
+from futures_fund.graduation import deflated_sharpe_pvalue
+from futures_fund.metrics import sharpe
+
 
 def walk_forward_splits(n_obs: int, *, n_splits: int = 4,
                         min_train: int = 20) -> list[tuple[range, range]]:
@@ -28,3 +31,23 @@ def walk_forward_splits(n_obs: int, *, n_splits: int = 4,
         test_stop = n_obs if k == n_splits - 1 else train_stop + chunk
         splits.append((range(0, train_stop), range(test_start, test_stop)))
     return splits
+
+
+def validate_sleeve_param(oos_returns: list[list[float]], *, num_trials: int,
+                          periods_per_year: float = 365.0,
+                          dsr_threshold: float = 0.95) -> dict:
+    """Gate a sleeve param/threshold change on out-of-sample evidence.
+
+    `oos_returns` is one return stream per walk-forward fold. Pools the folds, computes the OOS
+    Sharpe (annualized at `periods_per_year` — 365 daily / 52 weekly) and the Deflated-Sharpe
+    p-value deflated for `num_trials` (the number of param candidates tried). passed iff the OOS
+    Sharpe is > 0 AND the DSR p-value clears `dsr_threshold`.
+    """
+    pooled: list[float] = [r for fold in oos_returns for r in fold]
+    if len(pooled) < 10:
+        return {"passed": False, "oos_sharpe": 0.0, "dsr_pvalue": 0.0, "n_obs": len(pooled)}
+    oos_sharpe = sharpe(pooled, periods_per_year=periods_per_year)
+    dsr_p = deflated_sharpe_pvalue(pooled, num_trials=num_trials,
+                                   periods_per_year=periods_per_year)
+    passed = oos_sharpe > 0 and dsr_p >= dsr_threshold
+    return {"passed": passed, "oos_sharpe": oos_sharpe, "dsr_pvalue": dsr_p, "n_obs": len(pooled)}
