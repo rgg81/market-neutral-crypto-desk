@@ -64,13 +64,17 @@ def _base(symbol: str) -> str:
 
 
 def tag_instruments(title: str, symbols: list[str]) -> list[str]:
-    """Which of `symbols` (bases or unified) a headline mentions, by ticker or full name."""
+    """Which of `symbols` (bases or unified) a headline mentions, by ticker or full name.
+
+    Matches on WORD BOUNDARIES (not raw substrings) so common words don't produce spurious
+    tags: 'method' must not match 'eth', 'console'/'absolute' must not match 'sol',
+    'canada'/'nevada' must not match 'ada', 'ethernet' must not match 'eth'."""
     t = title.lower()
     out: list[str] = []
     for sym in symbols:
         b = _base(sym)
         kws = (b.lower(),) + _ALIASES.get(b, ())
-        if any(k in t for k in kws) and b not in out:
+        if any(re.search(rf"\b{re.escape(k)}\b", t) for k in kws) and b not in out:
             out.append(b)
     return out
 

@@ -44,6 +44,17 @@ def test_tag_instruments_handles_unified_symbols_and_no_dupes():
     assert tag_instruments("solana solana solana", ["SOLUSDT"]) == ["SOL"]
 
 
+def test_tag_instruments_word_boundary_avoids_substring_collisions():
+    # ticker/alias must be a WHOLE word, not a substring of a common word
+    assert tag_instruments("A new method for staking", ["ETH"]) == []     # 'eth' in 'method'
+    assert tag_instruments("The console shows absolute gains", ["SOL"]) == []  # 'sol' in console
+    assert tag_instruments("Canada and Nevada tighten rules", ["ADA"]) == []   # 'ada' in canada
+    assert tag_instruments("ethernet of finance", ["ETH"]) == []          # 'eth' in 'ethernet'
+    # but real whole-word mentions still tag
+    assert tag_instruments("ETH gas fees drop after the upgrade", ["ETH"]) == ["ETH"]
+    assert tag_instruments("Avalanche subnets expand", ["AVAX"]) == ["AVAX"]  # multi-word alias
+
+
 # ---- _clean_html (pure) ----
 
 def test_clean_html_strips_tags_decodes_entities_collapses_ws():
