@@ -336,7 +336,7 @@ def fail_soft_neutral(symbol: str, now: datetime) -> SentimentReport
 
 ```python
 def carry_signal(geometries: list[CoinGeometry], *, risk_budget_frac: float, now: datetime,
-                 top_frac: float = 0.33) -> SleeveSignal
+                 top_frac: float = 1 / 3) -> SleeveSignal
     # Rank by SIGNED funding_apr; long low/negative-funding, short high-positive-funding, delta-hedged.
     # Carry credit is UNCLAMPED (signed) so positive expected carry is visible (§6.1). sleeve="carry".
 ```

@@ -42,6 +42,21 @@ def test_carry_signal_top_frac_limits_legs():
     assert len(shorts) == 2
 
 
+def test_carry_signal_default_top_frac_is_exact_tercile():
+    # The default top_frac must be the exact tercile (1/3), matching the factor/sentiment
+    # sleeves' `tercile=1/3` convention -- NOT 0.33. For n=6 the two diverge:
+    # floor(6 * 1/3) = floor(2.0) = 2, but floor(6 * 0.33) = floor(1.98) = 1.
+    # Pin the agreed behavior on the default (no top_frac passed): 2 legs per side.
+    geos = [_geo(f"{c}/USDT:USDT", apr) for c, apr in
+            zip("ABCDEF", [0.3, 0.2, 0.1, -0.1, -0.2, -0.3], strict=True)]
+    sig = carry_signal(geos, risk_budget_frac=0.25, now=_NOW)
+    longs = [t for t in sig.tilts if t.direction == "long"]
+    shorts = [t for t in sig.tilts if t.direction == "short"]
+    assert len(longs) == 2
+    assert len(shorts) == 2
+    assert sig.diagnostics["k_per_side"] == 2
+
+
 def test_carry_signal_empty_geometries():
     sig = carry_signal([], risk_budget_frac=0.25, now=_NOW)
     assert sig.tilts == []
