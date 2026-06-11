@@ -55,12 +55,14 @@ def check_positions(
 ) -> dict:
     """Cheap between-cycle safety check (adapted from the weekly `monitor.check_positions`).
 
-    Alerts when any leg's mark sits within `liq_distance_min` of its liquidation price, and signals
-    HALT when drawdown-from-peak >= `max_drawdown` (the contract `Settings.max_drawdown_tolerance`).
-    Returns the alert list, the drawdown, and whether either of THESE two guards trips (the caller
-    ORs in the neutrality guard).
+    Signals HALT when EITHER guard trips: (a) drawdown-from-peak >= `max_drawdown` (the contract
+    `Settings.max_drawdown_tolerance`), or (b) any leg's mark sits within `liq_distance_min` of its
+    liquidation price (a leg approaching liquidation breaks the hedge it was paired into, so it must
+    halt — not merely alert). Returns the alert list, the drawdown, and whether either of THESE two
+    guards trips (the caller ORs in the neutrality guard).
     """
     alerts: list[str] = []
+    liq_breach = False
     for leg in legs:
         mark = leg.get("mark")
         liq = leg.get("liq_price")
@@ -68,12 +70,13 @@ def check_positions(
             continue
         dist = abs(mark - liq) / mark
         if dist <= liq_distance_min:
+            liq_breach = True
             alerts.append(
                 f"{leg['symbol']} within {dist:.2%} of liquidation"
                 f" (mark {mark}, liq {liq})"
             )
     drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
-    should_halt = drawdown >= max_drawdown
+    should_halt = drawdown >= max_drawdown or liq_breach
     if should_halt:
         alerts.append(f"drawdown {drawdown:.2%} >= halt tolerance {max_drawdown:.2%}")
     return {"alerts": alerts, "should_halt": should_halt, "drawdown": drawdown}

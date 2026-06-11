@@ -68,6 +68,39 @@ def imbalanced_book(tmp_path, monkeypatch) -> Path:
     return state
 
 
+@pytest.fixture
+def liq_book(tmp_path, monkeypatch) -> Path:
+    """A live book that is dollar- AND beta-neutral and well inside drawdown, but whose BTC leg
+    sits ~1% from its liquidation price — inside the 2.5x maintenance buffer. ONLY the liq-distance
+    trip fires, so this exercises the guard that must (independently) signal HALT."""
+    state = tmp_path / "state"
+    legs = [
+        # mark 60000, liq 59400 -> dist = 600/60000 = 1% < LIQ_DISTANCE_MIN (2.5%).
+        {"symbol": "BTC/USDT:USDT", "mark": 60000.0, "liq_price": 59400.0,
+         "notional": 5000.0, "beta_btc": 1.0},
+        {"symbol": "ETH/USDT:USDT", "mark": 3000.0, "liq_price": 6000.0,
+         "notional": -5000.0, "beta_btc": 1.0},
+    ]
+    _write_book(state, legs=legs, balance=20000.0, peak_equity=20000.0)
+    monkeypatch.chdir(tmp_path)
+    return state
+
+
+def test_monitor_trips_halt_on_liq_distance_breach(tmp_path, monkeypatch, liq_book):
+    halted = {}
+    monkeypatch.setattr(
+        "scripts.monitor_cli.load_settings", lambda *_a, **_k: Settings()
+    )
+    monkeypatch.setattr(
+        "scripts.monitor_cli.set_halt", lambda *_a, **_k: halted.setdefault("h", True)
+    )
+    from scripts.monitor_cli import main
+
+    rc = main([])
+    assert halted.get("h") is True
+    assert rc == 1
+
+
 def test_monitor_trips_halt_on_neutrality_breach(tmp_path, monkeypatch, imbalanced_book):
     halted = {}
     monkeypatch.setattr(
