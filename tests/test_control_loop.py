@@ -4,7 +4,64 @@ from pathlib import Path
 import pytest
 
 import futures_fund.control_loop as cl
-from futures_fund.control_loop import cadence_cycle_root, cadence_due
+from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt, TargetWeights
+from futures_fund.control_loop import cadence_cycle_root, cadence_due, weekly_selection
+from futures_fund.cycle_io import load_output
+from futures_fund.neutrality import NeutralityConfig
+
+NOW = datetime(2026, 6, 11, tzinfo=UTC)
+
+
+def _broad_geometries():
+    """A 6-name universe (3 long / 3 short) with a BALANCED beta structure, so a fully-deployed
+    dollar+beta-neutral book CAN respect the 25% per-name cap (feasible=True)."""
+    return [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.1, adv_usd=1e9),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.2, adv_usd=4e8),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=1.0, adv_usd=3e8),
+        CoinGeometry(symbol="ADA/USDT:USDT", mark=0.5, beta_btc=1.1, adv_usd=2e8),
+        CoinGeometry(symbol="DOGE/USDT:USDT", mark=0.15, beta_btc=1.2, adv_usd=2e8),
+    ]
+
+
+def _broad_sleeves(now):
+    """3 longs / 3 shorts so each side can spread its gross across enough names to stay under
+    the per-name cap (the band-respecting, feasible book)."""
+    return [SleeveSignal(
+        sleeve="factor", risk_budget_frac=1.0, as_of_ts=now,
+        tilts=[
+            SleeveTilt(symbol="BTC/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ADA/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ETH/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="DOGE/USDT:USDT", direction="short", target_weight=-0.5),
+        ],
+    )]
+
+
+def test_weekly_selection_runs_optimizer(tmp_path):
+    cfg = NeutralityConfig()
+    geometries = _broad_geometries()
+    sleeves = _broad_sleeves(NOW)
+    tw = weekly_selection(
+        tmp_path / "s", geometries, sleeves,
+        equity=20000.0, prior=None, cfg=cfg, cycle=1,
+    )
+    # returns a TargetWeights whose residuals are in band and which is feasible
+    assert isinstance(tw, TargetWeights)
+    assert tw.feasible is True
+    assert tw.dollar_residual_frac <= cfg.dollar_band + 1e-6
+    assert abs(tw.beta_residual) <= cfg.beta_band + 1e-6
+    # persisted under state/weekly/cycle/1/target_weights.json (cadence-segmented root)
+    persisted = tmp_path / "s" / "weekly" / "cycle" / "1" / "target_weights.json"
+    assert persisted.exists()
+    reloaded = TargetWeights.model_validate(
+        load_output(tmp_path / "s", 1, "target_weights", cadence="weekly")
+    )
+    assert reloaded.feasible is True
+    assert [leg.symbol for leg in reloaded.legs] == [leg.symbol for leg in tw.legs]
 
 
 def test_cadence_due_weekly_delegates_with_weekly_root(tmp_path, monkeypatch):
