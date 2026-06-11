@@ -134,3 +134,17 @@ def test_skill_md_keeps_live_false_and_standdown_contract() -> None:
     body = SKILL_PATH.read_text()
     assert "live" in body and "false" in body, "SKILL.md must affirm `live` stays false"
     assert "management" in body, "SKILL.md must state the empty-`management` stand-down contract"
+
+
+def test_skill_md_named_clis_exist_on_disk() -> None:
+    """Every CLI the ladders name must EXIST as a script on disk — not merely be mentioned."""
+    body = SKILL_PATH.read_text()
+    expected = [
+        "runlock_cli.py", "due_check.py", "scout_cli.py", "preflight.py",
+        "cycle_prep_cli.py", "control_loop_cli.py", "reviewer_cli.py",
+        "gate_execute_cli.py", "record_lessons_cli.py", "promote_lesson_cli.py",
+        "reflect_cli.py", "monitor_cli.py", "run_paper_cli.py", "dashboard_cli.py",
+    ]
+    for cli in expected:
+        assert cli in body, f"SKILL.md must name the provenanced CLI {cli}"
+        assert (Path("scripts") / cli).exists(), f"named CLI scripts/{cli} is missing on disk"

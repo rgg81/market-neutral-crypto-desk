@@ -57,8 +57,11 @@ artifact writer share this one root.
 **W2 — Due-check.** `due_check.py state --loop weekly`. On `SKIP:` release the lock and stop; otherwise
 take the cycle number `N` from `DUE FRESH/RETRY N`.
 
-**W3 — Universe Scout + preflight.** `scout_cli.py` -> candidates; `preflight.py` audits closes,
-folds in every held symbol, builds per-symbol briefs + market context -> `universe.json`.
+**W3 — Universe Scout + preflight + cycle-prep.** `scout_cli.py` -> `universe.json`; `preflight.py`
+audits closes, folds in every held symbol, builds per-symbol briefs -> `context.json`;
+`cycle_prep_cli.py --cadence weekly --cycle N` builds the cycle's geometry/sleeve/pair/spread
+artifacts (`geometries.json`, `sleeves.json`, `pairs.json`, `spreads.json`) the constructor and
+reviewer consume. The analysts reason over these artifacts; the optimizer owns the numbers.
 
 **W4 — Parallel analysts (opus).** Dispatch `funding_carry`, `pair_analyst`, `factor_analyst`,
 `sentiment` (deep), `technical`, `derivatives` with their lane inputs -> `analyst_reports.json`,
@@ -103,9 +106,9 @@ demotes / retires existing lessons.
 **D2 — Due-check.** `due_check.py state --loop daily`. On `SKIP:` release the lock and stop; otherwise
 take the cycle number `N`.
 
-**D3 — Sentiment refresh + recompute.** Dispatch `sentiment` (light) and recompute drift / z-scores /
-funding / neutrality -> updated geometry, `sentiment.json`. The same symbol set as the weekly meeting;
-trade only drift/breaches.
+**D3 — Sentiment refresh + cycle-prep.** Dispatch `sentiment` (light); `cycle_prep_cli.py --cadence
+daily --cycle N` rebuilds the daily geometry/sleeve/pair/spread artifacts (drift / z-scores / funding /
+neutrality) for the SAME symbol set as the weekly meeting; trade only drift/breaches.
 
 **D4 — Neutrality Constructor (CODE).** `control_loop_cli.py --cadence daily --cycle N` reprojects the
 dollar+beta-neutral book -> `target_weights.json`.
@@ -123,6 +126,15 @@ the non-overridable risk gate and executes -> `report.json`.
 `runlock_cli.py release --owner daily` (always, even on error).
 
 ---
+
+## Run the whole desk (one command) + read the dashboard
+The dual-cadence run is glued together by the deterministic driver `run_paper_cli.py`, which
+serializes WEEKLY-then-DAILY under ONE run lock and walks both ladders (scout -> cycle-prep ->
+control loop -> reviewer -> execute -> equity -> reflect):
+- `uv run python scripts/run_paper_cli.py` (or `--now <ISO>` to pin the instant offline).
+After a run, read the KPI dashboard (primary KPI `no_losing_month`; secondary daily Sharpe ×365):
+- `uv run python scripts/dashboard_cli.py --format both`.
+PAPER-ONLY: `run_paper_cli.py` never sends a live order; the execute boundary records what WOULD fill.
 
 ## Between cycles — monitor tripwire
 `monitor_cli.py` runs on a FASTER cron between meetings and trips HALT on drawdown / liq-distance /
