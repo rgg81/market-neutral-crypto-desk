@@ -343,11 +343,18 @@ def check_pair_pnl(spreads: list[Spread], pairs: list[Pair]) -> list[ReviewerChe
     """Re-derive pair PnL at the SPREAD level and the leg hedge-ratio sizing — emit BOTH
     `pair_pnl_attribution` and `pair_leg_hedge_ratio` (canonical names 9 + 10).
 
-    - `pair_pnl_attribution`: PnL is attributed at the spread (not per-leg) level. A spread is a
-      directional position in the traded unit (`y - hedge_ratio*x`); its PnL is
-      `side * qty_y * (spread_value - mu)` where `side = +1` for `long_spread` (long the spread),
-      `-1` for `short_spread`, and `mu` is the OU entry/mean anchor. The reviewer recomputes that
-      and compares to the artifact's stated `realized_pnl` within `_TOL`.
+    - `pair_pnl_attribution`: PnL is attributed at the spread (not per-leg) level and measured
+      SINCE ENTRY (standard realized PnL), not mark-to-mean. A spread is a directional position in
+      the traded unit (`y - hedge_ratio*x`); its PnL is
+      `side * qty_y * (spread_value - entry_spread)` where `side = +1` for `long_spread` (long the
+      spread), `-1` for `short_spread`. A mean-reversion pair NEVER enters at the OU mean `mu`: it
+      opens at `|z| >= entry_z`, so the entry spread is `mu - side*entry_z*sigma_eq` (a long_spread
+      enters cheap at `z = -entry_z`, a short_spread enters rich at `z = +entry_z`). The reviewer
+      reconstructs the entry spread from the OU params (`mu`, `sigma_eq` from the Pair) and the
+      spread's own `entry_z`, then compares the re-derived PnL-since-entry to the artifact's stated
+      `realized_pnl` within `_TOL`. (Anchoring on `mu` would only coincide with PnL-since-entry for
+      a position entered exactly at the mean — which a mean-reversion entry never is — so this
+      re-derivation matches production attribution.)
     - `pair_leg_hedge_ratio`: the x leg MUST be sized at `hedge_ratio * qty_y` (otherwise the pair
       carries a residual single-name exposure); `|qty_x - hedge_ratio*qty_y|` must be within
       tolerance."""
@@ -355,17 +362,26 @@ def check_pair_pnl(spreads: list[Spread], pairs: list[Pair]) -> list[ReviewerChe
 
     attribution_ok = True
     worst_attr = 0.0
+    worst_expected_pnl = 0.0  # re-derived PnL of the worst-divergence spread (adversarial expected)
+    worst_stated_pnl = 0.0    # the artifact's stated realized_pnl for that spread (actual)
     hedge_ok = True
     worst_hedge = 0.0
     for s in spreads:
         p = pair_by_id.get(s.pair_id)
         if p is None:
             continue
-        # spread-level PnL re-derivation
+        # spread-level PnL re-derivation, measured SINCE ENTRY (not mark-to-mean). A
+        # mean-reversion pair opens at |z| >= entry_z, never at the mean: a long_spread enters
+        # cheap (z = -entry_z), a short_spread enters rich (z = +entry_z), so the entry spread is
+        # mu - side*entry_z*sigma_eq. PnL = side * qty_y * (spread_now - entry_spread).
         side = 1.0 if s.state == "long_spread" else (-1.0 if s.state == "short_spread" else 0.0)
-        expected_pnl = side * s.qty_y * (s.spread_value - p.mu)
+        entry_spread = p.mu - side * s.entry_z * p.sigma_eq
+        expected_pnl = side * s.qty_y * (s.spread_value - entry_spread)
         attr_err = abs(expected_pnl - s.realized_pnl)
-        worst_attr = max(worst_attr, attr_err)
+        if attr_err >= worst_attr:
+            worst_attr = attr_err
+            worst_expected_pnl = expected_pnl
+            worst_stated_pnl = s.realized_pnl
         if attr_err > _TOL * max(1.0, abs(expected_pnl), abs(s.realized_pnl)):
             attribution_ok = False
         # hedge-ratio sizing re-derivation
@@ -378,11 +394,12 @@ def check_pair_pnl(spreads: list[Spread], pairs: list[Pair]) -> list[ReviewerChe
     attribution_check = ReviewerCheck(
         name="pair_pnl_attribution",
         ok=attribution_ok,
-        expected=worst_attr,
-        actual=worst_attr,
+        expected=worst_expected_pnl,
+        actual=worst_stated_pnl,
         tolerance=_TOL,
         detail=(
-            f"re-derived spread-level PnL; worst |expected - stated| = {worst_attr:.6f}"
+            f"re-derived spread-level PnL-since-entry = {worst_expected_pnl:.6f} vs stated "
+            f"{worst_stated_pnl:.6f} (worst |expected - stated| = {worst_attr:.6f})"
         ),
     )
     hedge_check = ReviewerCheck(
@@ -453,17 +470,26 @@ def check_sharpe_annualization(cadence: Cadence) -> ReviewerCheck:
 
 
 def _round_qty_to_step(qty: float, step: float) -> float:
-    """Floor a quantity onto the lot-step grid — the SAME rounding the executor applies to an order
-    before submission (floor, never round-up, so the book never over-fills). `step <= 0` => no
-    constraint (qty passes through). Mirrors `orders.round_qty` in the weekly executor."""
+    """Floor a quantity onto the lot-step grid (floor, never round-up, so the book never
+    over-fills). `step <= 0` => no constraint (qty passes through).
+
+    This DEFINES the qty grid-rounding contract any future order-submission path must satisfy: the
+    market-neutral repo has no executor / order-rounding primitive yet, so there is nothing to
+    cross-derive against. The contract is the floor-to-`step_size` semantics of the weekly
+    reference `orders.round_qty` (weekly repo `futures_fund/orders.py`); when an executor is ported
+    here it MUST round identically or this check will (correctly) diverge from the submitted
+    order."""
     if step <= 0:
         return qty
     return round(math.floor(qty / step) * step, 10)
 
 
 def _round_price_to_tick(price: float, tick: float) -> float:
-    """Round a price onto the tick grid (nearest tick) — the SAME rounding the executor applies to
-    a price before submission. `tick <= 0` => no constraint. Mirrors `orders.round_price`."""
+    """Round a price onto the tick grid (nearest tick). `tick <= 0` => no constraint.
+
+    Like `_round_qty_to_step`, this DEFINES the price grid-rounding contract (nearest-`tick_size`)
+    the future executor must satisfy; there is no executor price-rounding primitive in this repo to
+    cross-derive against yet (it matches the weekly reference `orders.round_price` semantics)."""
     if tick <= 0:
         return price
     return round(round(price / tick) * tick, 10)
@@ -475,12 +501,15 @@ def check_exchange_filters(
     """Re-derive exchange-filter compliance for the ORDER THAT WOULD ACTUALLY BE SUBMITTED for each
     leg from its `SymbolSpec` (canonical name 13).
 
-    Real Binance-futures filter compliance is about the qty/price the executor submits AFTER
-    grid-rounding (`orders.round_qty` floors qty to `step_size`; `orders.round_price` rounds price
-    to `tick_size`) — NOT whether the raw `|notional|/mark` ratio happens to land on the step grid
-    (for an arbitrary notional ÷ arbitrary mark it almost never does, which would false-positive on
-    every realistic book). So the reviewer rounds qty/price exactly as the executor would and then
-    checks the REAL exchange constraints:
+    Real Binance-futures filter compliance is about the qty/price an order carries AFTER
+    grid-rounding (qty floored to `step_size`, price rounded to `tick_size`) — NOT whether the raw
+    `|notional|/mark` ratio happens to land on the step grid (for an arbitrary notional ÷ arbitrary
+    mark it almost never does, which would false-positive on every realistic book). This repo has no
+    order-submission path yet, so the reviewer cannot cross-derive against a real executor; instead
+    `_round_qty_to_step` / `_round_price_to_tick` DEFINE the grid-rounding contract the future
+    executor must satisfy (floor-to-step qty, nearest-tick price — the weekly reference
+    `orders.round_qty` / `orders.round_price` semantics). The reviewer applies that contract and
+    then checks the REAL exchange constraints:
 
       - the floored qty must be > 0 (a leg that rounds to a zero lot can't be submitted), and
       - the executable notional (rounded_qty × rounded_price) must be >= `min_notional`.

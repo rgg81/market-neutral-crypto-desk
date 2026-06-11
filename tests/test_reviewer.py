@@ -414,6 +414,73 @@ def test_pair_pnl_at_spread_level(make_tw):  # noqa: ARG001
     assert attribution.ok is False  # 999999 nowhere near the re-derived spread PnL
 
 
+def test_pair_pnl_at_spread_level_ok_long():
+    # GREEN PATH: PnL is measured SINCE ENTRY, not mark-to-mean. A mean-reversion long_spread
+    # entered at z = -entry_z (cheap), so entry_spread = mu - entry_z*sigma_eq = 0 - 2*1 = -2.0.
+    # With spread now 0.5 and qty_y 10, realized PnL = 1 * 10 * (0.5 - (-2.0)) = 25.0. An artifact
+    # that correctly states that value passes (ok=True) — exercising the formula on a realistically
+    # entered spread (it never enters at the OU mean, so a mark-to-mean check would mis-report it).
+    pair = _pair()  # mu=0.0, sigma_eq=1.0, hedge_ratio=2.0
+    spread = Spread(
+        pair_id=pair.pair_id,
+        spread_value=0.5,
+        zscore=0.5,
+        state="long_spread",
+        entry_z=2.0,
+        qty_y=10.0,
+        qty_x=20.0,            # hedge_ratio * qty_y
+        realized_pnl=25.0,     # side * qty_y * (spread_now - entry_spread) = 1*10*(0.5-(-2.0))
+    )
+    checks = check_pair_pnl([spread], [pair])
+    attribution = next(c for c in checks if c.name == "pair_pnl_attribution")
+    assert attribution.ok is True
+    assert attribution.expected == pytest.approx(25.0)
+    assert attribution.actual == pytest.approx(25.0)
+
+
+def test_pair_pnl_at_spread_level_ok_short():
+    # GREEN PATH (short side): a short_spread enters at z = +entry_z (rich), so
+    # entry_spread = mu + entry_z*sigma_eq = 0 + 2*1 = 2.0. With spread now 0.5 and qty_y 10,
+    # realized PnL = -1 * 10 * (0.5 - 2.0) = 15.0. The sign flips with the spread direction.
+    pair = _pair()  # mu=0.0, sigma_eq=1.0
+    spread = Spread(
+        pair_id=pair.pair_id,
+        spread_value=0.5,
+        zscore=-0.5,
+        state="short_spread",
+        entry_z=2.0,
+        qty_y=10.0,
+        qty_x=20.0,
+        realized_pnl=15.0,     # side * qty_y * (spread_now - entry_spread) = -1*10*(0.5-2.0)
+    )
+    checks = check_pair_pnl([spread], [pair])
+    attribution = next(c for c in checks if c.name == "pair_pnl_attribution")
+    assert attribution.ok is True
+    assert attribution.expected == pytest.approx(15.0)
+
+
+def test_pair_pnl_mark_to_mean_is_rejected():
+    # REGRESSION GUARD: the old mark-to-mean formula (side * qty_y * (spread_now - mu)) would
+    # mis-attribute a realistically entered spread. For the long_spread above, mark-to-mean would
+    # claim 1*10*(0.5 - 0.0) = 5.0, but PnL-since-entry is 25.0. An artifact carrying the
+    # mark-to-mean value (5.0) must NOW be flagged (ok=False) — i.e. the check no longer anchors on
+    # mu and will not false-pass a mark-to-mean book.
+    pair = _pair()
+    spread = Spread(
+        pair_id=pair.pair_id,
+        spread_value=0.5,
+        zscore=0.5,
+        state="long_spread",
+        entry_z=2.0,
+        qty_y=10.0,
+        qty_x=20.0,
+        realized_pnl=5.0,      # the OLD mark-to-mean value 1*10*(0.5 - mu=0.0) -- now WRONG
+    )
+    checks = check_pair_pnl([spread], [pair])
+    attribution = next(c for c in checks if c.name == "pair_pnl_attribution")
+    assert attribution.ok is False
+
+
 def test_pair_legs_sized_by_hedge_ratio():
     # The hedge-ratio check verifies the x leg is sized at hedge_ratio * qty_y. A spread whose
     # qty_x is NOT hedge_ratio*qty_y leaves a residual beta in the pair => ok=False.
