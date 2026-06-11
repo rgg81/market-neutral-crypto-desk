@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
@@ -9,8 +10,14 @@ from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
 
-from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt
-from futures_fund.models import SleeveName
+from futures_fund.contracts import (
+    CoinGeometry,
+    SleeveSignal,
+    SleeveTilt,
+    TargetWeights,
+    WeightLeg,
+)
+from futures_fund.models import RegimeState, SleeveName
 
 
 class NeutralityConfig(BaseModel):
@@ -382,3 +389,237 @@ def apply_conviction_tilts(
         )
         out.append(leg.model_copy(update={"target_weight": tilted}))
     return out
+
+
+def _apply_turnover_band(
+    weights: dict[str, float],
+    prior_weights: dict[str, float],
+    *,
+    drift_band: float,
+    turnover_penalty: float,
+) -> tuple[dict[str, float], float]:
+    """No-trade drift band + L1 turnover penalty, applied BEFORE the final projection so the
+    projection has the last say on neutrality. A symbol PRESENT in the prior whose target is
+    within `drift_band` of its prior weight keeps the prior weight (no churn); otherwise it
+    moves to target, shrunk toward prior by `turnover_penalty` (L1 damping). A symbol ABSENT
+    from the prior (prior == 0) is ALWAYS-TRADE: it is never snapped to 0 by the band, so a
+    fresh sub-drift-band leg survives the rebalance. Returns (adjusted_weights, l1_turnover)."""
+    out: dict[str, float] = {}
+    for sym, target in weights.items():
+        if sym not in prior_weights:
+            # fresh name: always trade (do not let the no-trade band delete it)
+            out[sym] = target
+            continue
+        prior = prior_weights[sym]
+        denom = abs(prior) if abs(prior) > 1e-12 else 1.0
+        if abs(target - prior) / denom <= drift_band:
+            out[sym] = prior
+        else:
+            out[sym] = target - turnover_penalty * (target - prior)
+    l1 = sum(abs(out[s] - prior_weights.get(s, 0.0)) for s in out)
+    return out, l1
+
+
+def _scale_to_deploy_target(
+    weights: dict[str, float], hedge_notional: float, *, equity: float,
+    side_budget: float, deploy_target_frac: float,
+) -> tuple[dict[str, float], float]:
+    """Scale the projected (dollar+beta-neutral) book by a SINGLE positive scalar so the
+    larger side's gross equals `deploy_target_frac * side_budget`. A positive scalar preserves
+    BOTH neutralities exactly (Sum(k*w)=0, Sum(k*w*beta)=0) and scales each side's gross
+    equally, so this restores the deployment floor WITHOUT re-breaking neutrality. The hedge
+    notional is scaled by the same factor (it is part of the neutral vector). Returns
+    (scaled_weights, scaled_hedge_notional)."""
+    long_gross = sum(w for w in weights.values() if w > 0.0) * equity
+    short_gross = -sum(w for w in weights.values() if w < 0.0) * equity
+    # include the hedge in the side it sits on
+    if hedge_notional > 0.0:
+        long_gross += hedge_notional
+    elif hedge_notional < 0.0:
+        short_gross += -hedge_notional
+    larger = max(long_gross, short_gross)
+    if larger <= 0.0:
+        return dict(weights), hedge_notional
+    target_side_usd = deploy_target_frac * side_budget
+    k = target_side_usd / larger
+    return {s: w * k for s, w in weights.items()}, hedge_notional * k
+
+
+def optimize_book(
+    sleeves: list[SleeveSignal],
+    geometries: list[CoinGeometry],
+    *,
+    equity: float,
+    prior_legs: list[WeightLeg] | None,
+    cfg: NeutralityConfig,
+    regime: RegimeState | None = None,
+    returns: pd.DataFrame | None = None,
+) -> TargetWeights:
+    """THE solver. Merge sleeves -> sentiment tilts -> HRP-shape (Ledoit-Wolf -> HRP) ->
+    per-name & cluster caps -> turnover/no-trade band (vs prior) -> size BTC hedge on the
+    alpha legs' residual beta (real DOF) and append it -> project alpha+hedge onto the
+    dollar+beta-neutral set -> scale the neutral book to the per-side deployment target
+    (single positive scalar, preserves neutrality) -> assemble TargetWeights with residuals
+    + per-side deployment. Stress-tightens bands under a correlation-spike regime. Sets
+    feasible=False (never silently un-neutral / under-deployed) if the bands or the floor
+    cannot be met. `returns` (optional) is the per-symbol return frame used to build the
+    Ledoit-Wolf covariance for HRP shaping; without it the merged split is used."""
+    betas = {g.symbol: g.beta_btc for g in geometries}
+
+    # Stress-tighten bands under a correlation-spike regime.
+    band_mult = 1.0
+    if regime is not None and regime.quadrant in (
+        "high_vol_trend", "high_vol_range", "transition"
+    ):
+        band_mult = cfg.stress_band_mult
+    dollar_band = cfg.dollar_band * band_mult
+    beta_band = cfg.beta_band * band_mult
+
+    # 1. assign risk budgets + merge sleeve tilts into one signed vector
+    risk_parity_budgets(sleeves)
+    merged = merge_sleeves(sleeves, geometries)
+
+    # 2. apply sentiment conviction tilts BEFORE projection (sign-preserving, capped)
+    tilted_tilts = apply_conviction_tilts(
+        [SleeveTilt(symbol=s, direction="long" if w >= 0 else "short", target_weight=w)
+         for s, w in merged.items()],
+        geometries,
+    )
+    weights = {t.symbol: t.target_weight for t in tilted_tilts}
+
+    # 3. HRP shaping: Ledoit-Wolf shrunk covariance -> HRP -> reshape per-name split per side
+    if returns is not None and not returns.empty:
+        labels = [s for s in weights if s in returns.columns]
+        if len(labels) >= 2:
+            cov = ledoit_wolf_cov(returns[labels])
+            hrp = hrp_weights(cov, labels)
+            weights = apply_hrp_weights(weights, hrp)
+
+    # 4. per-name + cluster caps
+    weights = apply_per_name_cap(weights, per_name_cap=cfg.per_name_cap)
+    corr: dict[tuple[str, str], float] = {}  # no cross-corr snapshot in pure-math layer
+    weights = apply_cluster_cap(
+        weights, corr=corr, cluster_cap=cfg.cluster_cap, threshold=cfg.corr_threshold
+    )
+
+    # 5. turnover / no-trade band vs the prior book — BEFORE projection (fresh names always-trade)
+    prior_weights = {leg.symbol: leg.weight for leg in (prior_legs or [])
+                     if leg.sleeve != "hedge"}
+    turnover_l1 = 0.0
+    if prior_weights:
+        weights, turnover_l1 = _apply_turnover_band(
+            weights, prior_weights,
+            drift_band=cfg.drift_band, turnover_penalty=cfg.turnover_penalty,
+        )
+
+    # 6. size the BTC hedge on the ALPHA legs' residual beta (real DOF) and append it, then
+    #    project the alpha+hedge vector onto the dollar+beta-neutral set. With the hedge
+    #    appended there are >= 3 names, so projection yields a non-trivial neutral book.
+    hedge_notional = size_btc_hedge(
+        weights, betas, equity=equity, side_budget=cfg.side_budget_usdt
+    )
+    proj_in = dict(weights)
+    proj_betas = dict(betas)
+    btc = "BTC/USDT:USDT"
+    if abs(hedge_notional) > 1e-9:
+        proj_in[btc] = proj_in.get(btc, 0.0) + hedge_notional / equity
+        proj_betas.setdefault(btc, 1.0)
+    projected = project_neutral(proj_in, proj_betas, dollar_band=dollar_band, beta_band=beta_band)
+    # split the projected BTC weight back into (alpha BTC leg, hedge): the hedge keeps the
+    # residual-beta share, the rest stays an alpha BTC leg. We carry the hedge as its own leg.
+    hedge_weight = hedge_notional / equity if equity > 0 else 0.0
+    alpha_weights = dict(projected)
+    if abs(hedge_notional) > 1e-9:
+        alpha_weights[btc] = projected.get(btc, 0.0) - hedge_weight
+        if abs(alpha_weights[btc]) < 1e-12:
+            alpha_weights.pop(btc, None)
+
+    # 7. scale the neutral book up to the per-side deployment target (preserves neutrality)
+    alpha_weights, hedge_notional = _scale_to_deploy_target(
+        alpha_weights, hedge_notional, equity=equity,
+        side_budget=cfg.side_budget_usdt, deploy_target_frac=cfg.deploy_target_frac,
+    )
+
+    # 8. assemble legs (alpha legs) + the hedge leg
+    legs: list[WeightLeg] = []
+    notionals: dict[str, float] = {}
+    full_weights: dict[str, float] = {}
+    full_betas: dict[str, float] = {}
+    for sym, w in alpha_weights.items():
+        if abs(w) < 1e-9:
+            continue
+        notional = w * equity
+        notionals[sym] = notional
+        full_weights[sym] = w
+        full_betas[sym] = betas.get(sym, 1.0)
+        legs.append(WeightLeg(
+            symbol=sym,
+            direction="long" if w > 0 else "short",
+            weight=w,
+            target_notional=notional,
+            beta_btc=betas.get(sym, 1.0),
+            sleeve=_dominant_sleeve(sym, sleeves),
+        ))
+    if abs(hedge_notional) > 1.0:
+        hedge_w = hedge_notional / equity
+        notionals["__hedge__"] = hedge_notional
+        full_weights["__hedge__"] = hedge_w
+        full_betas["__hedge__"] = 1.0
+        legs.append(WeightLeg(
+            symbol=btc,
+            direction="long" if hedge_notional > 0 else "short",
+            weight=hedge_w,
+            target_notional=hedge_notional,
+            beta_btc=1.0,
+            sleeve="hedge",
+        ))
+
+    # residuals + per-side deployment (include hedge leg in dollar/beta sums)
+    d_resid = dollar_residual(full_weights, notionals)
+    d_resid_frac = abs(d_resid) / cfg.side_budget_usdt if cfg.side_budget_usdt > 0 else 0.0
+    b_resid = beta_residual(full_weights, full_betas)
+    gross_long = sum(n for n in notionals.values() if n > 0)
+    gross_short = sum(-n for n in notionals.values() if n < 0)
+    deploy_long = gross_long / cfg.side_budget_usdt if cfg.side_budget_usdt > 0 else 0.0
+    deploy_short = gross_short / cfg.side_budget_usdt if cfg.side_budget_usdt > 0 else 0.0
+
+    feasible = (
+        d_resid_frac <= dollar_band + 1e-6
+        and abs(b_resid) <= beta_band + 1e-6
+        and deploy_long >= cfg.deployment_floor - 1e-6
+        and deploy_short >= cfg.deployment_floor - 1e-6
+        and deploy_long <= (1.0 - cfg.dry_powder_frac) + 1e-6
+        and deploy_short <= (1.0 - cfg.dry_powder_frac) + 1e-6
+    )
+    notes: list[str] = []
+    if not feasible:
+        notes.append("constraint set infeasible: residual or deployment-floor breach")
+
+    return TargetWeights(
+        legs=legs,
+        btc_hedge_notional=hedge_notional,
+        dollar_residual=d_resid,
+        dollar_residual_frac=d_resid_frac,
+        beta_residual=b_resid,
+        gross_long=gross_long,
+        gross_short=gross_short,
+        deploy_long_frac=deploy_long,
+        deploy_short_frac=deploy_short,
+        gross_notional=gross_long + gross_short,
+        turnover_l1=turnover_l1,
+        feasible=feasible,
+        notes=notes,
+        as_of_ts=datetime.now(UTC),
+    )
+
+
+def _dominant_sleeve(symbol: str, sleeves: list[SleeveSignal]) -> SleeveName:
+    """The sleeve contributing the largest |budgeted tilt| to this symbol (source attribution)."""
+    best: tuple[float, SleeveName] = (-1.0, "factor")
+    for s in sleeves:
+        for t in s.tilts:
+            if t.symbol == symbol:
+                contrib = abs(t.target_weight) * s.risk_budget_frac
+                if contrib > best[0]:
+                    best = (contrib, s.sleeve)
+    return best[1]
