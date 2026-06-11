@@ -7,6 +7,9 @@ from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
 
+from futures_fund.contracts import CoinGeometry, SleeveSignal
+from futures_fund.models import SleeveName
+
 
 class NeutralityConfig(BaseModel):
     capital_usdt: float = 20000.0
@@ -122,3 +125,71 @@ def hrp_weights(cov: np.ndarray, labels: list[str]) -> dict[str, float]:
                 weights[idx] *= 1.0 - alpha
     weights /= weights.sum()
     return {labels[i]: float(weights[i]) for i in range(n)}
+
+
+def risk_parity_budgets(
+    sleeves: list[SleeveSignal], *, cov: np.ndarray | None = None
+) -> dict[SleeveName, float]:
+    """Risk-parity (or inverse-vol) budget across the sleeves; writes the result back onto
+    each SleeveSignal.risk_budget_frac and returns the {sleeve: frac} map. Sums to 1.0.
+    With no covariance supplied, falls back to an equal (inverse-unit-vol) split."""
+    if not sleeves:
+        return {}
+    if cov is None or cov.shape[0] != len(sleeves):
+        raw = np.ones(len(sleeves))
+    else:
+        vol = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+        raw = 1.0 / vol
+    fracs = raw / raw.sum()
+    out: dict[SleeveName, float] = {}
+    for s, f in zip(sleeves, fracs, strict=True):
+        s.risk_budget_frac = float(f)
+        out[s.sleeve] = float(f)
+    return out
+
+
+def merge_sleeves(
+    sleeves: list[SleeveSignal], geometries: list[CoinGeometry]
+) -> dict[str, float]:
+    """Combine already-risk-budgeted sleeve tilts into one signed pre-projection weight
+    vector. Each tilt's signed target_weight is scaled by its sleeve risk_budget_frac and
+    summed per symbol."""
+    known = {g.symbol for g in geometries}
+    merged: dict[str, float] = {}
+    for s in sleeves:
+        for tilt in s.tilts:
+            if tilt.symbol not in known:
+                continue
+            merged[tilt.symbol] = merged.get(tilt.symbol, 0.0) + (
+                tilt.target_weight * s.risk_budget_frac
+            )
+    return merged
+
+
+def apply_hrp_weights(
+    weights: dict[str, float], hrp: dict[str, float]
+) -> dict[str, float]:
+    """Reshape a signed weight vector so each side's per-name split follows the HRP weights,
+    WITHOUT changing any sign or either side's total gross. This is how Ledoit-Wolf -> HRP
+    (Task 8) actually shapes the book (spec §8): for each side, redistribute that side's gross
+    across its names in proportion to the names' HRP weights (re-normalized within the side).
+    Returns `weights` unchanged if `hrp` is empty (HRP unavailable / single name)."""
+    if not hrp:
+        return dict(weights)
+    longs = {s: w for s, w in weights.items() if w > 0.0}
+    shorts = {s: w for s, w in weights.items() if w < 0.0}
+    out: dict[str, float] = {s: w for s, w in weights.items() if w == 0.0}
+    for side in (longs, shorts):
+        if not side:
+            continue
+        side_gross = sum(abs(w) for w in side.values())
+        sign = 1.0 if next(iter(side.values())) > 0.0 else -1.0
+        hrp_side = {s: hrp.get(s, 0.0) for s in side}
+        hrp_sum = sum(hrp_side.values())
+        if hrp_sum <= 0.0:
+            # HRP has no info for this side's names: keep the original split.
+            out.update(side)
+            continue
+        for s in side:
+            out[s] = sign * side_gross * (hrp_side[s] / hrp_sum)
+    return out
