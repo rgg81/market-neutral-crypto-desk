@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from futures_fund.models import (
+    Cadence,
     Direction,
     PairTestMethod,
     SentimentLevel,
@@ -257,3 +258,29 @@ class Lesson(BaseModel):
     state: LessonState = "candidate"              # Reflector proposes; eval harness promotes
     confirmations: int = 0
     provenance: list[str] = Field(default_factory=list)  # source journal decision id(s)
+
+
+class ReviewerCheck(BaseModel):
+    """One re-derived adversarial code/calc check (§10 Guardian, §12). The reviewer NEVER trusts
+    an artifact's stated number — it recomputes `expected` from ground truth and compares it to
+    the `actual` it found in the artifact, within `tolerance`. `name` is one of the canonical,
+    verbatim check ids the gate keys off."""
+    name: str                                     # canonical check id (see the canonical set)
+    ok: bool
+    expected: float | str | None = None           # reviewer's ground-truth re-derivation
+    actual: float | str | None = None             # value found in the artifact under review
+    tolerance: float = 1e-6
+    detail: str = ""
+
+
+class ReviewerVerdict(BaseModel):
+    """Every-cycle reviewer verdict. `passed` is the AND of every canonical check and is the
+    DETERMINISTIC flag `reviewer_gate_ok` reads; the execute step HALTs (`SystemExit(2)`) if it is
+    absent or false (§10 mandatory non-skippable stage). `mismatches` is exactly the names of the
+    failed checks (`[c.name for c in checks if not c.ok]`)."""
+    passed: bool
+    checks: list[ReviewerCheck] = Field(default_factory=list)
+    mismatches: list[str] = Field(default_factory=list)
+    cycle: int
+    cadence: Cadence
+    reviewed_at: datetime
