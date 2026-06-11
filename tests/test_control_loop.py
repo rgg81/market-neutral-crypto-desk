@@ -25,6 +25,7 @@ from futures_fund.control_loop import (
 )
 from futures_fund.cycle_io import load_output, save_output
 from futures_fund.neutrality import NeutralityConfig
+from futures_fund.reviewer import review_cycle
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
@@ -239,8 +240,11 @@ def _stop_spread(pair_id: str) -> Spread:
 
 def test_daily_rebalance_same_set(tmp_path):
     # Daily Rebalance Meeting (§9): keep the SAME symbol set as the weekly target, recompute
-    # residuals/z/funding/sentiment, and (with an in-band book and no z-stops) emit ZERO delta legs
-    # so the carry-over book is not churned. Still persists a TargetWeights under the daily root.
+    # residuals/z/funding/sentiment. The reviewed `target_weights.json` is the FULL recomputed
+    # (intended-holdings) book — the same neutral, hedge-correct, fully-deployed book optimize_book
+    # produced — so the reviewer audits the ACTUAL resulting positions. The NO-CHURN guarantee is
+    # relocated (not regressed away) to the SEPARATE `rebalance_trades` deltas artifact: with an
+    # in-band book and no z-stops the deltas are EMPTY so the executor trades nothing.
     cfg = NeutralityConfig()
     geometries = _broad_geometries()
     sleeves = _broad_sleeves(NOW)
@@ -255,17 +259,21 @@ def test_daily_rebalance_same_set(tmp_path):
         equity=20000.0, cfg=cfg, cycle=1,
     )
     assert isinstance(result, TargetWeights)
+    # the returned book is the FULL recomputed intended-holdings book (NOT the sparse delta)
+    assert result.legs, "daily_rebalance must return the full recomputed book, not the empty delta"
     # SAME symbol set: the recompute introduced no new names and dropped none.
     assert {leg.symbol for leg in result.legs} <= weekly_symbols
-    # in-band, no z-stop, no neutrality breach -> zero delta legs (no churn)
-    assert result.legs == []
-    # persisted under state/daily/cycle/1/target_weights.json (cadence-segmented daily root)
+    # persisted under state/daily/cycle/1/target_weights.json (cadence-segmented daily root) — the
+    # FULL recomputed book the reviewer audits.
     persisted = tmp_path / "s" / "daily" / "cycle" / "1" / "target_weights.json"
     assert persisted.exists()
     reloaded = TargetWeights.model_validate(
         load_output(tmp_path / "s", 1, "target_weights", cadence="daily")
     )
-    assert reloaded.legs == []
+    assert {leg.symbol for leg in reloaded.legs} == {leg.symbol for leg in result.legs}
+    # NO-CHURN relocated to the deltas artifact: in-band, no z-stop, no breach -> ZERO trade deltas.
+    trades = load_output(tmp_path / "s", 1, "rebalance_trades", cadence="daily")
+    assert trades["legs"] == []
 
 
 def test_daily_rebalance_zstop_flattens(tmp_path):
@@ -294,13 +302,17 @@ def test_daily_rebalance_zstop_flattens(tmp_path):
     ]})
     prior_by_sym = {leg.symbol: leg for leg in forced.legs}
 
-    result = daily_rebalance(
+    daily_rebalance(
         tmp_path / "s", forced, geometries, spreads=[_stop_spread(pair_id)],
         equity=20000.0, cfg=cfg, cycle=2,
     )
-    by_key = {(leg.symbol, leg.direction): leg for leg in result.legs}
+    # the z-stop flatten lands in the SEPARATE trade-deltas artifact (the executor's trades), not in
+    # the reviewed full-book target_weights.json.
+    deltas = [WeightLeg.model_validate(d) for d in
+              load_output(tmp_path / "s", 2, "rebalance_trades", cadence="daily")["legs"]]
+    by_key = {(leg.symbol, leg.direction): leg for leg in deltas}
     # the stopped pair's legs are forced into the delta book despite being in drift band
-    assert {syms[0], syms[1]} <= {leg.symbol for leg in result.legs}
+    assert {syms[0], syms[1]} <= {leg.symbol for leg in deltas}
     for sym in (syms[0], syms[1]):
         # the override keys on the PRIOR leg's (symbol, direction) — the position that exists
         d = prior_by_sym[sym].direction
@@ -333,14 +345,16 @@ def test_daily_rebalance_neutrality_breach_forces_full_set(tmp_path, monkeypatch
     })
     monkeypatch.setattr(cl, "optimize_book", lambda *a, **k: breached)
 
-    result = daily_rebalance(
+    daily_rebalance(
         tmp_path / "s", target, geometries, spreads=[],
         equity=20000.0, cfg=cfg, cycle=3,
     )
     # without the breach override the unchanged book would yield ZERO deltas; the breach forces the
-    # FULL recomputed leg set (same symbol set, same directions) into the delta book.
-    assert len(result.legs) == len(target.legs)
-    assert {(leg.symbol, leg.direction) for leg in result.legs} == \
+    # FULL recomputed leg set (same symbol set, same directions) into the SEPARATE deltas artifact.
+    deltas = [WeightLeg.model_validate(d) for d in
+              load_output(tmp_path / "s", 3, "rebalance_trades", cadence="daily")["legs"]]
+    assert len(deltas) == len(target.legs)
+    assert {(leg.symbol, leg.direction) for leg in deltas} == \
         {(leg.symbol, leg.direction) for leg in target.legs}
 
 
@@ -379,13 +393,16 @@ def test_daily_rebalance_zstop_wins_over_neutrality_breach(tmp_path, monkeypatch
     })
     monkeypatch.setattr(cl, "optimize_book", lambda *a, **k: breached)
 
-    result = daily_rebalance(
+    daily_rebalance(
         tmp_path / "s", forced, geometries, spreads=[_stop_spread(pair_id)],
         equity=20000.0, cfg=cfg, cycle=4,
     )
-    by_key = {(leg.symbol, leg.direction): leg for leg in result.legs}
+    # the trade-deltas artifact carries the breach-forced full set with the z-stop flatten applied.
+    deltas = [WeightLeg.model_validate(d) for d in
+              load_output(tmp_path / "s", 4, "rebalance_trades", cadence="daily")["legs"]]
+    by_key = {(leg.symbol, leg.direction): leg for leg in deltas}
     # the breach still forces the full recomputed set into the delta book...
-    assert {(leg.symbol, leg.direction) for leg in result.legs} == \
+    assert {(leg.symbol, leg.direction) for leg in deltas} == \
         {(leg.symbol, leg.direction) for leg in forced.legs}
     # ...but the stopped pair's legs stay FLATTENED (z-stop wins), NOT re-marked at target notional.
     for sym in (syms[0], syms[1]):
@@ -397,9 +414,96 @@ def test_daily_rebalance_zstop_wins_over_neutrality_breach(tmp_path, monkeypatch
         assert flat.weight == 0.0
         assert flat.direction == d
     # the non-stopped legs are NOT zeroed — they carry the recomputed (breach) re-mark
-    nonstopped = [leg for leg in result.legs if leg.symbol not in (syms[0], syms[1])]
+    nonstopped = [leg for leg in deltas if leg.symbol not in (syms[0], syms[1])]
     assert nonstopped, "the breach override should still re-mark the non-stopped legs"
     assert any(leg.target_notional != 0.0 for leg in nonstopped)
+
+
+def _hedged_geometries():
+    """A 6-name universe whose longs carry HIGHER beta than its shorts, so the alpha legs leave a
+    net positive residual beta that the optimizer absorbs with a real (non-trivial) SHORT BTC hedge
+    leg — the precondition for the live `btc_hedge_sizing` reviewer HALT this bug reproduces."""
+    return [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=0.7, adv_usd=1e9),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.5, adv_usd=4e8),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=0.6, adv_usd=3e8),
+        CoinGeometry(symbol="ADA/USDT:USDT", mark=0.5, beta_btc=1.4, adv_usd=2e8),
+        CoinGeometry(symbol="DOGE/USDT:USDT", mark=0.15, beta_btc=0.7, adv_usd=2e8),
+    ]
+
+
+def _hedged_sleeves(now):
+    """High-beta names long / low-beta names short -> residual positive beta -> real BTC hedge."""
+    return [SleeveSignal(
+        sleeve="factor", risk_budget_frac=1.0, as_of_ts=now,
+        tilts=[
+            SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ADA/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="BTC/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ETH/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="DOGE/USDT:USDT", direction="short", target_weight=-0.5),
+        ],
+    )]
+
+
+def test_daily_rebalance_persists_full_book_reviewer_passes(tmp_path):
+    # LIVE BUG REGRESSION (btc_hedge_sizing HALT): a daily_rebalance whose recomputed book carries a
+    # real BTC hedge must persist a `target_weights.json` that is the FULL recomputed
+    # (intended-holdings) book — so the reviewer's hedge/dollar/beta/deployment/cap re-derivations
+    # all agree with the artifact's metadata and the verdict PASSES. The trade DELTAS land in the
+    # SEPARATE `rebalance_trades` artifact (only the changed legs). BEFORE the fix the persisted
+    # target_weights conflated full-book metadata (hedge sized for the alpha legs) with the SPARSE
+    # delta legs, so check_btc_hedge re-derived a hedge of ~0 from the empty alpha set and HALTed.
+    cfg = NeutralityConfig()
+    geometries = _hedged_geometries()
+    sleeves = _hedged_sleeves(NOW)
+    target = weekly_selection(
+        tmp_path / "s", geometries, sleeves,
+        equity=20000.0, prior=None, cfg=cfg, cycle=1,
+    )
+    # sanity: the weekly book carries a real (non-trivial) BTC hedge
+    assert abs(target.btc_hedge_notional) > 1.0
+    assert any(leg.sleeve == "hedge" for leg in target.legs)
+
+    # a live beta drift (ETH's beta-to-BTC moves) so the optimizer re-allocates the alpha legs and
+    # the recompute produces a non-empty (but PARTIAL — unchanged hedge excluded) trade delta.
+    geos2 = [g.model_copy(update={"beta_btc": 1.1}) if g.symbol == "ETH/USDT:USDT" else g
+             for g in geometries]
+
+    result = daily_rebalance(
+        tmp_path / "s", target, geos2, spreads=[],
+        equity=20000.0, cfg=cfg, cycle=1,
+    )
+    # the persisted target_weights.json is the FULL recomputed book (hedge + all alpha legs)...
+    persisted = TargetWeights.model_validate(
+        load_output(tmp_path / "s", 1, "target_weights", cadence="daily")
+    )
+    assert any(leg.sleeve == "hedge" for leg in persisted.legs)
+    assert {leg.symbol for leg in persisted.legs} == {leg.symbol for leg in result.legs}
+
+    # ...so the reviewer (which re-derives every load-bearing number from the persisted legs) AGREES
+    # with the metadata: btc_hedge_sizing, dollar/beta neutral, deployment, caps ALL pass.
+    verdict = review_cycle(
+        tmp_path / "s", "memory", cycle=1, cadence="daily",
+        target=persisted, geometries=geos2, spreads=[], sentiment=[], cfg=cfg,
+    )
+    assert verdict.passed, \
+        f"reviewer must pass on the full daily book; mismatches={verdict.mismatches}"
+    for name in ("btc_hedge_sizing", "dollar_residual_in_band", "beta_residual_in_band",
+                 "deployment_floor_both_sides", "per_name_cap", "cluster_cap"):
+        chk = next(c for c in verdict.checks if c.name == name)
+        assert chk.ok, f"{name} must pass on the full recomputed daily book"
+
+    # the SEPARATE trade-deltas artifact carries ONLY the changed legs, NOT the full book — daily
+    # must not churn the whole book (the unchanged BTC hedge is excluded from the deltas).
+    deltas = [WeightLeg.model_validate(d) for d in
+              load_output(tmp_path / "s", 1, "rebalance_trades", cadence="daily")["legs"]]
+    assert deltas, "a live drift should produce at least one trade delta"
+    assert len(deltas) < len(persisted.legs), "deltas must be a SUBSET, not the full book"
+    assert not any(leg.sleeve == "hedge" for leg in deltas), \
+        "the unchanged BTC hedge must not be re-traded as a delta"
 
 
 # --- Task 3.7: control_loop_cli weekly/daily entrypoint ---
@@ -571,8 +675,10 @@ def test_cli_daily_fail_closed_when_no_weekly_target(tmp_path, monkeypatch, bala
 def test_cli_daily_spreads_zstop_flattens_pair(tmp_path, monkeypatch, balanced_settings):
     # The daily branch loads its spreads from the DAILY root and threads them to daily_rebalance: a
     # z-STOPPED spread (the cointegration-break EXIT, §6.2) must flatten its pair's legs (zero
-    # notional) in the persisted daily book — exercising the spreads-present path the empty-list
-    # fallback otherwise hides.
+    # notional) in the persisted daily TRADE-DELTAS artifact — exercising the spreads-present path
+    # the empty-list fallback otherwise hides. The reviewed `target_weights.json` is the FULL
+    # recomputed book; the flatten lives in the SEPARATE `rebalance_trades` deltas the executor
+    # trades.
     monkeypatch.setattr(
         "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
     )
@@ -601,8 +707,15 @@ def test_cli_daily_spreads_zstop_flattens_pair(tmp_path, monkeypatch, balanced_s
     save_output(state, 4, "spreads", {"spreads": [stop.model_dump(mode="json")]}, cadence="daily")
 
     main(["--cadence", "daily", "--cycle", "4"])
+    # the reviewed full book carries the stopped pair's legs at their NORMAL (non-zero) notional...
     daily = TargetWeights.model_validate(load_output(state, 4, "target_weights", cadence="daily"))
-    flat = {leg.symbol: leg for leg in daily.legs if leg.symbol in (syms[0], syms[1])}
+    full = {leg.symbol: leg for leg in daily.legs if leg.symbol in (syms[0], syms[1])}
+    assert set(full) == {syms[0], syms[1]}
+    assert any(leg.target_notional != 0.0 for leg in full.values())  # NOT flattened in the book
+    # ...while the z-stop flatten lands in the SEPARATE trade-deltas artifact (the executor trades)
+    deltas = [WeightLeg.model_validate(d) for d in
+              load_output(state, 4, "rebalance_trades", cadence="daily")["legs"]]
+    flat = {leg.symbol: leg for leg in deltas if leg.symbol in (syms[0], syms[1])}
     assert set(flat) == {syms[0], syms[1]}  # the stopped pair's legs entered the delta book
     for leg in flat.values():
         assert leg.target_notional == 0.0  # flattened, not re-marked at target notional

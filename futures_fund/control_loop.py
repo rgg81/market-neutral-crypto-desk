@@ -190,18 +190,27 @@ def daily_rebalance(
 
     Keeps the weekly `target`'s symbol set fixed (no re-selection), recomputes residuals/z/funding/
     sentiment by re-running `optimize_book` against that set (`prior_legs=target.legs`, so the
-    turnover/no-trade band excludes unchanged legs), then trades ONLY the deltas via
-    `rebalance_deltas(prior=target, target=recomputed)`. Two overrides force a trade on an
-    otherwise in-band leg: a `neutrality_breached` recomputed book forces the full recomputed leg
-    set (dollar/beta drift off-neutral), and any `Spread.state == "stop"` FLATTENS that pair's legs
-    (zero-notional unwind deltas — the hard z-stop is the cointegration-break EXIT, §6.2, NOT a
-    re-mark at target notional). The z-stop flatten is applied LAST so the hard-stop EXIT always
-    WINS: a book that is BOTH breached AND has a stopped spread still flattens the broken pair
-    rather than re-marking its legs at target notional. The returned `TargetWeights` carries the
-    recomputed book's residual/deployment metadata but its `legs` are the delta book the Trader must
-    execute — an in-band, no-stop, neutral book therefore yields ZERO delta legs (no churn).
-    Persisted under the
-    cadence-segmented daily root `state/daily/cycle/<cycle>/target_weights.json` (the SAME root the
+    turnover/no-trade band excludes unchanged legs). It produces TWO artifacts, separating "intended
+    holdings" from "trades to make this cycle":
+
+    - `target_weights.json` is the FULL recomputed (intended-holdings) book — the same neutral,
+      hedge-correct, fully-deployed book `optimize_book` produced. This is the book the every-cycle
+      reviewer audits: every check re-derives its load-bearing number (BTC hedge sizing, dollar/beta
+      residual, deployment floor, caps) from THESE legs, so the artifact's metadata and its legs are
+      internally consistent and all 17 checks validate the ACTUAL resulting positions and pass.
+    - `rebalance_trades.json` is the sparse TRADE-DELTA book the executor opens this cycle (§9
+      "trade only the deltas"). It carries ONLY the changed legs via `rebalance_deltas(prior=target,
+      target=recomputed)` — so an in-band, no-stop, neutral book yields ZERO trade deltas (no churn:
+      the daily cadence does NOT re-trade the whole book). Two overrides force a trade on an
+      otherwise in-band leg: a `neutrality_breached` recomputed book forces the full recomputed leg
+      set (dollar/beta drift off-neutral), and any `Spread.state == "stop"` FLATTENS that pair's
+      legs (zero-notional unwind deltas — the hard z-stop is the cointegration-break EXIT, §6.2,
+      NOT a re-mark at target notional). The z-stop flatten is applied LAST so the hard-stop EXIT
+      WINS: a book that is BOTH breached AND has a stopped spread still flattens the broken pair
+      rather than re-marking its legs at target notional.
+
+    Returns the FULL recomputed book (the reviewed intended-holdings target). Both artifacts are
+    persisted under the cadence-segmented daily root `state/daily/cycle/<cycle>/` (the SAME root the
     daily due-gate reads — CADENCE-ROOT INVARIANT)."""
     sleeves = _sleeves_from_legs(target.legs, target.as_of_ts)
     recomputed = optimize_book(
@@ -243,6 +252,16 @@ def daily_rebalance(
                 )
 
     delta_legs = list(delta_by_key.values())
-    rebalanced = recomputed.model_copy(update={"legs": delta_legs})
-    save_output(state_dir, cycle, "target_weights", rebalanced, cadence="daily")
-    return rebalanced
+    # The reviewed artifact is the FULL recomputed (intended-holdings) book, so the reviewer's
+    # re-derivations agree with its metadata and all 17 checks pass on the ACTUAL positions.
+    save_output(state_dir, cycle, "target_weights", recomputed, cadence="daily")
+    # The trade DELTAS (changed/forced/flattened legs) are a SEPARATE artifact the daily executor
+    # trades — so the cadence opens only the deltas, never churning the whole book.
+    save_output(
+        state_dir,
+        cycle,
+        "rebalance_trades",
+        {"legs": [leg.model_dump(mode="json") for leg in delta_legs]},
+        cadence="daily",
+    )
+    return recomputed

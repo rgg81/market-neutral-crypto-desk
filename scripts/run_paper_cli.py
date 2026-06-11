@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from futures_fund import equity_log, runlock
 from futures_fund.config import load_settings
 from futures_fund.contracts import TargetWeights, WeightLeg
-from futures_fund.control_loop import cadence_due, latest_cadence_cycle
+from futures_fund.control_loop import cadence_due
 from futures_fund.cycle_io import cycle_dir, load_output, save_output
 from futures_fund.models import Cadence
 from scripts.cycle_prep_cli import main as cycle_prep_main
@@ -63,58 +63,48 @@ def _run_control_loop_step(state_dir, cadence: Cadence, cycle: int) -> None:
     control_loop_main(["--cadence", cadence, "--cycle", str(cycle), "--state-dir", str(state_dir)])
 
 
-def _apply_deltas(base: TargetWeights, deltas: list[WeightLeg]) -> TargetWeights:
-    """Apply a daily delta book onto the carry-over weekly target to get the HELD book.
+def _reviewed_book(state_dir, cadence: Cadence, cycle: int) -> TargetWeights:
+    """The full intended-holdings book the reviewer audits for this cadence cycle.
 
-    Each delta keyed on `(symbol, direction)` REPLACES the base leg (a zero-notional delta flattens
-    that leg -> it leaves the held book). The result carries the recomputed neutrality/deployment
-    metadata of `base` (the maintained, fully-deployed weekly target) so the reviewer audits the
-    actual positions held, not the sparse delta the executor trades."""
-    by_key = {(leg.symbol, leg.direction): leg for leg in base.legs}
-    for d in deltas:
-        if abs(d.target_notional) <= 0.0:
-            by_key.pop((d.symbol, d.direction), None)  # flatten -> leg leaves the held book
-        else:
-            by_key[(d.symbol, d.direction)] = d
-    return base.model_copy(update={"legs": list(by_key.values())})
-
-
-def _resolve_held_book(state_dir, cadence: Cadence, cycle: int) -> TargetWeights:
-    """The book the reviewer audits + the executor opens for this cadence cycle.
-
-    WEEKLY: the produced `target_weights.json` IS the full held book. DAILY: the persisted
-    `target_weights.json` is the sparse DELTA book (`daily_rebalance`'s "trade only the deltas"
-    contract); the actual HELD book is the carry-over weekly target the daily cadence tracks with
-    those deltas applied. We resolve the held book here (driver-level orchestration — no protected
-    module is touched) and re-persist it as this cycle's `target_weights.json` so the reviewer's
-    deployment-floor / neutrality re-derivation sees the real positions, not the empty no-churn
-    delta. Falls back to the delta book if no weekly target exists (the reviewer then fails closed,
-    as it should)."""
-    book = TargetWeights.model_validate(
+    For BOTH cadences the persisted `target_weights.json` IS the full, neutral, hedge-correct,
+    fully-deployed book the optimizer produced — weekly from `weekly_selection`, daily from
+    `daily_rebalance` (which now persists the FULL recomputed book, not the sparse delta). So the
+    reviewer's hedge/dollar/beta/deployment/cap re-derivations agree with the artifact's metadata
+    and all 17 checks validate the ACTUAL resulting positions. No re-persist / delta-application is
+    needed."""
+    return TargetWeights.model_validate(
         load_output(state_dir, cycle, "target_weights", cadence=cadence)
     )
-    if cadence == "weekly":
-        return book
-    weekly_cycle = latest_cadence_cycle(state_dir, "weekly", "target_weights")
-    if weekly_cycle is None:
-        return book
-    weekly_target = TargetWeights.model_validate(
-        load_output(state_dir, weekly_cycle, "target_weights", cadence="weekly")
-    )
-    held = _apply_deltas(weekly_target, book.legs)
-    save_output(state_dir, cycle, "target_weights", held, cadence=cadence)
-    return held
 
 
-def _proposals_from_book(book: TargetWeights) -> list[dict]:
-    """Derive the Trader's gate-ready per-leg opens from the persisted book's legs (the hand-off).
+def _trade_legs(state_dir, cadence: Cadence, cycle: int, book: TargetWeights) -> list[WeightLeg]:
+    """The legs the executor actually OPENS this cadence cycle (separate from what the reviewer
+    audits).
+
+    WEEKLY: the full book is opened — every leg of `target_weights.json`. DAILY: only the TRADE
+    DELTAS (`rebalance_trades.json` — the changed / breach-forced / z-stop-flattened legs
+    `daily_rebalance` persisted) are traded, so the daily cadence nudges the book toward target
+    without churning the whole (mostly-unchanged) book. If the daily deltas artifact is missing
+    (legacy / fail-soft) the cadence opens nothing rather than re-trading the full book."""
+    if cadence != "daily":
+        return list(book.legs)
+    try:
+        raw = load_output(state_dir, cycle, "rebalance_trades", cadence=cadence)
+    except FileNotFoundError:
+        return []
+    return [WeightLeg.model_validate(leg) for leg in raw["legs"]]
+
+
+def _proposals_from_legs(legs: list[WeightLeg]) -> list[dict]:
+    """Derive the Trader's gate-ready per-leg opens from the legs to TRADE this cycle (the
+    hand-off).
 
     The Trader does NO sizing — the notional already comes from the optimizer / `TargetWeights` — so
     each non-flat alpha/hedge leg becomes a market-entry proposal carrying its symbol/direction and
-    target notional. Zero-notional legs (carry-over unwinds / flattens) are excluded: there is
-    nothing to OPEN there."""
+    target notional. Zero-notional legs (carry-over unwinds / z-stop flattens) are excluded: there
+    is nothing to OPEN there."""
     proposals: list[dict] = []
-    for leg in book.legs:
+    for leg in legs:
         if abs(leg.target_notional) <= 0.0:
             continue
         proposals.append({
@@ -127,10 +117,10 @@ def _proposals_from_book(book: TargetWeights) -> list[dict]:
     return proposals
 
 
-def _write_proposals(state_dir, cadence: Cadence, cycle: int, book: TargetWeights) -> int:
-    """Derive + persist `proposals.json` (from the resolved HELD book) under the same cadence cycle
-    root the execute boundary loads from, and return the leg count."""
-    proposals = _proposals_from_book(book)
+def _write_proposals(state_dir, cadence: Cadence, cycle: int, legs: list[WeightLeg]) -> int:
+    """Derive + persist `proposals.json` (from the legs to TRADE this cycle) under the same cadence
+    cycle root the execute boundary loads from, and return the leg count."""
+    proposals = _proposals_from_legs(legs)
     save_output(
         state_dir, cycle, "proposals",
         {"proposals": proposals, "management": [], "triggers": [], "cancel_triggers": []},
@@ -199,13 +189,15 @@ def _run_cadence(
 
     # Step 3b — producers: scout + cycle-prep write geometries/sleeves/pairs/spreads.
     _run_producers(state_dir, cadence, cycle, now)
-    # Step 4a — cadence step: persist target_weights.json under state/<cadence>/cycle/<cycle>/.
+    # Step 4a — cadence step: persist target_weights.json under state/<cadence>/cycle/<cycle>/. For
+    # daily this is the FULL recomputed (intended-holdings) book PLUS a separate
+    # rebalance_trades.json carrying the sparse trade deltas.
     _run_control_loop_step(state_dir, cadence, cycle)
-    # Resolve the HELD book the reviewer audits + the executor opens (daily applies its sparse delta
-    # onto the carry-over weekly target it tracks; weekly is already the full book).
-    held = _resolve_held_book(state_dir, cadence, cycle)
-    # Hand-off — derive proposals.json from the held book's legs.
-    _write_proposals(state_dir, cadence, cycle, held)
+    # The reviewer audits the FULL intended-holdings book (target_weights.json) for both cadences.
+    reviewed = _reviewed_book(state_dir, cadence, cycle)
+    # Hand-off — the executor opens only the legs to TRADE this cycle: the full book weekly, the
+    # sparse rebalance_trades deltas daily (daily must NOT churn the whole, mostly-unchanged book).
+    _write_proposals(state_dir, cadence, cycle, _trade_legs(state_dir, cadence, cycle, reviewed))
     # Step 5a — reviewer gate (HARD VETO -> SystemExit(2) on a failed verdict).
     _run_reviewer(state_dir, cadence, cycle, memory_dir)
     # Step 6a — execute boundary (re-checks reviewer_gate_ok) -> report.json.
