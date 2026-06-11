@@ -8,7 +8,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt
+from futures_fund.contracts import (
+    CoinGeometry,
+    SleeveSignal,
+    SleeveTilt,
+    TargetWeights,
+    WeightLeg,
+)
 from futures_fund.scheduling import floor_tf
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
@@ -39,6 +45,44 @@ def write_served_report():
         return report
 
     return _write
+
+
+@pytest.fixture
+def make_tw():
+    """Factory: build a `TargetWeights` book from `(symbol, direction, target_notional)` tuples.
+
+    A bare-bones book for carry-over delta tests (`rebalance_deltas`): each tuple becomes a
+    `WeightLeg` (weight derived from its share of total gross, beta defaulted to 1.0, sleeve
+    "factor"). Residual/deployment fields are filled with zeros — the delta logic keys only on
+    `(symbol, direction)` and `target_notional`, so these scaffold fields are inert here."""
+
+    def _make(legs: list[tuple[str, str, float]]) -> TargetWeights:
+        gross = sum(abs(n) for _, _, n in legs) or 1.0
+        weight_legs = [
+            WeightLeg(
+                symbol=symbol,
+                direction=direction,
+                weight=notional / gross,
+                target_notional=notional,
+                beta_btc=1.0,
+                sleeve="factor",
+            )
+            for symbol, direction, notional in legs
+        ]
+        return TargetWeights(
+            legs=weight_legs,
+            dollar_residual=0.0,
+            dollar_residual_frac=0.0,
+            beta_residual=0.0,
+            gross_long=0.0,
+            gross_short=0.0,
+            deploy_long_frac=0.0,
+            deploy_short_frac=0.0,
+            gross_notional=gross,
+            as_of_ts=NOW,
+        )
+
+    return _make
 
 
 @pytest.fixture

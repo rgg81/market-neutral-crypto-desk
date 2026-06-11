@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from futures_fund.contracts import CoinGeometry, SleeveSignal, TargetWeights
+from futures_fund.contracts import CoinGeometry, SleeveSignal, TargetWeights, WeightLeg
 from futures_fund.cycle_io import save_output
 from futures_fund.models import Cadence
 from futures_fund.neutrality import NeutralityConfig, optimize_book, risk_parity_budgets
@@ -71,3 +71,25 @@ def weekly_selection(
     )
     save_output(state_dir, cycle, "target_weights", tw, cadence="weekly")
     return tw
+
+
+def rebalance_deltas(prior: TargetWeights, target: TargetWeights) -> list[WeightLeg]:
+    """Carry-over delta book (§9: "trade only the deltas").
+
+    Keying on `(symbol, direction)`, emit a delta leg only when the leg is NEW or its
+    `target_notional` moved beyond a $1 epsilon — so an unchanged overlapping leg (same symbol,
+    same direction, same notional within $1) is EXCLUDED and the book is not churned. Legs present
+    in `prior` but absent from `target` become zero-notional unwind deltas so the old exposure is
+    flattened rather than silently carried."""
+    prior_by = {(leg.symbol, leg.direction): leg for leg in prior.legs}
+    out: list[WeightLeg] = []
+    for leg in target.legs:
+        p = prior_by.get((leg.symbol, leg.direction))
+        if p is None or abs(leg.target_notional - p.target_notional) > 1.0:
+            out.append(leg)  # carry-over: unchanged overlap excluded
+    # removed legs (in prior, absent from target) become zero-notional unwinds
+    tgt_keys = {(leg.symbol, leg.direction) for leg in target.legs}
+    for (sym, d), p in prior_by.items():
+        if (sym, d) not in tgt_keys:
+            out.append(p.model_copy(update={"target_notional": 0.0, "weight": 0.0}))
+    return out
