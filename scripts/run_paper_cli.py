@@ -38,6 +38,8 @@ from futures_fund.contracts import TargetWeights, WeightLeg
 from futures_fund.control_loop import cadence_due, latest_cadence_cycle
 from futures_fund.cycle_io import cycle_dir, load_output, save_output
 from futures_fund.models import Cadence
+from scripts.cycle_prep_cli import main as cycle_prep_main
+from scripts.scout_cli import main as scout_main
 
 _STATE_DIR = "state"
 _CADENCES: tuple[Cadence, ...] = ("weekly", "daily")  # serialized WEEKLY-FIRST
@@ -172,6 +174,19 @@ def _run_reflect(state_dir, cadence: Cadence, cycle: int, memory_dir) -> None:
         print(f"WARNING: reflect step failed for {cadence} cycle {cycle}: {exc!r}", file=sys.stderr)
 
 
+def _run_producers(state_dir, cadence: Cadence, cycle: int, now: datetime) -> None:
+    """Step 3b — scout the universe then build the cycle's upstream artifacts (geometries / sleeves
+    / pairs / spreads) BEFORE the control-loop step consumes them. Closes C1: the loop no longer
+    depends on a hand-seeded `_seed_upstream`. Both CLIs are seams (monkeypatched in tests) so the
+    driver's ladder runs offline against a faked exchange. Idempotent on RETRY (overwrites the
+    cycle's artifacts in place)."""
+    scout_main(["--cycle", str(cycle), "--cadence", cadence, "--state-dir", str(state_dir)])
+    cycle_prep_main([
+        "--cycle", str(cycle), "--cadence", cadence, "--state-dir", str(state_dir),
+        "--now", now.isoformat(),
+    ])
+
+
 def _run_cadence(
     cadence: Cadence, state_dir, memory_dir, now: datetime, equity: float
 ) -> bool:
@@ -182,6 +197,8 @@ def _run_cadence(
     if mode == "SKIP":
         return False  # candle already served -> stand down (no re-run)
 
+    # Step 3b — producers: scout + cycle-prep write geometries/sleeves/pairs/spreads.
+    _run_producers(state_dir, cadence, cycle, now)
     # Step 4a — cadence step: persist target_weights.json under state/<cadence>/cycle/<cycle>/.
     _run_control_loop_step(state_dir, cadence, cycle)
     # Resolve the HELD book the reviewer audits + the executor opens (daily applies its sparse delta

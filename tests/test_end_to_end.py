@@ -86,6 +86,12 @@ def paper_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "scripts.gate_execute_cli.FuturesExchange.from_settings", lambda settings: object()
     )
+    # Phase 8: the producers (scout + cycle-prep) are a NO-OP for the seeded E2E — these tests
+    # assert behavior on _seed_upstream's hand-seeded artifacts, which the real producers would
+    # overwrite. The dedicated no-seed E2E (test_end_to_end_no_seed.py) exercises the real
+    # producers.
+    monkeypatch.setattr("scripts.run_paper_cli._run_producers",
+                        lambda state_dir, cadence, cycle, now: None)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
