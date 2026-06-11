@@ -10,6 +10,7 @@ from futures_fund.contracts import (
     SleeveTilt,
     Spread,
     TargetWeights,
+    WeightLeg,
 )
 from futures_fund.control_loop import (
     cadence_cycle_root,
@@ -265,9 +266,11 @@ def test_daily_rebalance_same_set(tmp_path):
     assert reloaded.legs == []
 
 
-def test_daily_rebalance_zstop_forces(tmp_path):
-    # A Spread flipped to "stop" must force ITS legs into the delta book even when every leg is
-    # individually inside its drift band (an otherwise in-band, no-churn rebalance).
+def test_daily_rebalance_zstop_flattens(tmp_path):
+    # A hard z-stop (Spread.state=="stop") is the cointegration-break EXIT (§6.2; the pairs sleeve
+    # treats "stop" as "emit no legs" == close). So it must force the stopped pair's legs into the
+    # delta book as ZERO-notional UNWINDS (flatten the broken pair), NOT re-mark them at target
+    # notional — even when every leg is individually inside its drift band (no-churn rebalance).
     cfg = NeutralityConfig()
     geometries = _broad_geometries()
     sleeves = _broad_sleeves(NOW)
@@ -287,11 +290,53 @@ def test_daily_rebalance_zstop_forces(tmp_path):
         leg.model_copy(update={"pair_id": pair_id}) if leg.symbol in (syms[0], syms[1]) else leg
         for leg in target.legs
     ]})
+    prior_by_sym = {leg.symbol: leg for leg in forced.legs}
 
     result = daily_rebalance(
         tmp_path / "s", forced, geometries, spreads=[_stop_spread(pair_id)],
         equity=20000.0, cfg=cfg, cycle=2,
     )
-    forced_syms = {leg.symbol for leg in result.legs}
+    by_key = {(leg.symbol, leg.direction): leg for leg in result.legs}
     # the stopped pair's legs are forced into the delta book despite being in drift band
-    assert {syms[0], syms[1]} <= forced_syms
+    assert {syms[0], syms[1]} <= {leg.symbol for leg in result.legs}
+    for sym in (syms[0], syms[1]):
+        # the override keys on the PRIOR leg's (symbol, direction) — the position that exists
+        d = prior_by_sym[sym].direction
+        flat = by_key[(sym, d)]
+        # FLATTEN, not re-mark: zeroed notional + weight, same direction as the prior position
+        assert flat.target_notional == 0.0, f"{sym} stopped pair should flatten, not re-mark"
+        assert flat.weight == 0.0
+        assert flat.direction == d
+
+
+def test_daily_rebalance_neutrality_breach_forces_full_set(tmp_path, monkeypatch):
+    # neutrality-breach override (§9): when the RECOMPUTED book is off-neutral (dollar/beta residual
+    # past its band) the FULL recomputed leg set is forced into the delta book — even though those
+    # legs are individually UNCHANGED vs the prior target (so the base carry-over rebalance_deltas
+    # would emit ZERO). We hold the recomputed legs identical to the prior so ONLY the breach branch
+    # can produce output, isolating the override.
+    cfg = NeutralityConfig()  # dollar_band=0.03, beta_band=0.05
+    geometries = _broad_geometries()
+    sleeves = _broad_sleeves(NOW)
+    target = weekly_selection(
+        tmp_path / "s", geometries, sleeves,
+        equity=20000.0, prior=None, cfg=cfg, cycle=1,
+    )
+    # Build a recomputed book whose legs EXACTLY equal the prior target's legs (zero base delta),
+    # but whose residual fields BREACH the dollar band (frac well over 0.03).
+    breached = target.model_copy(update={
+        "legs": [WeightLeg(**leg.model_dump()) for leg in target.legs],
+        "dollar_residual_frac": 0.50,
+        "beta_residual": 0.0,
+    })
+    monkeypatch.setattr(cl, "optimize_book", lambda *a, **k: breached)
+
+    result = daily_rebalance(
+        tmp_path / "s", target, geometries, spreads=[],
+        equity=20000.0, cfg=cfg, cycle=3,
+    )
+    # without the breach override the unchanged book would yield ZERO deltas; the breach forces the
+    # FULL recomputed leg set (same symbol set, same directions) into the delta book.
+    assert len(result.legs) == len(target.legs)
+    assert {(leg.symbol, leg.direction) for leg in result.legs} == \
+        {(leg.symbol, leg.direction) for leg in target.legs}
