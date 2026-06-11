@@ -106,6 +106,26 @@ def test_unclamped_funding_shows_credit():
     assert unclamped.sized_trade.cost.total < clamped.sized_trade.cost.total
 
 
+def test_pay_bnb_applies_fee_discount():
+    """`GateInputs.pay_bnb` is a real caller-facing input, not a silent no-op: setting it True
+    must thread through to round_trip_fee and apply the BNB fee discount, LOWERING entry+exit fees
+    (by costs.BNB_DISCOUNT) vs full taker fees. Only fees shrink; no limit/breaker weakens."""
+    from futures_fund.costs import BNB_DISCOUNT
+
+    inp = _inputs()
+    full = evaluate(inp)                          # pay_bnb defaults to False
+    discounted = evaluate(_inputs(pay_bnb=True))
+
+    assert full.verdict in ("approve", "resize")
+    assert discounted.verdict in ("approve", "resize")
+
+    full_fees = full.sized_trade.cost.entry_fee + full.sized_trade.cost.exit_fee
+    disc_fees = discounted.sized_trade.cost.entry_fee + discounted.sized_trade.cost.exit_fee
+    assert full_fees > 0.0
+    assert disc_fees == pytest.approx(full_fees * BNB_DISCOUNT)
+    assert disc_fees < full_fees
+
+
 def test_unclamp_does_not_resurrect_rr_floor_failure():
     """Step 5 monotonicity guard (protected-module rule). A trade that FAILED the RR>=2 floor
     under the clamp must NOT pass solely because the unclamp un-hid a funding credit. The RR

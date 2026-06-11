@@ -44,12 +44,14 @@ def _reward_risk(p: TradeProposal) -> float:
 
 
 def _build_sized(p: TradeProposal, spec: SymbolSpec, qty: float, leverage: float,
-                 *, unclamped_funding: bool = False) -> SizedTrade:
+                 *, unclamped_funding: bool = False, pay_bnb: bool = False) -> SizedTrade:
     notional = qty * p.entry
     mmr, maint = mmr_for_notional(notional, spec.mmr_brackets)
     margin = notional / leverage if leverage > 0 else notional
     liq = liquidation_price(p.entry, qty, margin, p.direction, mmr, maint)
-    fees = round_trip_fee(notional, maker_entry=False, maker_exit=False)
+    # Taker both legs (conservative); `pay_bnb` applies the BNB fee discount (costs.BNB_DISCOUNT)
+    # when the caller models settling fees in BNB. This only LOWERS fees, never weakens a limit.
+    fees = round_trip_fee(notional, maker_entry=False, maker_exit=False, pay_bnb=pay_bnb)
     # Per-contract funding interval (Binance uses 4h for many perps, 1h under stress);
     # not the magic 8.
     n_events = max(1, int(p.horizon_hours // p.funding_interval_hours))
@@ -129,7 +131,8 @@ def evaluate(inp: GateInputs, *, unclamped_funding: bool = False) -> RiskDecisio
         return RiskDecision(verdict="veto",
                             reason=f"notional {notional:.2f} < min {spec.min_notional}")
 
-    sized = _build_sized(p, spec, qty, leverage, unclamped_funding=unclamped_funding)
+    sized = _build_sized(p, spec, qty, leverage, unclamped_funding=unclamped_funding,
+                         pay_bnb=inp.pay_bnb)
 
     # 7. Final liq-distance assertion
     ratio = liq_distance_ratio(p.entry, p.stop, sized.liq_price, p.direction)
