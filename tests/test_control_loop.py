@@ -340,3 +340,61 @@ def test_daily_rebalance_neutrality_breach_forces_full_set(tmp_path, monkeypatch
     assert len(result.legs) == len(target.legs)
     assert {(leg.symbol, leg.direction) for leg in result.legs} == \
         {(leg.symbol, leg.direction) for leg in target.legs}
+
+
+def test_daily_rebalance_zstop_wins_over_neutrality_breach(tmp_path, monkeypatch):
+    # CO-OCCURRENCE: when the recomputed book is BOTH neutrality-breached AND has a stopped spread,
+    # the hard z-stop EXIT (§6.2) must WIN — the stopped pair's legs stay FLATTENED (zero notional),
+    # never re-marked at TARGET notional by the breach override's full-recomputed-set re-mark. This
+    # is the interaction the two single-branch tests above each miss in isolation; it is exactly the
+    # re-mark regression (re-opening a cointegration-broken pair at full size).
+    cfg = NeutralityConfig()  # dollar_band=0.03, beta_band=0.05
+    geometries = _broad_geometries()
+    sleeves = _broad_sleeves(NOW)
+    target = weekly_selection(
+        tmp_path / "s", geometries, sleeves,
+        equity=20000.0, prior=None, cfg=cfg, cycle=1,
+    )
+    syms = [leg.symbol for leg in target.legs]
+
+    def _slug(sym: str) -> str:
+        return sym.replace("/", "").replace(":", "")
+
+    pair_id = f"{_slug(syms[0])}__{_slug(syms[1])}"
+    # stamp the pair_id onto the two legs so the stopped spread maps back to real book legs
+    forced = target.model_copy(update={"legs": [
+        leg.model_copy(update={"pair_id": pair_id}) if leg.symbol in (syms[0], syms[1]) else leg
+        for leg in target.legs
+    ]})
+    prior_by_sym = {leg.symbol: leg for leg in forced.legs}
+
+    # Recomputed book == prior legs (so the base carry-over emits ZERO) BUT residuals BREACH the
+    # dollar band, so the breach override would re-mark the FULL recomputed set at target notional.
+    breached = forced.model_copy(update={
+        "legs": [WeightLeg(**leg.model_dump()) for leg in forced.legs],
+        "dollar_residual_frac": 0.50,
+        "beta_residual": 0.0,
+    })
+    monkeypatch.setattr(cl, "optimize_book", lambda *a, **k: breached)
+
+    result = daily_rebalance(
+        tmp_path / "s", forced, geometries, spreads=[_stop_spread(pair_id)],
+        equity=20000.0, cfg=cfg, cycle=4,
+    )
+    by_key = {(leg.symbol, leg.direction): leg for leg in result.legs}
+    # the breach still forces the full recomputed set into the delta book...
+    assert {(leg.symbol, leg.direction) for leg in result.legs} == \
+        {(leg.symbol, leg.direction) for leg in forced.legs}
+    # ...but the stopped pair's legs stay FLATTENED (z-stop wins), NOT re-marked at target notional.
+    for sym in (syms[0], syms[1]):
+        d = prior_by_sym[sym].direction
+        flat = by_key[(sym, d)]
+        assert flat.target_notional == 0.0, (
+            f"{sym} stopped pair must stay flat despite the neutrality breach, not be re-marked"
+        )
+        assert flat.weight == 0.0
+        assert flat.direction == d
+    # the non-stopped legs are NOT zeroed — they carry the recomputed (breach) re-mark
+    nonstopped = [leg for leg in result.legs if leg.symbol not in (syms[0], syms[1])]
+    assert nonstopped, "the breach override should still re-mark the non-stopped legs"
+    assert any(leg.target_notional != 0.0 for leg in nonstopped)

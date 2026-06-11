@@ -170,12 +170,15 @@ def daily_rebalance(
     sentiment by re-running `optimize_book` against that set (`prior_legs=target.legs`, so the
     turnover/no-trade band excludes unchanged legs), then trades ONLY the deltas via
     `rebalance_deltas(prior=target, target=recomputed)`. Two overrides force a trade on an
-    otherwise in-band leg: any `Spread.state == "stop"` FLATTENS that pair's legs (zero-notional
-    unwind deltas — the hard z-stop is the cointegration-break EXIT, §6.2, NOT a re-mark at target
-    notional), and a `neutrality_breached` recomputed book forces the full recomputed leg set
-    (dollar/beta drift off-neutral). The returned `TargetWeights` carries the recomputed book's
-    residual/deployment metadata but its `legs` are the delta book the Trader must execute — an
-    in-band, no-stop, neutral book therefore yields ZERO delta legs (no churn). Persisted under the
+    otherwise in-band leg: a `neutrality_breached` recomputed book forces the full recomputed leg
+    set (dollar/beta drift off-neutral), and any `Spread.state == "stop"` FLATTENS that pair's legs
+    (zero-notional unwind deltas — the hard z-stop is the cointegration-break EXIT, §6.2, NOT a
+    re-mark at target notional). The z-stop flatten is applied LAST so the hard-stop EXIT always
+    WINS: a book that is BOTH breached AND has a stopped spread still flattens the broken pair
+    rather than re-marking its legs at target notional. The returned `TargetWeights` carries the
+    recomputed book's residual/deployment metadata but its `legs` are the delta book the Trader must
+    execute — an in-band, no-stop, neutral book therefore yields ZERO delta legs (no churn).
+    Persisted under the
     cadence-segmented daily root `state/daily/cycle/<cycle>/target_weights.json` (the SAME root the
     daily due-gate reads — CADENCE-ROOT INVARIANT)."""
     sleeves = _sleeves_from_legs(target.legs, target.as_of_ts)
@@ -193,12 +196,22 @@ def daily_rebalance(
         for leg in rebalance_deltas(target, recomputed)
     }
 
-    # z-stop override: a hard z-stop (|z| >= stop_z) is the cointegration-break EXIT (§6.2: "hard
-    # stop |z| >= 3"; the pairs sleeve treats state=="stop" as "emit no legs" == close). So a
-    # stopped spread FLATTENS its pair's legs — NOT re-mark them at target notional. The pair_id is
-    # carried on the PRIOR target's legs (the fixed set), so we resolve stopped pairs -> the prior
-    # legs there and force a ZERO-notional unwind delta (mirroring rebalance_deltas' removed-leg
-    # unwind) keyed by the prior leg's (symbol, direction) — the position that actually exists.
+    # neutrality-breach override: an off-neutral recomputed book forces the FULL recomputed set.
+    if neutrality_breached(recomputed, cfg):
+        for leg in recomputed.legs:
+            delta_by_key[(leg.symbol, leg.direction)] = leg
+
+    # z-stop override (applied LAST so the hard-stop EXIT WINS): a hard z-stop (|z| >= stop_z) is
+    # the cointegration-break EXIT (§6.2: "hard stop |z| >= 3"; the pairs sleeve treats
+    # state=="stop" as "emit no legs" == close). So a stopped spread FLATTENS its pair's legs — NOT
+    # re-mark them at target notional. The pair_id is carried on the PRIOR target's legs (the fixed
+    # set), so we resolve stopped pairs -> the prior legs there and force a ZERO-notional unwind
+    # delta (mirroring rebalance_deltas' removed-leg unwind) keyed by the prior leg's
+    # (symbol, direction) — the position that actually exists. This MUST run after the
+    # neutrality-breach loop: when a book is BOTH breached AND has a stopped spread, the breach loop
+    # would otherwise re-mark the stopped pair's legs at TARGET notional, defeating the hard z-stop
+    # exit; flattening last guarantees the cointegration-broken pair is closed, never re-opened at
+    # full size.
     stopped_pairs = {sp.pair_id for sp in spreads if sp.state == "stop"}
     if stopped_pairs:
         for leg in target.legs:
@@ -206,11 +219,6 @@ def daily_rebalance(
                 delta_by_key[(leg.symbol, leg.direction)] = leg.model_copy(
                     update={"target_notional": 0.0, "weight": 0.0}
                 )
-
-    # neutrality-breach override: an off-neutral recomputed book forces the FULL recomputed set.
-    if neutrality_breached(recomputed, cfg):
-        for leg in recomputed.legs:
-            delta_by_key[(leg.symbol, leg.direction)] = leg
 
     delta_legs = list(delta_by_key.values())
     rebalanced = recomputed.model_copy(update={"legs": delta_legs})
