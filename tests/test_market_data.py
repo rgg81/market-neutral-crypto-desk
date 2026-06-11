@@ -83,6 +83,56 @@ def test_scan_universe_excludes_all_tradfi_wrappers():
         assert s not in syms
 
 
+# Gold/commodity-PEGGED tokens (spec §1/§20: "no gold coins / metals / commodities"). These are
+# classified underlyingType=COIN by Binance (they are tradeable crypto tokens that TRACK a metal),
+# so the underlyingType allowlist passes them — an explicit base-symbol denylist must reject them.
+_PEGGED_COMMODITY_MARKETS = {
+    "PAXG/USDT:USDT": {"base": "PAXG", "symbol": "PAXG/USDT:USDT",
+                       "info": {"baseAsset": "PAXG", "underlyingType": "COIN",
+                                "contractType": "PERPETUAL"}},   # PAX Gold
+    "XAUT/USDT:USDT": {"base": "XAUT", "symbol": "XAUT/USDT:USDT",
+                       "info": {"baseAsset": "XAUT", "underlyingType": "COIN",
+                                "contractType": "PERPETUAL"}},   # Tether Gold
+}
+
+
+@pytest.mark.parametrize("sym", list(_PEGGED_COMMODITY_MARKETS))
+def test_is_crypto_perp_rejects_pegged_commodity_token(sym):
+    # PAXG (PAX Gold) / XAUT (Tether Gold) are classified underlyingType=COIN, so they slip past the
+    # COIN allowlist — but they are gold-PEGGED and the no-gold-coins mandate (§1/§20) forbids them.
+    # The explicit pegged-commodity denylist must reject them while real crypto COIN perps pass.
+    assert is_crypto_perp(_PEGGED_COMMODITY_MARKETS[sym]) is False
+    assert is_crypto_perp(_MARKETS["BTC/USDT:USDT"]) is True
+
+
+def test_scan_universe_excludes_pegged_commodity_tokens():
+    """PAXG / XAUT rank HIGH by 24h volume on Binance USD-M and are classified COIN, yet the
+    gold-pegged denylist must keep them OUT of the scanned universe while BTC/ETH survive."""
+    markets = {
+        "BTC/USDT:USDT": _MARKETS["BTC/USDT:USDT"],
+        "ETH/USDT:USDT": {"info": {"underlyingType": "COIN", "contractType": "PERPETUAL"}},
+        **_PEGGED_COMMODITY_MARKETS,
+    }
+
+    class _Client:
+        def fetch_tickers(self):
+            t = {
+                "BTC/USDT:USDT": {"quoteVolume": 1e10, "percentage": 0.1, "last": 70000.0},
+                "ETH/USDT:USDT": {"quoteVolume": 5e9, "percentage": 0.0, "last": 2000.0},
+            }
+            # each gold-pegged token out-ranks BTC by 24h volume, yet must be filtered out
+            for i, s in enumerate(_PEGGED_COMMODITY_MARKETS):
+                t[s] = {"quoteVolume": 9e10 + i, "percentage": 0.0, "last": 2300.0}
+            return t
+
+    _Client.markets = markets
+    rows = scan_universe(_Client(), top_n=10)
+    syms = [r["symbol"] for r in rows]
+    assert syms == ["BTC/USDT:USDT", "ETH/USDT:USDT"]  # only the real crypto perps survive
+    for s in _PEGGED_COMMODITY_MARKETS:
+        assert s not in syms
+
+
 def test_scan_universe_drops_tradfi_and_non_perp():
     rows = scan_universe(_TickerClient(), top_n=10)
     syms = [r["symbol"] for r in rows]

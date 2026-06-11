@@ -63,13 +63,39 @@ def parse_symbol_spec(market: dict, tiers: list[dict]) -> SymbolSpec:
 # `underlyingType` is COIN for the real cryptocurrencies; everything else is excluded.
 _CRYPTO_UNDERLYING_TYPES = frozenset({"COIN"})
 
+# Metal/commodity-PEGGED tokens the no-gold-coins mandate (§1/§20) FORBIDS. These are tradeable
+# crypto tokens that TRACK a metal price, so Binance classifies them `underlyingType=COIN` and they
+# slip past the COIN allowlist above — an explicit base-symbol denylist is the only thing that keeps
+# them out. Keyed on the base asset (the part before `/USDT`), so it is exchange/quote agnostic and
+# trivially extensible: add a base symbol here to ban a new metal/commodity-pegged token.
+_PEGGED_COMMODITY_BASES = frozenset({"PAXG", "XAUT"})  # PAX Gold, Tether Gold
+
+
+def _base_symbol(market: dict | None) -> str:
+    """Best-effort base asset for a ccxt market dict, UPPER-cased.
+
+    Prefers the ccxt unified `base` field, then the raw Binance `info.baseAsset`, then parses the
+    unified `symbol` (`PAXG/USDT:USDT` -> `PAXG`). Returns "" when nothing identifies the base."""
+    market = market or {}
+    base = market.get("base")
+    if not base:
+        base = (market.get("info") or {}).get("baseAsset")
+    if not base:
+        sym = market.get("symbol") or ""
+        base = sym.split("/", 1)[0] if "/" in sym else ""
+    return str(base).upper()
+
 
 def is_crypto_perp(market: dict | None) -> bool:
-    """True only for a cryptocurrency COIN perp; False for TradFi-wrapper contracts.
+    """True only for a cryptocurrency COIN perp; False for TradFi-wrapper / metal-pegged contracts.
 
     Uses `underlyingType` authoritatively (COIN-only allowlist); on a metadata gap falls back to
-    `contractType` so a TRADIFI_PERPETUAL is still rejected while a plain PERPETUAL is kept.
+    `contractType` so a TRADIFI_PERPETUAL is still rejected while a plain PERPETUAL is kept. A
+    metal/commodity-PEGGED token (`_PEGGED_COMMODITY_BASES`, e.g. PAXG/XAUT) is rejected EVEN THOUGH
+    Binance classifies it COIN — the no-gold-coins mandate (§1/§20) forbids gold/metals/commodities.
     """
+    if _base_symbol(market) in _PEGGED_COMMODITY_BASES:
+        return False  # gold/metal-pegged token — forbidden despite its COIN classification
     info = (market or {}).get("info") or {}
     utype = info.get("underlyingType")
     if utype:
@@ -88,7 +114,10 @@ def scan_universe(client, top_n: int = 30) -> list[dict]:
     for sym, t in tickers.items():
         if not sym.endswith("/USDT:USDT"):
             continue
-        if not is_crypto_perp(markets.get(sym)):
+        # Carry the ticker symbol into the market dict so `is_crypto_perp` can derive the base asset
+        # (for the pegged-commodity denylist) even when the market metadata omits base/baseAsset.
+        market = {**(markets.get(sym) or {}), "symbol": sym}
+        if not is_crypto_perp(market):
             continue
         qv = t.get("quoteVolume") or 0.0
         last = t.get("last")
