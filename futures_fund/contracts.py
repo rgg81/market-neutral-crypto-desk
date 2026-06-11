@@ -145,3 +145,25 @@ class Spread(BaseModel):
     notional_y: float = 0.0
     notional_x: float = 0.0
     realized_pnl: float = 0.0                     # attributed at pair level
+
+
+class AgentProposal(BaseModel):
+    """One gate-ready per-leg order the Trader emits from a `TargetWeights` leg. The Trader does NO
+    sizing — notional comes from the optimizer — so this is a pure entry/stop/TP envelope. Field
+    names are reused verbatim by the `trader.json` conformance fixture."""
+    symbol: str                                   # ccxt unified id, e.g. BTC/USDT:USDT
+    direction: Direction
+    entry: float
+    stop: float
+    take_profit: float
+    rationale: str = ""
+    trigger_type: Literal["market", "limit", "stop"] = "market"
+
+
+class TraderOutput(BaseModel):
+    """The Trader/Execution planner's bundle: gate-ready opens + management + triggers. Mirrors
+    the weekly `ScalperOutput`; an explicit empty `management` list is the stand-down contract."""
+    proposals: list[AgentProposal] = Field(default_factory=list)
+    management: list[dict] = Field(default_factory=list)
+    triggers: list[dict] = Field(default_factory=list)
+    cancel_triggers: list[dict] = Field(default_factory=list)
