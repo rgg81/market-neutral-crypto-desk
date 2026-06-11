@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from futures_fund import cointegration as co
+from futures_fund.contracts import Pair
 
 
 def _cointegrated_pair(n: int = 400, seed: int = 7) -> tuple[pd.Series, pd.Series]:
@@ -131,3 +132,33 @@ def test_fdr_bonferroni_multiplies_by_m():
 
 def test_fdr_empty_returns_empty():
     assert co.fdr_adjust([]) == []
+
+
+def test_build_pair_assembles_validated_pair():
+    y, x = _cointegrated_pair()
+    pair = co.build_pair(y, x, "BTC/USDT:USDT", "ETH/USDT:USDT", cycle=4)
+    assert isinstance(pair, Pair)
+    assert pair.pair_id == "BTCUSDT__ETHUSDT"      # canonical slash-free id
+    assert pair.symbol_y == "BTC/USDT:USDT"
+    assert pair.symbol_x == "ETH/USDT:USDT"
+    assert pair.method == "engle_granger"
+    assert pair.adf_pvalue < 0.05
+    assert pair.adf_pvalue_adj is None             # FDR fills this later across the candidate set
+    assert abs(pair.hedge_ratio - 2.0) < 0.1
+    assert pair.formed_cycle == 4
+    assert pair.cointegrated is True
+    assert pair.half_life > 0.0
+
+
+def test_build_pair_johansen_method():
+    # method="johansen": hedge_ratio + johansen fields come from the Johansen result, and
+    # cointegration is judged by trace_stat > crit_95 (NOT the EG ADF p, which is informational).
+    y, x = _cointegrated_pair()
+    pair = co.build_pair(y, x, "BTC/USDT:USDT", "ETH/USDT:USDT", cycle=4, method="johansen")
+    assert pair.method == "johansen"
+    assert pair.johansen_trace_stat is not None
+    assert pair.johansen_crit_95 is not None
+    # cointegrated derives from the trace statistic for the johansen branch
+    assert pair.cointegrated == (pair.johansen_trace_stat > pair.johansen_crit_95)
+    assert pair.cointegrated is True               # the simulated pair IS cointegrated
+    assert pair.half_life > 0.0

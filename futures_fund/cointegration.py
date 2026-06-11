@@ -14,7 +14,8 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
-from futures_fund.models import SpreadState
+from futures_fund.contracts import Pair
+from futures_fund.models import PairTestMethod, SpreadState
 
 
 def engle_granger(y: pd.Series, x: pd.Series) -> tuple[float, float, float]:
@@ -150,3 +151,58 @@ def fdr_adjust(pvalues: list[float], *, alpha: float = 0.05,
     for rank, idx in enumerate(order):
         out[idx] = adj_sorted[rank]
     return out
+
+
+def _canonical_pair_id(symbol_y: str, symbol_x: str) -> str:
+    """Slash-free canonical pair id, e.g. ("BTC/USDT:USDT", "ETH/USDT:USDT") -> "BTCUSDT__ETHUSDT".
+
+    Drops the ccxt ':SETTLE' suffix and the '/' delimiter so the id is split-safe on the "__"
+    separator and matches the documented Pair.pair_id convention.
+    """
+    def _norm(sym: str) -> str:
+        return sym.split(":", 1)[0].replace("/", "")
+    return f"{_norm(symbol_y)}__{_norm(symbol_x)}"
+
+
+def build_pair(y: pd.Series, x: pd.Series, symbol_y: str, symbol_x: str, *, cycle: int,
+               method: PairTestMethod = "engle_granger") -> Pair:
+    """Test + OU-fit + assemble a validated Pair. adf_pvalue_adj is filled later by fdr_adjust
+    across the full candidate set.
+
+    For method=="engle_granger", cointegration is judged by the ADF p (< 0.05). For
+    method=="johansen", hedge_ratio + johansen fields come from the Johansen result and
+    cointegration is judged by trace_stat > crit_95; adf_pvalue is retained but informational.
+    """
+    hedge_ratio, adf_pvalue, _ = engle_granger(y, x)
+    yv = pd.Series(y).reset_index(drop=True).astype(float)
+    xv = pd.Series(x).reset_index(drop=True).astype(float)
+    n = min(len(yv), len(xv))
+    spread = yv.iloc[:n].to_numpy() - hedge_ratio * xv.iloc[:n].to_numpy()
+    theta, mu, sigma_eq = ou_fit(pd.Series(spread))
+    johansen_trace = johansen_crit = None
+    cointegrated = adf_pvalue < 0.05
+    if method == "johansen":
+        jo = johansen(pd.DataFrame({"y": yv, "x": xv}))
+        hedge_ratio = jo["hedge_ratio"]
+        johansen_trace = jo["trace_stat"]
+        johansen_crit = jo["crit_95"]
+        cointegrated = jo["trace_stat"] > jo["crit_95"]   # trace-stat verdict for johansen
+        # re-fit the OU spread on the Johansen-selected hedge ratio
+        spread = yv.iloc[:n].to_numpy() - hedge_ratio * xv.iloc[:n].to_numpy()
+        theta, mu, sigma_eq = ou_fit(pd.Series(spread))
+    return Pair(
+        pair_id=_canonical_pair_id(symbol_y, symbol_x),
+        symbol_y=symbol_y,
+        symbol_x=symbol_x,
+        hedge_ratio=hedge_ratio,
+        method=method,
+        adf_pvalue=adf_pvalue,
+        johansen_trace_stat=johansen_trace,
+        johansen_crit_95=johansen_crit,
+        half_life=half_life(theta),
+        theta=theta,
+        mu=mu,
+        sigma_eq=sigma_eq,
+        formed_cycle=cycle,
+        cointegrated=cointegrated,
+    )
