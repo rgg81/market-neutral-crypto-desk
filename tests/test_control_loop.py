@@ -398,3 +398,51 @@ def test_daily_rebalance_zstop_wins_over_neutrality_breach(tmp_path, monkeypatch
     nonstopped = [leg for leg in result.legs if leg.symbol not in (syms[0], syms[1])]
     assert nonstopped, "the breach override should still re-mark the non-stopped legs"
     assert any(leg.target_notional != 0.0 for leg in nonstopped)
+
+
+# --- Task 3.7: control_loop_cli weekly/daily entrypoint ---
+
+
+def test_cli_writes_weekly_cadence_root(tmp_path, monkeypatch, balanced_settings):
+    # The CLI persists the weekly target under the SAME cadence-due root the gate reads:
+    # state/weekly/cycle/<N>/target_weights.json (CADENCE-ROOT INVARIANT). It also prints
+    # parseable JSON to stdout (the Trader's hand-off contract).
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    main(["--cadence", "weekly", "--cycle", "1"])
+    assert (tmp_path / "state" / "weekly" / "cycle" / "1" / "target_weights.json").exists()
+
+
+def test_cli_prints_parseable_json(tmp_path, monkeypatch, balanced_settings, capsys):
+    # stdout must be a single JSON object the Trader can parse (json.dumps(..., default=str)).
+    import json
+
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    main(["--cadence", "weekly", "--cycle", "1"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["feasible"] is True
+    assert {leg["symbol"] for leg in payload["legs"]}  # non-empty weekly book
+
+
+def test_cli_fail_closed_when_inputs_missing(tmp_path, monkeypatch, balanced_settings):
+    # Fail-closed (§9 / contract): SystemExit(2) when the upstream sleeve/geometry artifacts the
+    # cadence cycle needs are absent — the loop never runs a meeting on missing inputs.
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    # cycle 7 has no seeded geometries/sleeves -> fail closed.
+    with pytest.raises(SystemExit) as exc:
+        main(["--cadence", "weekly", "--cycle", "7"])
+    assert exc.value.code == 2

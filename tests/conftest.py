@@ -8,16 +8,78 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from futures_fund.config import Settings
 from futures_fund.contracts import (
     CoinGeometry,
+    GeometryBundle,
     SleeveSignal,
     SleeveTilt,
     TargetWeights,
     WeightLeg,
 )
+from futures_fund.cycle_io import save_output
 from futures_fund.scheduling import floor_tf
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
+
+
+def _balanced_geometries() -> list[CoinGeometry]:
+    """A 6-name universe (3 long / 3 short) with a BALANCED beta structure, so a fully-deployed
+    dollar+beta-neutral book CAN respect the per-name cap (feasible=True)."""
+    return [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.1, adv_usd=1e9),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.2, adv_usd=4e8),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=1.0, adv_usd=3e8),
+        CoinGeometry(symbol="ADA/USDT:USDT", mark=0.5, beta_btc=1.1, adv_usd=2e8),
+        CoinGeometry(symbol="DOGE/USDT:USDT", mark=0.15, beta_btc=1.2, adv_usd=2e8),
+    ]
+
+
+def _balanced_sleeves() -> list[SleeveSignal]:
+    """3 longs / 3 shorts so each side can spread its gross across enough names to stay under
+    the per-name cap (the band-respecting, feasible book)."""
+    return [
+        SleeveSignal(
+            sleeve="factor",
+            risk_budget_frac=1.0,
+            as_of_ts=NOW,
+            tilts=[
+                SleeveTilt(symbol="BTC/USDT:USDT", direction="long", target_weight=0.5),
+                SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.5),
+                SleeveTilt(symbol="ADA/USDT:USDT", direction="long", target_weight=0.5),
+                SleeveTilt(symbol="ETH/USDT:USDT", direction="short", target_weight=-0.5),
+                SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.5),
+                SleeveTilt(symbol="DOGE/USDT:USDT", direction="short", target_weight=-0.5),
+            ],
+        )
+    ]
+
+
+@pytest.fixture
+def balanced_settings(tmp_path) -> Settings:
+    """A `Settings` plus the upstream cycle artifacts (`geometries.json` / `sleeves.json`) the
+    control-loop CLI loads to run a weekly Selection / daily Rebalance.
+
+    The CLI reads its geometry + sleeve inputs from the SAME cadence-segmented cycle root the
+    due-gate uses (`state/<cadence>/cycle/<N>/`). Seeding them under `tmp_path/state` lines them up
+    with the CLI's cwd-relative `state/` after the test's `monkeypatch.chdir(tmp_path)`, so a
+    `--cadence weekly --cycle 1` invocation finds a feasible balanced book and persists a
+    `target_weights.json`. The 6-name (3 long / 3 short) balanced-beta structure is the proven
+    feasible optimizer input used across the control-loop tests."""
+    state = tmp_path / "state"
+    bundle = GeometryBundle(geometries=_balanced_geometries(), as_of_ts=NOW)
+    sleeves = _balanced_sleeves()
+    for cadence in ("weekly", "daily"):
+        save_output(state, 1, "geometries", bundle, cadence=cadence)
+        save_output(
+            state,
+            1,
+            "sleeves",
+            {"sleeves": [s.model_dump(mode="json") for s in sleeves]},
+            cadence=cadence,
+        )
+    return Settings()
 
 
 @pytest.fixture
