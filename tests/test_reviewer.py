@@ -336,6 +336,43 @@ def test_funding_amount_matches_realized(make_tw):
     assert amt.ok is True
 
 
+def test_funding_sign_caught_when_primitive_flips_sign(make_tw, monkeypatch):
+    # ADVERSARIAL fail-path: the funding_sign check re-derives the EXPECTED sign from market physics
+    # (short-on-positive-funding => credit) independently of realized_funding. If the audited
+    # primitive flips its sign convention, the per-leg sign cross-check must catch it (ok=False) —
+    # proving the check is falsifiable, not a self-equal pin.
+    import futures_fund.reviewer as rev
+
+    monkeypatch.setattr(
+        rev, "realized_funding", lambda notional, mark, qty, rate, direction: -(
+            (1.0 if direction == "long" else -1.0) * mark * qty * rate
+        ) * -1.0  # deliberately wrong: flips the correct -side*mark*qty*rate sign
+    )
+    geoms = _funding_geoms({"ETH/USDT:USDT": {"mark": 100.0, "funding_rate": 0.001}})
+    tw = make_tw([("ETH/USDT:USDT", "short", 5000.0)])
+    checks = rev.check_funding(tw, geoms)
+    sign = next(c for c in checks if c.name == "funding_sign")
+    assert sign.ok is False
+
+
+def test_funding_amount_caught_when_primitive_wrong_scale(make_tw, monkeypatch):
+    # ADVERSARIAL fail-path: funding_amount compares the closed-form Σ -side·notional·rate
+    # (expected) to Σ realized_funding (actual). A primitive that mis-scales (e.g. forgets a
+    # factor) makes the totals diverge => ok=False.
+    import futures_fund.reviewer as rev
+
+    monkeypatch.setattr(
+        rev, "realized_funding", lambda notional, mark, qty, rate, direction: (
+            -(1.0 if direction == "long" else -1.0) * mark * qty * rate
+        ) * 2.0  # correct sign but 2x scale => expected != actual
+    )
+    geoms = _funding_geoms({"ETH/USDT:USDT": {"mark": 100.0, "funding_rate": 0.001}})
+    tw = make_tw([("ETH/USDT:USDT", "short", 5000.0)])
+    checks = rev.check_funding(tw, geoms)
+    amt = next(c for c in checks if c.name == "funding_amount")
+    assert amt.ok is False
+
+
 # --- names 9 + 10: pair_pnl_attribution + pair_leg_hedge_ratio ----------------------------
 
 def _pair() -> Pair:
@@ -448,9 +485,24 @@ def test_sharpe_daily_365_weekly_52():
     weekly = check_sharpe_annualization("weekly")
     assert daily.name == "sharpe_annualization"
     assert daily.expected == pytest.approx(365.0)
+    assert daily.actual == pytest.approx(365.0)
     assert daily.ok is True
     assert weekly.expected == pytest.approx(52.0)
+    assert weekly.actual == pytest.approx(52.0)
     assert weekly.ok is True
+
+
+def test_sharpe_annualization_caught_on_legacy_regression(monkeypatch):
+    # ADVERSARIAL fail-path: the check compares the spec factor (expected) to the constant the
+    # production metrics module actually exposes (actual). If the metrics module regresses back to
+    # the inherited 2190 4h factor, the check must FAIL (ok=False) — proving expected-vs-actual is a
+    # real comparison, not an always-true `!= 2190` tautology.
+    import futures_fund.reviewer as rev
+
+    monkeypatch.setattr(rev, "PERIODS_PER_YEAR_WEEKLY", 2190.0)
+    chk = rev.check_sharpe_annualization("weekly")
+    assert chk.actual == pytest.approx(2190.0)
+    assert chk.ok is False
 
 
 # --- name 13: exchange_filter_compliance ---------------------------------------------------
@@ -504,3 +556,42 @@ def test_exchange_filter_min_notional_ok(make_tw):
     chk = checks[0]
     assert chk.name == "exchange_filter_compliance"
     assert chk.ok is True
+
+
+def test_exchange_filter_off_grid_mark_is_compliant(make_tw):
+    # REGRESSION GUARD for the old over-strict logic: a realistic mark that IS on the tick grid
+    # (100.07 on a 0.01 tick) divided into an arbitrary 5000 notional yields qty 49.965... which the
+    # previous check wrongly flagged as 'off step_size'. After grid-rounding the executable order
+    # (49.965 @ 100.07 => ~4999.998) clears min_notional, so the leg is COMPLIANT — the raw
+    # notional/mark ratio landing off-grid is normal and must NOT halt a legitimate book.
+    spec = _spec("ETH/USDT:USDT", min_notional=10.0, tick=0.01, step=0.001)
+    geoms = _filter_geoms({"ETH/USDT:USDT": (100.07, spec)})
+    tw = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    checks = check_exchange_filters(tw, geoms)
+    assert checks[0].ok is True
+
+
+def test_exchange_filter_rounds_to_dust(make_tw):
+    # ADVERSARIAL fail-path for the grid logic: a leg whose qty floors to ZERO on a coarse step grid
+    # cannot be submitted => non-compliant. notional 5 / mark 100 = 0.05 qty, floored to step 1.0
+    # => 0 lots.
+    geoms = _filter_geoms(
+        {"ETH/USDT:USDT": (100.0, _spec("ETH/USDT:USDT", min_notional=1.0, tick=0.01, step=1.0))}
+    )
+    tw = make_tw([("ETH/USDT:USDT", "long", 5.0)])
+    checks = check_exchange_filters(tw, geoms)
+    assert checks[0].ok is False
+    assert "rounds to 0" in checks[0].detail
+
+
+def test_exchange_filter_below_min_after_rounding(make_tw):
+    # ADVERSARIAL fail-path: a leg whose RAW notional clears min_notional but whose grid-FLOORED
+    # qty drops the executable notional BELOW it => non-compliant. notional 150 / mark 100 = 1.5
+    # qty; floored to step 1.0 => 1 lot => executable notional 100 < min_notional 120.
+    geoms = _filter_geoms(
+        {"ETH/USDT:USDT": (100.0, _spec("ETH/USDT:USDT", min_notional=120.0, tick=0.01, step=1.0))}
+    )
+    tw = make_tw([("ETH/USDT:USDT", "long", 150.0)])
+    checks = check_exchange_filters(tw, geoms)
+    assert checks[0].ok is False
+    assert "executable notional" in checks[0].detail

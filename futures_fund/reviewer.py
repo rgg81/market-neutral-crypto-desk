@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 from futures_fund.contracts import (
@@ -240,26 +241,51 @@ def check_caps(
 _TOL = 1e-6  # reviewer tolerance (canonical contract §reviewer.tolerance)
 
 
+def _physical_funding_sign(direction: str, rate: float) -> int:
+    """GROUND-TRUTH funding sign from market physics, derived WITHOUT calling realized_funding.
+
+    The settlement law (§11): on a POSITIVE funding rate longs PAY (debit, balance contribution
+    < 0) and shorts RECEIVE (credit, > 0); on a NEGATIVE rate the sides swap; a zero rate settles
+    nothing. So the expected balance-contribution sign is `-side(direction) * sign(rate)`. This is
+    an INDEPENDENT re-derivation (it does not reuse `realized_funding`'s `-side*mark*qty*rate`
+    expression), so comparing it against the primitive's actual output is a real falsification: if
+    `realized_funding` ever flipped its sign convention the `funding_sign` check would fail."""
+    if rate > 0:
+        rate_sign = 1
+    elif rate < 0:
+        rate_sign = -1
+    else:
+        return 0
+    side = 1 if direction == "long" else -1
+    return -side * rate_sign
+
+
 def check_funding(
     target: TargetWeights, geometries: list[CoinGeometry]
 ) -> list[ReviewerCheck]:
     """Re-derive each ALPHA leg's realized funding from ground truth and emit BOTH `funding_sign`
-    and `funding_amount` (canonical names 7 + 8).
+    and `funding_amount` (canonical names 7 + 8). Both checks are ADVERSARIAL cross-derivations: an
+    independent re-derivation is the `expected` and the value produced by the audited primitive
+    (`funding_intervals.realized_funding`) is the `actual`, so a sign/scale regression in the
+    primitive falsifies the check (it is NOT a self-equal pin).
 
     For each leg the qty = |target_notional| / mark and the per-interval rate is the geometry's
-    SIGNED `funding_rate`, clamped sign-preservingly (`clamp_funding_rate`). The settlement is
-    `funding_intervals.realized_funding(...)`, which is a SIGNED balance contribution: a SHORT on
-    POSITIVE funding RECEIVES funding (a positive CREDIT). The reviewer never trusts an artifact's
-    funding figure — both the sign and the amount are recomputed here.
+    SIGNED `funding_rate`, clamped sign-preservingly (`clamp_funding_rate`). `realized_funding(...)`
+    is a SIGNED balance contribution: a SHORT on POSITIVE funding RECEIVES funding (a positive
+    CREDIT). The reviewer never trusts an artifact's funding figure.
 
-    - `funding_sign`: the recomputed total realized funding's sign is consistent with the legs'
-      directions and signed rates (a short-on-positive-funding shows a positive credit). `ok` is
-      True iff no individual leg's realized contribution contradicts its direction×rate sign.
-    - `funding_amount`: the recomputed total realized funding (the `actual` mirrors it — there is
-      no separately-stated funding field on `TargetWeights`, so the amount check pins that the
-      re-derivation itself is well-formed and finite)."""
+    - `funding_sign`: per leg the EXPECTED contribution sign is re-derived from market physics
+      (`_physical_funding_sign`, `-side*sign(rate)`, computed without the primitive) and compared
+      to the SIGN of the primitive's output. `ok` is False if any leg's `realized_funding` sign
+      contradicts the physical sign (the primitive flipped a credit to a debit or vice versa).
+    - `funding_amount`: the EXPECTED total is the closed-form settlement `Σ -side*notional*rate`
+      (independent of `realized_funding`'s mark*qty form; identical only when the primitive is
+      correct, since mark*qty == |notional| for a leg sized at notional/mark) and the ACTUAL total
+      is `Σ realized_funding(...)`. `ok` is False if they disagree beyond tolerance — so a primitive
+      that, e.g., dropped the sign or used mark² would be caught."""
     geo = {g.symbol: g for g in geometries}
-    total = 0.0
+    expected_total = 0.0  # independent closed-form Σ -side*notional*rate
+    actual_total = 0.0  # Σ realized_funding(...) (the audited primitive)
     sign_ok = True
     for leg in _alpha_legs(target):
         g = geo.get(leg.symbol)
@@ -270,33 +296,45 @@ def check_funding(
         contrib = realized_funding(
             leg.target_notional, g.mark, qty, rate, leg.direction
         )
-        total += contrib
-        # ground-truth sign: long pays on +rate (cost, <=0 credit); short receives on +rate.
+        actual_total += contrib
+        # INDEPENDENT closed form: mark*qty == |notional| for a leg sized at notional/mark.
         side = 1.0 if leg.direction == "long" else -1.0
-        expected_sign = -side * rate  # sign of -side*mark*qty*rate (mark,qty > 0)
-        if expected_sign > 0 and contrib < -_TOL:
+        expected_total += -side * abs(leg.target_notional) * rate
+        # per-leg sign cross-check: physical expected sign vs the primitive's actual sign.
+        exp_sign = _physical_funding_sign(leg.direction, rate)
+        if exp_sign > 0 and contrib < -_TOL:
             sign_ok = False
-        if expected_sign < 0 and contrib > _TOL:
+        if exp_sign < 0 and contrib > _TOL:
             sign_ok = False
+        if exp_sign == 0 and abs(contrib) > _TOL:
+            sign_ok = False
+
+    amount_ok = abs(expected_total - actual_total) <= _TOL * max(
+        1.0, abs(expected_total), abs(actual_total)
+    )
 
     sign_check = ReviewerCheck(
         name="funding_sign",
         ok=sign_ok,
-        expected=total,
-        actual=total,
+        expected=expected_total,
+        actual=actual_total,
         tolerance=_TOL,
         detail=(
-            f"re-derived realized funding {total:.6f} (short-on-positive-funding is a credit); "
-            f"per-leg sign consistent with direction×rate = {sign_ok}"
+            f"per-leg physical sign (-side·sign(rate)) vs realized_funding sign; "
+            f"consistent = {sign_ok}; Σ realized = {actual_total:.6f} "
+            f"(short-on-positive-funding is a credit)"
         ),
     )
     amount_check = ReviewerCheck(
         name="funding_amount",
-        ok=(total == total),  # finite (not NaN) — re-derivation is well-formed
-        expected=total,
-        actual=total,
+        ok=amount_ok,
+        expected=expected_total,
+        actual=actual_total,
         tolerance=_TOL,
-        detail=f"re-derived Σ realized_funding = {total:.6f}",
+        detail=(
+            f"closed-form Σ -side·notional·rate = {expected_total:.6f} vs "
+            f"Σ realized_funding = {actual_total:.6f}"
+        ),
     )
     return [sign_check, amount_check]
 
@@ -379,34 +417,76 @@ def check_rr_after_costs(proposals: list[TradeProposal]) -> ReviewerCheck:
     )
 
 
+_SHARPE_FACTOR_SPEC: dict[Cadence, float] = {"daily": 365.0, "weekly": 52.0}
+_LEGACY_4H_FACTOR = 2190.0  # the inherited (wrong-for-this-desk) 4h periods/yr (§11/§18)
+
+
 def check_sharpe_annualization(cadence: Cadence) -> ReviewerCheck:
-    """Re-derive the Sharpe annualization factor from the cadence: daily -> 365, weekly -> 52 (the
-    §11/§18 fix; NOT the inherited 2190 4h factor). `ok` iff the factor is the cadence-correct
-    constant from `metrics` (canonical name 12)."""
-    expected = (
+    """Cross-check the Sharpe annualization factor the PRODUCTION metrics module would apply
+    against the spec ground truth (canonical name 12).
+
+    `expected` is the spec-mandated periods/yr for this cadence (daily -> 365, weekly -> 52, the
+    §11/§18 fix). `actual` is the constant the production `metrics` module actually exposes for that
+    cadence (`PERIODS_PER_YEAR_DAILY` / `PERIODS_PER_YEAR_WEEKLY`) — the value `metrics.sharpe`
+    annualizes with. `ok` is True iff they MATCH and the production constant is NOT the inherited
+    2190 4h factor. So a regression that flips the metrics module back to the 4h factor (or to any
+    other value) is FALSIFIED here — this is an independent expected-vs-actual comparison, not a
+    self-equal pin."""
+    expected = _SHARPE_FACTOR_SPEC[cadence]
+    actual = (
         PERIODS_PER_YEAR_DAILY if cadence == "daily" else PERIODS_PER_YEAR_WEEKLY
     )
-    legacy_4h = 2190.0
-    ok = abs(expected - legacy_4h) > _TOL  # never the inherited 4h factor
+    matches = abs(expected - actual) <= _TOL
+    not_legacy = abs(actual - _LEGACY_4H_FACTOR) > _TOL
+    ok = matches and not_legacy
     return ReviewerCheck(
         name="sharpe_annualization",
         ok=ok,
         expected=expected,
-        actual=expected,
+        actual=actual,
         tolerance=_TOL,
-        detail=f"{cadence} annualization factor = {expected} (not the inherited 2190)",
+        detail=(
+            f"{cadence} spec periods/yr = {expected} vs metrics module {actual} "
+            f"(must match and not be the inherited 2190)"
+        ),
     )
+
+
+def _round_qty_to_step(qty: float, step: float) -> float:
+    """Floor a quantity onto the lot-step grid — the SAME rounding the executor applies to an order
+    before submission (floor, never round-up, so the book never over-fills). `step <= 0` => no
+    constraint (qty passes through). Mirrors `orders.round_qty` in the weekly executor."""
+    if step <= 0:
+        return qty
+    return round(math.floor(qty / step) * step, 10)
+
+
+def _round_price_to_tick(price: float, tick: float) -> float:
+    """Round a price onto the tick grid (nearest tick) — the SAME rounding the executor applies to
+    a price before submission. `tick <= 0` => no constraint. Mirrors `orders.round_price`."""
+    if tick <= 0:
+        return price
+    return round(round(price / tick) * tick, 10)
 
 
 def check_exchange_filters(
     target: TargetWeights, geometries: list[CoinGeometry]
 ) -> list[ReviewerCheck]:
-    """Re-derive exchange-filter compliance for every leg from its `SymbolSpec` (canonical name 13).
+    """Re-derive exchange-filter compliance for the ORDER THAT WOULD ACTUALLY BE SUBMITTED for each
+    leg from its `SymbolSpec` (canonical name 13).
 
-    Each ALPHA leg's traded notional must be >= the symbol's `min_notional`, and the implied qty
-    (`|notional|/mark`) and price (`mark`) must sit on the `step_size` / `tick_size` grids. A leg
-    whose geometry carries no spec is skipped (no filter to enforce). Sub-min-notional / off-grid
-    legs are flagged non-compliant."""
+    Real Binance-futures filter compliance is about the qty/price the executor submits AFTER
+    grid-rounding (`orders.round_qty` floors qty to `step_size`; `orders.round_price` rounds price
+    to `tick_size`) — NOT whether the raw `|notional|/mark` ratio happens to land on the step grid
+    (for an arbitrary notional ÷ arbitrary mark it almost never does, which would false-positive on
+    every realistic book). So the reviewer rounds qty/price exactly as the executor would and then
+    checks the REAL exchange constraints:
+
+      - the floored qty must be > 0 (a leg that rounds to a zero lot can't be submitted), and
+      - the executable notional (rounded_qty × rounded_price) must be >= `min_notional`.
+
+    A leg whose geometry carries no spec is skipped (no filter to enforce). Sub-min-notional /
+    rounds-to-dust legs are flagged non-compliant."""
     geo = {g.symbol: g for g in geometries}
     violations: list[str] = []
     for leg in _alpha_legs(target):
@@ -415,20 +495,21 @@ def check_exchange_filters(
             continue
         spec = g.spec
         notional = abs(leg.target_notional)
-        if notional < spec.min_notional - _TOL:
+        # the order the executor would actually submit (grid-rounded qty @ grid-rounded price)
+        raw_qty = notional / g.mark
+        order_qty = _round_qty_to_step(raw_qty, spec.step_size)
+        order_price = _round_price_to_tick(g.mark, spec.tick_size)
+        if order_qty <= 0:
             violations.append(
-                f"{leg.symbol} notional {notional:.2f} < min_notional {spec.min_notional}"
+                f"{leg.symbol} qty {raw_qty:.8f} rounds to 0 on step_size {spec.step_size}"
             )
             continue
-        qty = notional / g.mark
-        if spec.step_size > 0:
-            steps = qty / spec.step_size
-            if abs(steps - round(steps)) > 1e-6:
-                violations.append(f"{leg.symbol} qty {qty} off step_size {spec.step_size}")
-        if spec.tick_size > 0:
-            ticks = g.mark / spec.tick_size
-            if abs(ticks - round(ticks)) > 1e-6:
-                violations.append(f"{leg.symbol} mark {g.mark} off tick_size {spec.tick_size}")
+        exec_notional = order_qty * order_price
+        if exec_notional < spec.min_notional - _TOL:
+            violations.append(
+                f"{leg.symbol} executable notional {exec_notional:.2f} "
+                f"< min_notional {spec.min_notional}"
+            )
     ok = not violations
     return [
         ReviewerCheck(
@@ -437,6 +518,10 @@ def check_exchange_filters(
             expected=0.0,
             actual=float(len(violations)),
             tolerance=_TOL,
-            detail=("; ".join(violations) if violations else "all legs on-grid >= min_notional"),
+            detail=(
+                "; ".join(violations)
+                if violations
+                else "all legs submit a non-zero lot >= min_notional after grid-rounding"
+            ),
         )
     ]
