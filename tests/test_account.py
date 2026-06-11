@@ -39,3 +39,25 @@ def test_account_persistence_round_trip():
 
 def test_fresh_account_has_no_funding_clock():
     assert PaperAccount(cash=20_000.0).last_funding_ts is None
+
+
+def test_mark_to_market_and_equity_long_and_short():
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="long", qty=2.0, entry=2000.0)
+    acct.positions["BTC/USDT:USDT"] = _pos(
+        symbol="BTC/USDT:USDT", direction="short", qty=0.1, entry=60_000.0)
+
+    marks = {"ETH/USDT:USDT": 2100.0, "BTC/USDT:USDT": 59_000.0}
+    upnl = acct.mark_to_market(marks)
+
+    # long: 2*(2100-2000)=200 ; short: 0.1*(60000-59000)=100
+    assert upnl["ETH/USDT:USDT"] == 200.0
+    assert upnl["BTC/USDT:USDT"] == 100.0
+    assert acct.equity(marks) == 20_000.0 + 300.0
+
+
+def test_equity_skips_symbols_missing_a_mark():
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="long", qty=2.0, entry=2000.0)
+    # no mark for ETH -> contributes 0, equity == cash
+    assert acct.equity({}) == 20_000.0

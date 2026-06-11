@@ -53,3 +53,22 @@ class PaperAccount(BaseModel):
     @classmethod
     def from_dict(cls, data: dict) -> PaperAccount:
         return cls.model_validate(data)
+
+    def mark_to_market(self, marks: dict[str, float]) -> dict[str, float]:
+        """Unrealized PnL per held symbol (skips symbols with no mark).
+
+        long: qty*(mark-entry) ; short: qty*(entry-mark)."""
+        upnl: dict[str, float] = {}
+        for sym, pos in self.positions.items():
+            mark = marks.get(sym)
+            if mark is None:
+                continue
+            if pos.direction == "long":
+                upnl[sym] = pos.qty * (mark - pos.entry_price)
+            else:
+                upnl[sym] = pos.qty * (pos.entry_price - mark)
+        return upnl
+
+    def equity(self, marks: dict[str, float]) -> float:
+        """cash + sum unrealized PnL (skips symbols missing a mark)."""
+        return self.cash + sum(self.mark_to_market(marks).values())
