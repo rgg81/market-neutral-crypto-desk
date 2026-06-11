@@ -52,6 +52,42 @@ def beta_residual(weights: dict[str, float], betas: dict[str, float]) -> float:
     return sum(w * betas.get(sym, 1.0) for sym, w in weights.items())
 
 
+def project_neutral(
+    weights: dict[str, float],
+    betas: dict[str, float],
+    *,
+    dollar_band: float,
+    beta_band: float,
+) -> dict[str, float]:
+    """Least-norm projection of a signed weight vector onto the dollar+beta-neutral
+    constraint set: removes the components of the vector in the span of the dollar direction
+    (all-ones) and the beta direction so Sum(w_i) ~ 0 and Sum(w_i*beta_i) ~ 0. The result
+    lives in the (n - 2)-dimensional null space of the two constraints, so a NON-TRIVIAL
+    neutral book requires >= 3 distinct active names (with n <= 2 the only neutral point is
+    0 — see the Task 11 degenerate-case note). Sentiment tilts are applied BEFORE this call,
+    so sentiment cannot break neutrality (residuals are recomputed after). `dollar_band` /
+    `beta_band` are accepted for signature stability with the reviewer's re-derivation and to
+    document the bands this projection targets; the exact projection drives residuals to ~0,
+    well inside the bands."""
+    syms = list(weights.keys())
+    if not syms:
+        return {}
+    w = np.array([weights[s] for s in syms], dtype=float)
+    b = np.array([betas.get(s, 1.0) for s in syms], dtype=float)
+    ones = np.ones(len(syms))
+
+    # Constraint matrix C (2 x n): row0 = dollar (ones), row1 = beta.
+    c = np.vstack([ones, b])
+    residual = c @ w  # [dollar_resid, beta_resid]
+    gram = c @ c.T  # 2 x 2
+    try:
+        correction = c.T @ np.linalg.solve(gram, residual)
+    except np.linalg.LinAlgError:
+        correction = c.T @ (np.linalg.pinv(gram) @ residual)
+    w_proj = w - correction
+    return {syms[i]: float(w_proj[i]) for i in range(len(syms))}
+
+
 def ledoit_wolf_cov(returns: pd.DataFrame) -> np.ndarray:
     """Ledoit-Wolf shrunk covariance — stable, avoids unstable inversion. Drops rows with
     any NaN so the estimator sees a complete block."""
