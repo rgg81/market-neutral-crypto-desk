@@ -1,0 +1,117 @@
+# --- account / capital ---
+account_size_usdt: 20000
+target_weekly: 0.05
+max_drawdown_tolerance: 0.05
+live: false
+
+# --- two-cadence loops ---
+loops:
+  weekly:
+    timeframe: "4h"
+    regime_timeframe: "4h"
+    poll_minutes: 1440
+    deep_model: "opus"
+    quick_model: "sonnet"
+    cadence_days: 7
+  daily:
+    timeframe: "1h"
+    poll_minutes: 60
+    deep_model: "sonnet"
+    quick_model: "haiku"
+    cadence_hour_utc: 0
+
+# --- per-agent model assignment (empty this phase; agents arrive in Phase 4) ---
+# Kept as a first-class key so model_for() resolves per-agent FIRST (inherited contract);
+# Phase 4 fills this in without a breaking change to the resolution order.
+agent_models: {}
+
+# --- neutrality / capital deployment -> NeutralityConfig (hydrated in Phase 1) ---
+neutrality:
+  capital_usdt: 20000
+  target_gross_usdt: 20000
+  side_budget_usdt: 10000
+  deployment_floor: 0.90
+  dry_powder_frac: 0.10
+  per_name_cap: 0.25
+  cluster_cap: 0.40
+  dollar_band: 0.03
+  beta_band: 0.05
+  drift_band: 0.20
+  turnover_penalty: 0.001
+  corr_threshold: 0.7
+  stress_band_mult: 0.5
+
+# --- beta estimation ---
+beta:
+  lookback_days: 45
+  btc_symbol: "BTC/USDT:USDT"
+
+# --- alpha sleeves ---
+sleeves:
+  risk_parity: true
+  enabled: ["carry", "pairs", "factor", "sentiment"]
+  factor:
+    factors: ["momentum", "carry", "low_vol"]
+    tercile: 0.3333
+    weighting: "inverse_vol"
+  pairs:
+    adf_pvalue_max: 0.05
+    fdr_method: "bh"
+    entry_z: 2.0
+    exit_z: 0.0
+    stop_z: 3.0
+    min_half_life_cycles: 1.0
+    max_half_life_cycles: 40.0
+    rolling_retest_cycles: 7
+
+# --- sentiment ---
+sentiment:
+  kappa: 0.5
+  cap: 0.25
+  halflife_days: 3
+  refresh_daily: true
+
+# --- universe ---
+universe:
+  symbol_count: 30
+  min_adv_usd: 50000000
+  crypto_only: true
+
+# --- fees / funding / slippage realism ---
+fees:
+  taker_bps: 5.0
+  maker_bps: 2.0
+  pay_bnb: false
+  bnb_discount: 0.90
+funding:
+  default_interval_hours: 8
+  major_cap: 0.003
+  alt_cap: 0.02
+  majors: ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+  unclamped_in_rr: true
+  signed_realized: true
+slippage:
+  model: "depth"
+  k: 0.1
+  half_spread_bps_default: 1.0
+  depth_levels: 20
+  flat_bps: null
+
+# --- metrics / annualization ---
+metrics:
+  daily_periods_per_year: 365
+  weekly_periods_per_year: 52
+  benchmark_return: 0.0
+
+# --- reviewer guardian ---
+reviewer:
+  enabled: true
+  halt_on_mismatch: true
+  model: "opus"
+  tolerance: 1e-6
+
+# --- graduation / overfit gate ---
+graduation:
+  dsr_threshold: 0.95
+  min_cycles: 20
+  walk_forward_required: true
