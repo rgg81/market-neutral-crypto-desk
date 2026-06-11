@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from futures_fund.models import (
     Direction,
@@ -158,6 +158,22 @@ class AgentProposal(BaseModel):
     take_profit: float
     rationale: str = ""
     trigger_type: Literal["market", "limit", "stop"] = "market"
+
+    @model_validator(mode="after")
+    def _check_stop_tp_side(self) -> AgentProposal:
+        # Mirror TradeProposal._check_stop_side: stop is always on the loss side of entry,
+        # take_profit on the gain side. A malformed gate-ready order must NOT validate.
+        if self.direction == "long":
+            if self.stop >= self.entry:
+                raise ValueError("long stop must be below entry")
+            if self.take_profit <= self.entry:
+                raise ValueError("long take_profit must be above entry")
+        else:  # short
+            if self.stop <= self.entry:
+                raise ValueError("short stop must be above entry")
+            if self.take_profit >= self.entry:
+                raise ValueError("short take_profit must be below entry")
+        return self
 
 
 class TraderOutput(BaseModel):
