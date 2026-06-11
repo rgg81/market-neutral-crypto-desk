@@ -2122,14 +2122,13 @@ def test_readme_exists_and_names_the_run_and_dashboard_commands():
     assert "dashboard_cli.py" in text, "README must show how to read the dashboard"
     assert "paper" in text.lower(), "README must state the desk is paper-only"
     assert "neutral" in text.lower(), "README must state the dollar+beta-neutral mandate"
-
-
-def test_claude_md_exists_with_operating_rules():
-    text = Path("CLAUDE.md").read_text()
-    assert "live" in text.lower() and "false" in text.lower(), "CLAUDE.md must affirm live=false"
-    assert "reviewer" in text.lower(), "CLAUDE.md must state the every-cycle reviewer hard-veto"
-    assert "protected" in text.lower(), "CLAUDE.md must state the protected-module rule"
 ```
+
+> **Green-at-commit (binding invariant, line ~2253; issue #8):** ONLY the README test lands in this
+> Task-15 commit, because README.md is its deliverable and goes green here. The CLAUDE.md test
+> (`test_claude_md_exists_with_operating_rules`) is NOT added yet — it lands together with its
+> deliverable `CLAUDE.md` in Task 16, so no failing test is committed in isolation and the full suite
+> stays green at every commit.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2196,10 +2195,10 @@ uv run ruff check .
 ```
 ```
 
-- [ ] **Step 4: Run the README half of the test (CLAUDE.md half still fails — Task 16)**
+- [ ] **Step 4: Run the docs test (now fully green — only the README test is present in this task)**
 
-Run: `uv run pytest tests/test_docs_exist.py::test_readme_exists_and_names_the_run_and_dashboard_commands -v`
-Expected: PASS (1 passed; the README half is green. The CLAUDE.md test is still failing — fixed in Task 16.)
+Run: `uv run pytest tests/test_docs_exist.py -v`
+Expected: PASS (1 passed; the file contains only the README test in this commit — the CLAUDE.md test is added in Task 16 alongside `CLAUDE.md`, so the full suite stays green here.)
 
 - [ ] **Step 5: Commit**
 
@@ -2214,12 +2213,25 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### Task 16: `CLAUDE.md` — operating rules (spec §16)
 
-Spec §16 lists `CLAUDE.md`; it is absent. Write the operating-rules file (paper-only, LLM-proposes-code-disposes, every-cycle reviewer hard-veto, neutrality+deployment mandate, protected-module rule, how to run a cycle). The failing test (`test_claude_md_exists_with_operating_rules`) was already added to `tests/test_docs_exist.py` in Task 15.
+Spec §16 lists `CLAUDE.md`; it is absent. Write the operating-rules file (paper-only, LLM-proposes-code-disposes, every-cycle reviewer hard-veto, neutrality+deployment mandate, protected-module rule, how to run a cycle). The failing test (`test_claude_md_exists_with_operating_rules`) is added to `tests/test_docs_exist.py` HERE — alongside its deliverable `CLAUDE.md` — so the test is green at commit time and no failing test lands in isolation (binding invariant: full `uv run pytest` green before any commit).
 
 **Files:**
 - Create: `/home/roberto/crypto-trade-claude-code-market-neutral/CLAUDE.md`
+- Edit: `/home/roberto/crypto-trade-claude-code-market-neutral/tests/test_docs_exist.py` (append the CLAUDE.md test)
 
-- [ ] **Step 1: Confirm the CLAUDE.md test is currently red**
+- [ ] **Step 1: Append the CLAUDE.md test (red until Step 2 writes CLAUDE.md)**
+
+Append to `tests/test_docs_exist.py`:
+
+```python
+
+
+def test_claude_md_exists_with_operating_rules():
+    text = Path("CLAUDE.md").read_text()
+    assert "live" in text.lower() and "false" in text.lower(), "CLAUDE.md must affirm live=false"
+    assert "reviewer" in text.lower(), "CLAUDE.md must state the every-cycle reviewer hard-veto"
+    assert "protected" in text.lower(), "CLAUDE.md must state the protected-module rule"
+```
 
 Run: `uv run pytest tests/test_docs_exist.py::test_claude_md_exists_with_operating_rules -v`
 Expected: FAIL — `FileNotFoundError: ... 'CLAUDE.md'`
@@ -2275,7 +2287,7 @@ Expected: PASS (2 passed)
 - [ ] **Step 4: Commit**
 
 ```bash
-git add CLAUDE.md
+git add CLAUDE.md tests/test_docs_exist.py
 git commit -m "docs(CLAUDE): operating rules — paper-only, code-disposes, reviewer hard-veto, neutrality
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -2581,7 +2593,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 5. **Two contradictory fixture strategies** — Task 12 commits to the single `_run_producers` no-op stub (the correct one); the duplicate-fakes option is deleted. ✅
 6. **Self-contradictory Expected** — Task 12 is split into Step 2a (apply the no-op patch) and Step 2b (`Run -> Expected PASS`), so the stated outcome matches the post-patch state. ✅
 7. **TDD gap / untested seam** — Tasks 12+13 are declared ONE atomic unit with ONE commit (Task 13 Step 5); Task 12 has no standalone commit landing an untested seam. ✅
-8. **Failing test split across tasks** — the old Tasks 14+15 are merged: SKILL.md is reconciled AND the on-disk test is added in ONE task (new Task 14) with ONE commit; the test is green as committed. ✅
+8. **Failing test split across tasks** — the old Tasks 14+15 are merged: SKILL.md is reconciled AND the on-disk test is added in ONE task (new Task 14) with ONE commit; the test is green as committed. The README/CLAUDE docs tests follow the same rule: Task 15 commits ONLY `test_readme_exists...` + README.md (green here), and Task 16 appends `test_claude_md_exists...` alongside its deliverable CLAUDE.md (green there) — no failing test lands in isolation; full `uv run pytest` is green at every commit. ✅
 9. **`--state` vs `--state-dir`** — standardized on `--state-dir` across `runlock_cli`/`due_check` (documented in the File-Structure CLI-flag-convention note + each CLI's docstring). ✅
 10. **Test-name/count mismatches** — each Step-4 run is pinned to its `-k` selector or specific node id with corrected `(N passed)` counts (Task 1: 3, Task 2: 3, Task 3 `-k build_sleeves`: 3, Task 4 `-k build_pairs`: 2, Task 5: 1, etc.). ✅
 11. **Equity-file path assumption** — Task 13 notes `equity_log.record_equity` writes `state/equity-history.jsonl` (the same path the existing seeded E2E asserts — verified inherited, not a new assumption). ✅
