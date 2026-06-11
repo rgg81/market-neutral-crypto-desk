@@ -4,9 +4,12 @@ import math
 
 import numpy as np
 import pandas as pd
+import pytest
+from statsmodels.stats.multitest import multipletests
 
 from futures_fund import cointegration as co
 from futures_fund.contracts import Pair, Spread
+from futures_fund.sleeves.pairs import select_pairs
 
 
 def _cointegrated_pair(n: int = 400, seed: int = 7) -> tuple[pd.Series, pd.Series]:
@@ -154,6 +157,19 @@ def test_fdr_empty_returns_empty():
     assert co.fdr_adjust([]) == []
 
 
+def test_fdr_adjust_matches_statsmodels_ground_truth():
+    # I2: fdr_adjust must equal statsmodels' multipletests on BOTH paths, on a vector with TIES
+    # and OUT-OF-ORDER p-values (the cases where a naive BH implementation diverges). statsmodels
+    # is the independent oracle here (never re-call fdr_adjust as its own ground truth).
+    raw = [0.04, 0.005, 0.04, 0.20, 0.005, 0.5, 0.13]   # ties at 0.04 / 0.005, not sorted
+    bh = co.fdr_adjust(raw, method="bh")
+    bh_truth = multipletests(raw, method="fdr_bh")[1]
+    assert bh == pytest.approx(list(bh_truth))
+    bonf = co.fdr_adjust(raw, method="bonferroni")
+    bonf_truth = multipletests(raw, method="bonferroni")[1]
+    assert bonf == pytest.approx(list(bonf_truth))
+
+
 def test_build_pair_assembles_validated_pair():
     y, x = _cointegrated_pair()
     pair = co.build_pair(y, x, "BTC/USDT:USDT", "ETH/USDT:USDT", cycle=4)
@@ -168,6 +184,18 @@ def test_build_pair_assembles_validated_pair():
     assert pair.formed_cycle == 4
     assert pair.cointegrated is True
     assert pair.half_life > 0.0
+
+
+def test_build_pair_non_cointegrated_two_random_walks():
+    # build_pair on two INDEPENDENT random walks must NOT call them cointegrated: the
+    # Engle-Granger p stays > 0.05 (no spurious cointegration) and the assembled Pair flags
+    # cointegrated=False.
+    rng = np.random.default_rng(11)
+    y = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 50.0)
+    x = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 50.0)   # independent walk, no relationship
+    pair = co.build_pair(y, x, "BTC/USDT:USDT", "ETH/USDT:USDT", cycle=2)
+    assert pair.cointegrated is False
+    assert pair.adf_pvalue > 0.05
 
 
 def test_build_pair_johansen_method():
@@ -209,3 +237,54 @@ def test_build_spread_hard_stop_state():
     sp = co.build_spread(pair, mark_y=131.0, mark_x=49.0, prev_state="short_spread")
     assert sp.zscore == 3.3                          # (33 - 0)/10 -> |z| >= stop_z
     assert sp.state == "stop"
+
+
+def _indep_walks(seed: int, n: int = 400) -> tuple[pd.Series, pd.Series]:
+    """Two INDEPENDENT random walks (no cointegrating relationship)."""
+    rng = np.random.default_rng(seed)
+    y = pd.Series(np.cumsum(rng.normal(0, 1, n)) + 50.0)
+    x = pd.Series(np.cumsum(rng.normal(0, 1, n)) + 50.0)
+    return y, x
+
+
+def test_fdr_chain_drops_spurious_pair_through_real_select_pairs():
+    # I1: end-to-end multiple-testing guard. Across a candidate set with ONE genuinely cointegrated
+    # pair and several spurious ones, fdr_adjust must lift a BORDERLINE-spurious pair (raw EG p just
+    # under 0.05, so it would pass select_pairs on the RAW p) to an adjusted p ABOVE the threshold,
+    # so the real select_pairs chain DROPS it and keeps only the genuine pair. All pairs are built
+    # by the real build_pair so adf_pvalue / cointegrated come from the real EG test, not handwoven.
+    rng = np.random.default_rng(7)
+    gx = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 100.0)
+    gy = 2.0 * gx + pd.Series(rng.normal(0, 0.5, 400))           # genuinely cointegrated
+    genuine = co.build_pair(gy, gx, "BTC/USDT:USDT", "ETH/USDT:USDT", cycle=1)
+
+    # seed 36 is a spurious independent-walk pair whose raw EG p lands just under 0.05 (in
+    # [0.03, 0.05)) -- a false positive that the RAW threshold would wrongly keep.
+    by, bx = _indep_walks(36)
+    borderline = co.build_pair(by, bx, "XRP/USDT:USDT", "ADA/USDT:USDT", cycle=1)
+
+    # extra clearly-spurious pairs to supply the multiple-testing multiplicity that inflates the
+    # borderline pair's adjusted p above 0.05.
+    spurious = [
+        co.build_pair(*_indep_walks(100 + i), f"C{i}/USDT:USDT", f"D{i}/USDT:USDT", cycle=1)
+        for i in range(4)
+    ]
+
+    candidates = [genuine, borderline, *spurious]
+    # the borderline pair genuinely passes on the RAW p (this is what makes the FDR step bind)
+    assert genuine.adf_pvalue < 0.05
+    assert borderline.adf_pvalue < 0.05
+
+    # run the real FDR correction over the candidate set, writing the adjusted p back onto each pair
+    adj = co.fdr_adjust([p.adf_pvalue for p in candidates], method="bh")
+    for p, a in zip(candidates, adj, strict=True):
+        p.adf_pvalue_adj = a
+
+    # the FDR adjustment BINDS: it pushes the borderline pair's adjusted p over the threshold
+    assert borderline.adf_pvalue_adj > 0.05
+    assert genuine.adf_pvalue_adj < 0.05
+
+    kept = select_pairs(candidates, adf_pvalue_max=0.05)
+    # only the genuine pair survives; the borderline false positive is dropped by FDR
+    assert [p.pair_id for p in kept] == [genuine.pair_id]
+    assert borderline not in kept

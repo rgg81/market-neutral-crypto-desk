@@ -71,3 +71,20 @@ def test_factor_signal_combines_multiple_factors_by_rank():
     shorts = {t.symbol for t in sig.tilts if t.direction == "short"}
     assert "A/USDT:USDT" in longs
     assert "C/USDT:USDT" in shorts
+
+
+def test_factor_signal_n3_default_tercile_one_long_one_short_no_overlap():
+    # Small-N no-overlap guard: n=3 with the DEFAULT tercile (1/3) gives k=floor(3/3)=1, so the
+    # sleeve emits EXACTLY one long (top combined rank) and one short (bottom) with the long and
+    # short sides DISJOINT -- the middle name is held out, never double-counted on both legs.
+    geos = [_geo("A/USDT:USDT", mom=0.5),    # best momentum -> the single LONG
+            _geo("B/USDT:USDT", mom=0.0),    # middle -> held out
+            _geo("C/USDT:USDT", mom=-0.5)]   # worst momentum -> the single SHORT
+    sig = factor_signal(geos, risk_budget_frac=0.0, now=_NOW,
+                        factors=["momentum"], weighting="equal")  # default tercile=1/3
+    longs = [t.symbol for t in sig.tilts if t.direction == "long"]
+    shorts = [t.symbol for t in sig.tilts if t.direction == "short"]
+    assert longs == ["A/USDT:USDT"]
+    assert shorts == ["C/USDT:USDT"]
+    assert len(longs) == 1 and len(shorts) == 1
+    assert set(longs) & set(shorts) == set()           # disjoint sides on a tiny universe

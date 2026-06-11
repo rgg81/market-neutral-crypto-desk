@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from futures_fund.walk_forward import validate_sleeve_param, walk_forward_splits
 
@@ -59,6 +60,30 @@ def test_validate_sleeve_param_num_trials_deflates_pvalue_and_flips_pass():
     # And it actually moves the gate decision: a single trial clears it, many trials do not.
     assert res_1["passed"] is True
     assert res_1000["passed"] is False
+
+
+def test_validate_sleeve_param_weekly_path_threads_periods_per_year():
+    # Walk-forward WEEKLY path: periods_per_year=52 must be threaded into the OOS Sharpe
+    # annualization, so the SAME OOS returns yield a DIFFERENT (smaller) annualized Sharpe under
+    # 52 than under 365 -- sqrt(52)/sqrt(365) ~ 0.377x. Independent oracle: the 52 Sharpe equals
+    # the 365 Sharpe scaled by sqrt(52/365), computed here WITHOUT re-calling validate_sleeve_param.
+    rng = np.random.default_rng(0)
+    oos_returns = [list(rng.normal(0.01, 0.01, 40)) for _ in range(4)]  # same returns both calls
+
+    res_365 = validate_sleeve_param(oos_returns, num_trials=4, periods_per_year=365.0,
+                                    dsr_threshold=0.95)
+    res_52 = validate_sleeve_param(oos_returns, num_trials=4, periods_per_year=52.0,
+                                   dsr_threshold=0.95)
+
+    # periods_per_year IS threaded into the Sharpe annualization: weekly differs from daily.
+    assert res_52["oos_sharpe"] != res_365["oos_sharpe"]
+    assert res_52["oos_sharpe"] == pytest.approx(
+        res_365["oos_sharpe"] * np.sqrt(52.0 / 365.0)
+    )
+    assert res_52["oos_sharpe"] < res_365["oos_sharpe"]   # weekly annualizes a smaller multiplier
+    # the weekly path still returns the full result dict shape with a DSR p-value present
+    assert 0.0 <= res_52["dsr_pvalue"] <= 1.0
+    assert res_52["n_obs"] == res_365["n_obs"] == 160
 
 
 def test_validate_sleeve_param_noise_fails():
