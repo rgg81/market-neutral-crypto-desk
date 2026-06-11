@@ -60,3 +60,16 @@ def test_carry_signal_default_top_frac_is_exact_tercile():
 def test_carry_signal_empty_geometries():
     sig = carry_signal([], risk_budget_frac=0.25, now=_NOW)
     assert sig.tilts == []
+
+
+def test_package_reexports_all_four_builders():
+    from futures_fund.sleeves import (
+        carry_signal,
+        factor_signal,
+        pairs_signal,
+        sentiment_factor_signal,
+    )
+    assert callable(carry_signal)
+    assert callable(pairs_signal)
+    assert callable(factor_signal)
+    assert callable(sentiment_factor_signal)
