@@ -14,7 +14,7 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
-from futures_fund.contracts import Pair
+from futures_fund.contracts import Pair, Spread
 from futures_fund.models import PairTestMethod, SpreadState
 
 
@@ -206,3 +206,12 @@ def build_pair(y: pd.Series, x: pd.Series, symbol_y: str, symbol_x: str, *, cycl
         formed_cycle=cycle,
         cointegrated=cointegrated,
     )
+
+
+def build_spread(pair: Pair, mark_y: float, mark_x: float,
+                 prev_state: SpreadState = "flat") -> Spread:
+    """Current Spread (value, zscore, state) from live marks + the pair's OU params."""
+    sv = spread_value(mark_y, mark_x, pair.hedge_ratio)
+    z = zscore(sv, pair.mu, pair.sigma_eq)
+    state = spread_state(z, prev_state=prev_state)
+    return Spread(pair_id=pair.pair_id, spread_value=sv, zscore=z, state=state)

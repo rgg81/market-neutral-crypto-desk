@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from futures_fund import cointegration as co
-from futures_fund.contracts import Pair
+from futures_fund.contracts import Pair, Spread
 
 
 def _cointegrated_pair(n: int = 400, seed: int = 7) -> tuple[pd.Series, pd.Series]:
@@ -162,3 +162,30 @@ def test_build_pair_johansen_method():
     assert pair.cointegrated == (pair.johansen_trace_stat > pair.johansen_crit_95)
     assert pair.cointegrated is True               # the simulated pair IS cointegrated
     assert pair.half_life > 0.0
+
+
+def _btc_eth_pair() -> Pair:
+    return Pair(
+        pair_id="BTCUSDT__ETHUSDT",
+        symbol_y="BTC/USDT:USDT", symbol_x="ETH/USDT:USDT",
+        hedge_ratio=2.0, method="engle_granger", adf_pvalue=0.01,
+        half_life=5.0, theta=0.139, mu=0.0, sigma_eq=10.0, formed_cycle=1,
+    )
+
+
+def test_build_spread_computes_value_zscore_state():
+    pair = _btc_eth_pair()
+    sp = co.build_spread(pair, mark_y=120.0, mark_x=49.0, prev_state="flat")
+    assert isinstance(sp, Spread)
+    assert sp.pair_id == pair.pair_id
+    assert sp.spread_value == 120.0 - 2.0 * 49.0    # = 22.0
+    assert sp.zscore == 2.2                          # (22 - 0) / 10
+    assert sp.state == "short_spread"                # z >= entry_z (2.0) -> short the rich spread
+    assert sp.entry_z == 2.0 and sp.exit_z == 0.0 and sp.stop_z == 3.0
+
+
+def test_build_spread_hard_stop_state():
+    pair = _btc_eth_pair()
+    sp = co.build_spread(pair, mark_y=131.0, mark_x=49.0, prev_state="short_spread")
+    assert sp.zscore == 3.3                          # (33 - 0)/10 -> |z| >= stop_z
+    assert sp.state == "stop"
