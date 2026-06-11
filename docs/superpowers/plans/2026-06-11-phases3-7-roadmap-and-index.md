@@ -922,8 +922,10 @@ All new functions mirror the existing `deployment_rate(state_dir, last_n)` signa
 ### Task 7.1: KPI dashboard
 
 **Files:**
-- Create: `futures_fund/dashboard.py`, `scripts/dashboard_cli.py`
+- Create: `futures_fund/dashboard.py`, `scripts/dashboard_cli.py`, `futures_fund/equity_log.py`
 - Test: `tests/test_dashboard.py`
+
+> **SCOPE NOTE (equity_log home):** the roadmap treats `equity_log.record_equity`/`equity_series`/`returns_series` as a PRE-EXISTING REUSE (Phase 3 daily-loop "Reuses:", line 165; Phase 6 test-strategy "real package helper", line 912; this phase's "Reuses: `equity_log.*`", line 918). In practice Phase 3 never materialized it, so the atomic, idempotent append-only equity-history log (`equity-history.jsonl` under `state/`) is created HERE in Task 7.1 and consumed by `dashboard.py` (and later `run_paper_cli.py` Step 7a). It is declared in this Create list — rather than smuggled in — so the artifact is accounted for. The module is minimal (`record_equity`/`equity_series`/`returns_series`) and clobbers nothing; downstream tasks (P7.3 Step 7a) import it as the reuse the roadmap intended.
 
 - [ ] **Step 1: Write failing test** for `build_kpi_dashboard(state_dir, memory_dir)` returning: `no_losing_month` (fraction of calendar months positive — target 1.0), `daily_sharpe` (`metrics.sharpe(returns, periods_per_year=365)`), `both_sides_deployment_rate`, `neutrality_adherence` (fraction of cycles with residuals in band), `pair_survival`, `carry_capture`, `sentiment_hit_rate`, **`reviewer_veto_rate`** (reused from `improvement` Task 6.3), `max_drawdown`.
   ```python
