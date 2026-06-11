@@ -9,7 +9,7 @@ from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
 
-from futures_fund.contracts import CoinGeometry, SleeveSignal
+from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt
 from futures_fund.models import SleeveName
 
 
@@ -322,4 +322,54 @@ def apply_cluster_cap(
             out[sym] = weights[sym] * (cluster_cap / mag)
         else:
             out[sym] = weights[sym]
+    return out
+
+
+def conviction_tilt(
+    weight: float,
+    sentiment_score: float,
+    sentiment_conf: float,
+    *,
+    kappa: float = 0.5,
+    cap: float = 0.25,
+) -> float:
+    """Deterministic sentiment tilt: w*(1 + kappa*s*conf), with |delta w| clamped to
+    cap*|w|. NEVER flips sign, never opens a position alone (returns 0 if weight is 0).
+    Applied BEFORE the optimizer re-projection (sentiment cannot break neutrality)."""
+    if weight == 0.0:
+        return 0.0
+    raw = weight * (1.0 + kappa * sentiment_score * sentiment_conf)
+    delta = raw - weight
+    max_delta = cap * abs(weight)
+    if delta > max_delta:
+        delta = max_delta
+    elif delta < -max_delta:
+        delta = -max_delta
+    tilted = weight + delta
+    # never flip sign
+    if (weight > 0 and tilted < 0) or (weight < 0 and tilted > 0):
+        return 0.0
+    return tilted
+
+
+def apply_conviction_tilts(
+    legs: list[SleeveTilt],
+    geometries: list[CoinGeometry],
+    *,
+    kappa: float = 0.5,
+    cap: float = 0.25,
+) -> list[SleeveTilt]:
+    """Map conviction_tilt over legs using each symbol's geometry; sign-preserving and
+    cap-respecting. Symbols without geometry are returned unchanged."""
+    geo = {g.symbol: g for g in geometries}
+    out: list[SleeveTilt] = []
+    for leg in legs:
+        g = geo.get(leg.symbol)
+        if g is None:
+            out.append(leg)
+            continue
+        tilted = conviction_tilt(
+            leg.target_weight, g.sentiment_score, g.sentiment_conf, kappa=kappa, cap=cap
+        )
+        out.append(leg.model_copy(update={"target_weight": tilted}))
     return out

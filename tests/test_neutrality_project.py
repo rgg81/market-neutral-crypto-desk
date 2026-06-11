@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from futures_fund.neutrality import beta_residual, project_neutral, size_btc_hedge
+from futures_fund.neutrality import (
+    apply_conviction_tilts,
+    beta_residual,
+    conviction_tilt,
+    project_neutral,
+    size_btc_hedge,
+)
 
 
 def test_project_neutral_drives_dollar_residual_into_band():
@@ -86,3 +92,46 @@ def test_btc_hedge_excludes_existing_btc_leg_from_residual():
     # residual beta = 0.3*1.5 + 0.1*1.0 = 0.55 ; hedge = -0.55*20000 = -11000 -> clamp -10000
     assert hedge < 0.0
     assert abs(hedge) <= 10000.0 + 1e-6
+
+
+def test_conviction_tilt_positive_sentiment_grows_long():
+    w = conviction_tilt(0.2, sentiment_score=0.8, sentiment_conf=1.0, kappa=0.5, cap=0.25)
+    # 0.2*(1 + 0.5*0.8*1.0) = 0.2*1.4 = 0.28, but |delta| <= 0.25*|0.2| => clamp to 0.25
+    assert w > 0.2
+    assert abs(w - 0.2) <= 0.25 * 0.2 + 1e-9
+
+
+def test_conviction_tilt_never_flips_sign():
+    # Extreme negative sentiment on a long can only shrink it, never flip to short.
+    w = conviction_tilt(0.2, sentiment_score=-1.0, sentiment_conf=1.0, kappa=5.0, cap=0.25)
+    assert w >= 0.0
+
+
+def test_conviction_tilt_zero_weight_stays_zero():
+    # Sentiment never OPENS a position alone.
+    assert conviction_tilt(0.0, sentiment_score=1.0, sentiment_conf=1.0) == 0.0
+
+
+def test_conviction_tilt_respects_cap_magnitude():
+    base = 0.4
+    w = conviction_tilt(base, sentiment_score=1.0, sentiment_conf=1.0, kappa=10.0, cap=0.25)
+    assert abs(w - base) <= 0.25 * abs(base) + 1e-9
+
+
+def test_apply_conviction_tilts_maps_over_legs(geometries):
+    from futures_fund.contracts import SleeveTilt
+
+    legs = [
+        SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.3),
+        SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.3),
+    ]
+    out = apply_conviction_tilts(legs, geometries, kappa=0.5, cap=0.25)
+    # SOL sentiment +0.6 conf 0.9 => long grows
+    sol = next(t for t in out if t.symbol == "SOL/USDT:USDT")
+    assert sol.target_weight > 0.3
+    # XRP sentiment -0.5 conf 0.7: scalar 1 + 0.5*-0.5*0.7 = 0.825 < 1 shrinks the short
+    # toward 0 (the tilt is a pure positive scalar on w; it never flips the sign).
+    xrp = next(t for t in out if t.symbol == "XRP/USDT:USDT")
+    assert -0.3 < xrp.target_weight < 0.0
+    # signs preserved
+    assert sol.target_weight > 0 and xrp.target_weight < 0
