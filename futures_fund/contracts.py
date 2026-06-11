@@ -257,6 +257,9 @@ class Lesson(BaseModel):
     regime: str | None = None                     # quadrant it applies to; None = all regimes
     symbol: str | None = None
     tags: list[str] = Field(default_factory=list)
+    # neutral failure mode (§10): cointegration_break | carry_thesis_miss | neutrality_breach
+    # | sentiment_detract; read by the lesson retrieval filter (Task 6.2).
+    dimension: str | None = None
     importance: int = Field(default=5, ge=1, le=10)
     polarity: Polarity = "restrictive"            # restrictive | enabling | process
     state: LessonState = "candidate"              # Reflector proposes; eval harness promotes
