@@ -6,8 +6,9 @@ from datetime import UTC, datetime
 import numpy as np
 import pandas as pd
 
+from futures_fund.contracts import CoinGeometry as _CG
 from futures_fund.contracts import GeometryBundle
-from futures_fund.cycle_prep import build_geometries
+from futures_fund.cycle_prep import build_geometries, build_sleeves
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
@@ -80,3 +81,37 @@ def test_funding_rate_is_clamped_sign_preserving():
                               btc_symbol="BTC/USDT:USDT", beta_lookback=45)
     doge = next(g for g in bundle.geometries if g.symbol == "DOGE/USDT:USDT")
     assert doge.funding_rate == 0.02  # clamped to alt cap (PER_SYMBOL_CAP_DEFAULT), sign preserved
+
+
+def _six_geos() -> list[_CG]:
+    syms = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+            "XRP/USDT:USDT", "ADA/USDT:USDT", "DOGE/USDT:USDT"]
+    out = []
+    for i, s in enumerate(syms):
+        out.append(_CG(symbol=s, mark=100.0 + i, beta_btc=1.0,
+                       funding_rate=0.0001 * (i - 2), funding_interval_hours=8.0,
+                       funding_apr=0.001 * (i - 2), momentum_20=0.1 * (i - 2),
+                       realized_vol=0.5, sentiment_score=0.2 * (i - 2),
+                       sentiment_conf=0.8))
+    return out
+
+
+def test_build_sleeves_emits_the_four_named_sleeves():
+    sleeves = build_sleeves(_six_geos(), pairs=[], spreads=[], now=NOW)
+    names = {s.sleeve for s in sleeves}
+    assert names == {"carry", "pairs", "factor", "sentiment"}
+
+
+def test_risk_budgets_assigned_and_sum_to_one():
+    sleeves = build_sleeves(_six_geos(), pairs=[], spreads=[], now=NOW)
+    total = sum(s.risk_budget_frac for s in sleeves)
+    assert abs(total - 1.0) < 1e-9
+
+
+def test_sleeves_round_trip_through_the_control_loop_cli_shape():
+    # control_loop_cli loads {"sleeves": [SleeveSignal-dict, ...]}; assert that shape validates.
+    from futures_fund.contracts import SleeveSignal
+    sleeves = build_sleeves(_six_geos(), pairs=[], spreads=[], now=NOW)
+    payload = {"sleeves": [s.model_dump(mode="json") for s in sleeves]}
+    reloaded = [SleeveSignal.model_validate(s) for s in payload["sleeves"]]
+    assert len(reloaded) == 4

@@ -15,11 +15,18 @@ import numpy as np
 import pandas as pd
 
 from futures_fund.beta import beta_for_symbols
-from futures_fund.contracts import CoinGeometry, GeometryBundle
+from futures_fund.contracts import CoinGeometry, GeometryBundle, Pair, SleeveSignal, Spread
 from futures_fund.funding_intervals import (
     clamp_funding_rate,
     funding_apr,
     funding_interval_hours,
+)
+from futures_fund.neutrality import risk_parity_budgets
+from futures_fund.sleeves import (
+    carry_signal,
+    factor_signal,
+    pairs_signal,
+    sentiment_factor_signal,
 )
 
 
@@ -94,3 +101,25 @@ def build_geometries(
             adv_usd=0.0,
         ))
     return GeometryBundle(geometries=geometries, as_of_ts=now)
+
+
+def build_sleeves(
+    geometries: list[CoinGeometry],
+    pairs: list[Pair],
+    spreads: list[Spread],
+    *,
+    now: datetime,
+) -> list[SleeveSignal]:
+    """Run all four alpha sleeves over the geometries (+ pairs/spreads), then assign risk-parity
+    budgets across them via `neutrality.risk_parity_budgets` (the contract's single home for the
+    budget split). `risk_budget_frac` starts at 0.0 on each sleeve and is filled in place by
+    `risk_parity_budgets`, which sums to 1.0 across the four. Closes the C1 gap: this is the only
+    producer that invokes the sleeve builders outside tests."""
+    sleeves = [
+        carry_signal(geometries, risk_budget_frac=0.0, now=now),
+        pairs_signal(pairs, spreads, risk_budget_frac=0.0, now=now),
+        factor_signal(geometries, risk_budget_frac=0.0, now=now),
+        sentiment_factor_signal(geometries, risk_budget_frac=0.0, now=now),
+    ]
+    budgets = risk_parity_budgets(sleeves)
+    return [s.model_copy(update={"risk_budget_frac": budgets[s.sleeve]}) for s in sleeves]
