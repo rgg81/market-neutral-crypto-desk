@@ -375,8 +375,10 @@ def sentiment_factor_signal(geometries: list[CoinGeometry], *, risk_budget_frac:
 
 def conviction_tilt(weight: float, sentiment_score: float, sentiment_conf: float, *,
                     kappa: float = 0.5, cap: float = 0.25) -> float
-    # Deterministic tilt: w*(1 + kappa*s*conf), clamped so |Delta w| <= cap (25%). NEVER flips sign, never
-    # opens a position alone (returns 0 if input weight is 0) (§7.2). Applied BEFORE optimizer re-projection (§7.3).
+    # Deterministic MAGNITUDE tilt: |w| <- |w|*(1 + kappa*sign(w)*s*conf), clamped so |Delta w| <= cap (25%).
+    # sign(w) aligns s with the leg's direction so it FAVORS the long when s>0 / the short when s<0 (§7.2 prose;
+    # the earlier `w*(1 + kappa*s*conf)` scalar form was wrong-for-shorts and is superseded). NEVER flips sign,
+    # never opens a position alone (returns 0 if input weight is 0) (§7.2). Applied BEFORE optimizer re-projection (§7.3).
 
 def apply_conviction_tilts(legs: list[SleeveTilt], geometries: list[CoinGeometry], *,
                            kappa: float = 0.5, cap: float = 0.25) -> list[SleeveTilt]

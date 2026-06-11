@@ -333,13 +333,22 @@ def conviction_tilt(
     kappa: float = 0.5,
     cap: float = 0.25,
 ) -> float:
-    """Deterministic sentiment tilt: w*(1 + kappa*s*conf), with |delta w| clamped to
-    cap*|w|. NEVER flips sign, never opens a position alone (returns 0 if weight is 0).
-    Applied BEFORE the optimizer re-projection (sentiment cannot break neutrality)."""
+    """Deterministic sentiment tilt on the leg MAGNITUDE: |w| <- |w|*(1 + kappa*s_dir*conf),
+    where s_dir = sign(w)*s aligns the score with the leg's OWN direction (spec §7.2). This
+    "favors the long when positive / the short when negative": positive sentiment GROWS a long
+    and negative sentiment GROWS a short, so the cross-sectional sentiment ordering invariant
+    holds on BOTH sides (more-bullish => stronger long, more-bearish => stronger short).
+
+    |delta w| is clamped to cap*|w|. NEVER flips sign, never opens a position alone (returns 0
+    if weight is 0). Applied BEFORE the optimizer re-projection (sentiment cannot break
+    neutrality)."""
     if weight == 0.0:
         return 0.0
-    raw = weight * (1.0 + kappa * sentiment_score * sentiment_conf)
-    delta = raw - weight
+    sign = 1.0 if weight > 0.0 else -1.0
+    # s_dir is the score signed by the leg's direction: short legs read a bearish (s<0) score
+    # as favorable, so the multiplier grows the short rather than shrinking it.
+    s_dir = sign * sentiment_score
+    delta = weight * (kappa * s_dir * sentiment_conf)
     max_delta = cap * abs(weight)
     if delta > max_delta:
         delta = max_delta

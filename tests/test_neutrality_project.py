@@ -118,6 +118,37 @@ def test_conviction_tilt_respects_cap_magnitude():
     assert abs(w - base) <= 0.25 * abs(base) + 1e-9
 
 
+def test_conviction_tilt_negative_sentiment_grows_short():
+    # Spec §7.2: the tilt "favors ... the short when negative". A bearish read on a SHORT leg
+    # must make the short STRONGER (more negative), not weaker. magnitude *= (1 + kappa*|s|*conf).
+    w = conviction_tilt(-0.2, sentiment_score=-0.8, sentiment_conf=1.0, kappa=0.5, cap=0.25)
+    # |w| grows: 0.2*(1 + 0.5*0.8*1.0) = 0.28 -> but |delta| <= 0.25*0.2 => clamp to -0.25.
+    assert w < -0.2  # stronger short
+    assert abs(w - (-0.2)) <= 0.25 * 0.2 + 1e-9
+
+
+def test_conviction_tilt_positive_sentiment_shrinks_short():
+    # The mirror: a bullish read on a SHORT leg should WEAKEN the short (toward 0), never flip.
+    w = conviction_tilt(-0.2, sentiment_score=0.8, sentiment_conf=1.0, kappa=0.5, cap=0.25)
+    assert -0.2 < w < 0.0
+
+
+def test_sentiment_ordering_invariant_across_legs():
+    """The task's named invariant: across same-side legs of equal base weight, the MORE
+    favorable sentiment (for that side's direction) must yield the STRONGER position.
+    More-bullish => stronger long; more-bearish => stronger short. Confidence held at 1.0."""
+    # Longs: more-bullish name (s=+0.9) must end up larger than the mild-bullish one (s=+0.1).
+    strong_long = conviction_tilt(0.2, sentiment_score=0.9, sentiment_conf=1.0, kappa=0.5)
+    mild_long = conviction_tilt(0.2, sentiment_score=0.1, sentiment_conf=1.0, kappa=0.5)
+    assert strong_long > mild_long > 0.0
+
+    # Shorts: more-bearish name (s=-0.9) must end up MORE negative than the mild-bearish one
+    # (s=-0.1). This is exactly the case the inverted scalar form got backwards.
+    strong_short = conviction_tilt(-0.2, sentiment_score=-0.9, sentiment_conf=1.0, kappa=0.5)
+    mild_short = conviction_tilt(-0.2, sentiment_score=-0.1, sentiment_conf=1.0, kappa=0.5)
+    assert strong_short < mild_short < 0.0
+
+
 def test_apply_conviction_tilts_maps_over_legs(geometries):
     from futures_fund.contracts import SleeveTilt
 
@@ -126,12 +157,12 @@ def test_apply_conviction_tilts_maps_over_legs(geometries):
         SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.3),
     ]
     out = apply_conviction_tilts(legs, geometries, kappa=0.5, cap=0.25)
-    # SOL sentiment +0.6 conf 0.9 => long grows
+    # SOL sentiment +0.6 conf 0.9 => bullish on a long => long grows.
     sol = next(t for t in out if t.symbol == "SOL/USDT:USDT")
     assert sol.target_weight > 0.3
-    # XRP sentiment -0.5 conf 0.7: scalar 1 + 0.5*-0.5*0.7 = 0.825 < 1 shrinks the short
-    # toward 0 (the tilt is a pure positive scalar on w; it never flips the sign).
+    # XRP sentiment -0.5 conf 0.7 => bearish on a short => short GROWS (more negative),
+    # honoring "favors the short when negative" (§7.2). magnitude *= 1 + 0.5*0.5*0.7 = 1.175.
     xrp = next(t for t in out if t.symbol == "XRP/USDT:USDT")
-    assert -0.3 < xrp.target_weight < 0.0
+    assert xrp.target_weight < -0.3
     # signs preserved
     assert sol.target_weight > 0 and xrp.target_weight < 0
