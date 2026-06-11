@@ -52,15 +52,24 @@ def tf_to_minutes(tf: str) -> int:
     return int(qty) * mult[unit]
 
 
-def floor_tf(dt: datetime, tf_minutes: int) -> datetime:
-    """Floor a tz-aware UTC datetime to the timeframe grid anchored at UTC 00:00.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)  # grid anchor (a Thursday) — see floor_tf
 
-    Works for any tf_minutes that divides the day evenly (15, 60, 240, ...). E.g. tf_minutes=15
-    floors 12:07 -> 12:00 and 12:59 -> 12:45; tf_minutes=240 reproduces the 4h grid (floor4)."""
+
+def floor_tf(dt: datetime, tf_minutes: int) -> datetime:
+    """Floor a tz-aware UTC datetime to the timeframe grid anchored at the UTC epoch.
+
+    The grid is contiguous fixed-width steps measured from 1970-01-01T00:00Z, so it is correct for
+    ANY tf_minutes — sub-daily, daily, AND multi-day (weekly = 10080) alike. For every tf that
+    divides a day evenly (15, 60, 240, 1440, ...) this is identical to anchoring at UTC 00:00 (the
+    epoch is itself UTC midnight), so floor4 and the daily grid are unchanged. For tf_minutes that
+    do NOT divide the day (notably WEEKLY=10080) it floors to the true week boundary instead of
+    degenerating to the same-day midnight: e.g. Mon and Tue of one week both floor to that week's
+    boundary, so weekly cadence gating actually gates per WEEK (Phase 3 Task 3.1). Week boundaries
+    fall on Thursday 00:00Z because the epoch is a Thursday."""
     assert dt.tzinfo is not None, "floor_tf requires a tz-aware datetime"
-    msm = dt.hour * 60 + dt.minute
-    floored = (msm // tf_minutes) * tf_minutes
-    return dt.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
+    step = timedelta(minutes=tf_minutes)
+    n = (dt - _EPOCH) // step
+    return _EPOCH + n * step
 
 
 def floor4(dt: datetime) -> datetime:

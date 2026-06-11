@@ -134,6 +134,21 @@ def test_floor_tf_daily_floors_to_utc_midnight():
     assert floor_tf(_dt("2026-06-11T17:42:00+00:00"), DAILY) == _dt("2026-06-11T00:00:00+00:00")
 
 
+def test_floor_tf_weekly_groups_whole_week_not_per_day():
+    # WEEKLY (10080) must floor to a true week boundary, NOT degenerate to same-day UTC midnight.
+    # Mon and Tue of one week share a weekly candle; the next week is a different candle. The grid
+    # is epoch-anchored, so week boundaries fall on Thursday 00:00Z (the epoch is a Thursday).
+    mon = floor_tf(_dt("2026-06-08T02:00:00+00:00"), WEEKLY)  # Monday
+    tue = floor_tf(_dt("2026-06-09T10:00:00+00:00"), WEEKLY)  # Tuesday, same week
+    assert mon == tue                                          # same week -> same candle
+    assert mon == _dt("2026-06-04T00:00:00+00:00")            # week boundary (a Thursday)
+    next_week = floor_tf(_dt("2026-06-11T12:00:00+00:00"), WEEKLY)
+    assert next_week == _dt("2026-06-11T00:00:00+00:00")      # following week boundary
+    assert next_week != mon                                    # distinct weekly candle
+    # exactly 7 days apart -> exactly one weekly step
+    assert (next_week - mon).days == 7
+
+
 def test_floor_tf_rejects_naive():
     with pytest.raises(AssertionError):
         floor_tf(datetime(2026, 5, 31, 12, 0, 0), 240)
@@ -239,6 +254,22 @@ def test_cycle_due_weekly_new_candle(tmp_path):
     mode, n, _ = cycle_due(tmp_path, _dt("2026-06-11T12:00:00+00:00"),
                            tf_minutes=WEEKLY, loop="weekly")
     assert (mode, n) == ("FRESH", 4)
+
+
+def test_cycle_due_weekly_same_week_skips_does_not_refire_daily(tmp_path):
+    # REGRESSION GUARD for the weekly-degenerates-to-daily floor bug. A weekly cycle that ran on
+    # Monday (2026-06-08) must SKIP when now is the SAME week (Tuesday 2026-06-09) — the weekly
+    # candle still covers it. Under a (broken) per-day floor Mon and Tue land in DIFFERENT candles
+    # so the gate would re-fire FRESH every day; only a true week-width floor groups them together.
+    # The seeded candle is computed by the gate's own floor_tf so the writer/reader share one grid.
+    mon = _dt("2026-06-08T02:00:00+00:00")
+    _write_report(tmp_path, 1, loop="weekly", candle=floor_tf(mon, WEEKLY).isoformat(),
+                  ran_at="2026-06-08T02:05:00+00:00")
+    tue = _dt("2026-06-09T10:00:00+00:00")  # same week as Monday
+    # Sanity: both instants must floor to the SAME weekly candle (else the test is vacuous).
+    assert floor_tf(mon, WEEKLY) == floor_tf(tue, WEEKLY)
+    mode, n, _ = cycle_due(tmp_path, tue, tf_minutes=WEEKLY, loop="weekly")
+    assert (mode, n) == ("SKIP", 1)
 
 
 # ----------------------------------------------------- cycle_due: RETRY crashed-dir
