@@ -52,6 +52,28 @@ def beta_residual(weights: dict[str, float], betas: dict[str, float]) -> float:
     return sum(w * betas.get(sym, 1.0) for sym, w in weights.items())
 
 
+def size_btc_hedge(
+    weights: dict[str, float],
+    betas: dict[str, float],
+    *,
+    equity: float,
+    side_budget: float,
+) -> float:
+    """Signed BTC-perp hedge notional that absorbs the ALPHA legs' residual portfolio beta.
+    BTC has beta 1.0, so the hedge weight equals the NEGATIVE of the residual beta of the
+    legs passed in; converted to USDT via equity and clamped to fit INSIDE one per-side
+    budget (never added on top). Call this on the alpha legs BEFORE project_neutral so the
+    hedge is a real degree of freedom (the reviewer re-derives it the same way)."""
+    resid_beta = beta_residual(weights, betas)
+    hedge_weight = -resid_beta  # BTC beta == 1.0
+    hedge_notional = hedge_weight * equity
+    if hedge_notional > side_budget:
+        hedge_notional = side_budget
+    elif hedge_notional < -side_budget:
+        hedge_notional = -side_budget
+    return hedge_notional
+
+
 def project_neutral(
     weights: dict[str, float],
     betas: dict[str, float],
