@@ -5,7 +5,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from futures_fund.models import Direction, SentimentLevel, SleeveName, SymbolSpec
+from futures_fund.models import (
+    Direction,
+    PairTestMethod,
+    SentimentLevel,
+    SleeveName,
+    SpreadState,
+    SymbolSpec,
+)
 
 
 class SentimentSource(BaseModel):
@@ -105,3 +112,36 @@ class TargetWeights(BaseModel):
     feasible: bool = True
     notes: list[str] = Field(default_factory=list)
     as_of_ts: datetime
+
+
+class Pair(BaseModel):
+    pair_id: str                                  # canonical slash-free id, e.g. "BTCUSDT__ETHUSDT"
+    symbol_y: str                                 # dependent leg (ccxt unified id)
+    symbol_x: str                                 # independent / hedge leg (ccxt unified id)
+    hedge_ratio: float                            # spread = y - hedge_ratio*x
+    method: PairTestMethod
+    adf_pvalue: float                             # Engle-Granger ADF p (info when johansen)
+    adf_pvalue_adj: float | None = None           # FDR/Bonferroni-corrected p
+    johansen_trace_stat: float | None = None
+    johansen_crit_95: float | None = None
+    half_life: float                              # OU half-life in CYCLES (ln2/theta)
+    theta: float                                  # OU mean-reversion speed
+    mu: float                                     # OU long-run spread mean
+    sigma_eq: float                               # OU equilibrium stdev of the spread
+    formed_cycle: int
+    cointegrated: bool = True                     # rolling re-test result
+
+
+class Spread(BaseModel):
+    pair_id: str
+    spread_value: float                           # y - hedge_ratio*x at current marks
+    zscore: float                                 # (spread_value - mu) / sigma_eq
+    state: SpreadState
+    entry_z: float = 2.0
+    exit_z: float = 0.0
+    stop_z: float = 3.0
+    qty_y: float = 0.0
+    qty_x: float = 0.0
+    notional_y: float = 0.0
+    notional_x: float = 0.0
+    realized_pnl: float = 0.0                     # attributed at pair level

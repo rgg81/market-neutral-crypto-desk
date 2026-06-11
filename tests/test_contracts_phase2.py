@@ -10,9 +10,11 @@ from futures_fund import models
 from futures_fund.contracts import (
     CoinGeometry,
     GeometryBundle,
+    Pair,
     SentimentBatch,
     SentimentReport,
     SentimentSource,
+    Spread,
 )
 
 _NOW = datetime(2026, 6, 11, 0, 0, tzinfo=UTC)
@@ -110,3 +112,35 @@ def test_geometry_bundle_holds_geometries():
         as_of_ts=_NOW,
     )
     assert b.geometries[0].symbol == "BTC/USDT:USDT"
+
+
+def _pair() -> Pair:
+    return Pair(
+        pair_id="BTCUSDT__ETHUSDT",
+        symbol_y="BTC/USDT:USDT",
+        symbol_x="ETH/USDT:USDT",
+        hedge_ratio=15.0,
+        method="engle_granger",
+        adf_pvalue=0.01,
+        half_life=5.0,
+        theta=0.139,
+        mu=0.0,
+        sigma_eq=200.0,
+        formed_cycle=3,
+    )
+
+
+def test_pair_defaults():
+    p = _pair()
+    assert p.cointegrated is True
+    assert p.adf_pvalue_adj is None
+    assert p.johansen_trace_stat is None
+
+
+def test_spread_defaults():
+    s = Spread(pair_id="BTCUSDT__ETHUSDT", spread_value=400.0, zscore=2.0, state="long_spread")
+    assert s.entry_z == 2.0
+    assert s.exit_z == 0.0
+    assert s.stop_z == 3.0
+    assert s.realized_pnl == 0.0
+    assert s.qty_y == 0.0
