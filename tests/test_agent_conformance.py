@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from futures_fund.contracts import (
     AgentProposal,
     AnalystReport,
+    Lesson,
+    ResearchPlan,
     SentimentBatch,
     TraderOutput,
     WatcherOutput,
@@ -125,3 +127,49 @@ def test_agent_proposal_stop_tp_side_invariant(direction, stop, take_profit, mat
             stop=stop,
             take_profit=take_profit,
         )
+
+
+# --- Task 4.2: debate + decision + learning conformance ---
+
+
+def test_bull_fixture_validates_analystreport_bullish():
+    # Bull builds the strongest LONG case -> an AnalystReport whose stance is bullish.
+    reports = [AnalystReport.model_validate(r) for r in _load("bull.json")["reports"]]
+    assert reports
+    assert all(r.stance == "bullish" for r in reports)
+    assert all(0.0 <= r.conviction <= 1.0 for r in reports)
+
+
+def test_bear_fixture_validates_analystreport_bearish():
+    # Bear builds the strongest SHORT case and must rebut the Bull -> stance bearish.
+    reports = [AnalystReport.model_validate(r) for r in _load("bear.json")["reports"]]
+    assert reports
+    assert all(r.stance == "bearish" for r in reports)
+    assert all(0.0 <= r.conviction <= 1.0 for r in reports)
+
+
+def test_research_manager_fixture_validates_researchplan_five_tier():
+    # The judge commits to one of the five tiers and writes a falsifiable prediction.
+    plans = [ResearchPlan.model_validate(p) for p in _load("research_manager.json")["plans"]]
+    assert plans
+    tiers = {"strong_long", "long", "flat", "short", "strong_short"}
+    assert all(p.rating in tiers for p in plans)
+    assert all(0.0 <= p.confidence <= 1.0 for p in plans)
+    assert all(p.falsifiable_prediction.strip() for p in plans)
+    # §10: the RM rates relative-value pairs explicitly -> both a long and a short tier present.
+    ratings = {p.rating for p in plans}
+    assert {"strong_long", "long"} & ratings
+    assert {"strong_short", "short"} & ratings
+
+
+def test_reflector_fixture_validates_lessons_two_sided():
+    data = _load("reflector.json")
+    lessons = [Lesson.model_validate(loaded) for loaded in data["lessons"]]
+    assert lessons
+    assert all(1 <= loaded.importance <= 10 for loaded in lessons)
+    assert all(
+        loaded.polarity in {"restrictive", "enabling", "process"} for loaded in lessons
+    )
+    # Reflector mines BOTH directions: an all-restrictive set ratchets the desk into never
+    # trading (spec §10, reflector mandate). The fixture must carry an enabling lesson.
+    assert any(loaded.polarity == "enabling" for loaded in lessons)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Literal
 
@@ -17,6 +18,15 @@ from futures_fund.models import (
 # --- analyst-roster type aliases (Phase 4; adapted from the weekly desk's contracts) ---
 Lean = Literal["long", "short", "watch"]      # Universe Scout candidate lean
 Stance = Literal["bullish", "bearish", "neutral"]   # analyst read direction
+# The Research Manager's five-tier verdict ladder (judge of the Bull/Bear debate). `strong_*`
+# requires confluent analysts AND a decisively defeated opponent; `flat` = no trade flows.
+Rating = Literal["strong_long", "long", "flat", "short", "strong_short"]
+# A lesson's lifecycle (Reflector mints `candidate`; the eval harness promotes to `validated`).
+LessonState = Literal["candidate", "validated", "retired"]
+# A lesson's directional pull: `restrictive` = a brake (do NOT / cut / avoid); `enabling` = an
+# accelerator (DO take / size when X); `process` = neutral discipline. The retrieval quota keeps
+# the injected set two-sided so a losing record can't flood every debate with prohibitions.
+Polarity = Literal["restrictive", "enabling", "process"]
 
 
 class Candidate(BaseModel):
@@ -47,6 +57,18 @@ class AnalystReport(BaseModel):
     thesis: str = ""                              # one-paragraph rationale citing the signals
     signals: dict = Field(default_factory=dict)   # the computed evidence (analyst-specific keys)
     horizon: str = ""                             # intended hold horizon, e.g. "weekly", "1-3 days"
+
+
+class ResearchPlan(BaseModel):
+    """The Research Manager's verdict for one symbol (or relative-value leg): a five-tier rating
+    plus a falsifiable prediction the Reflector grades later. Ported from the weekly desk's
+    `ResearchPlan`. The RM does NOT size — `rating` sets only direction/conviction; `flat` means
+    no trade flows to the Trader."""
+    symbol: str                                   # ccxt unified id, or a pair_id for a pair leg
+    rating: Rating                                # one of the five tiers (judge of the debate)
+    confidence: float = Field(ge=0.0, le=1.0)     # how decisively the debate resolved
+    thesis: str                                   # why this side won the debate, in this regime
+    falsifiable_prediction: str                   # concrete claim + horizon + explicit invalidation
 
 
 class SentimentSource(BaseModel):
@@ -217,3 +239,21 @@ class TraderOutput(BaseModel):
     management: list[dict] = Field(default_factory=list)
     triggers: list[dict] = Field(default_factory=list)
     cancel_triggers: list[dict] = Field(default_factory=list)
+
+
+class Lesson(BaseModel):
+    """One contrastive, actionable lesson the Reflector distills post-trade, keyed on alpha-vs-beta
+    (§10) — never raw return. Ported from the weekly desk's `lessons.Lesson`. The Reflector mints
+    `candidate` lessons in BOTH polarities so the corpus self-heals symmetrically (a losing record
+    must not ratchet the desk into an all-`restrictive` never-trade state)."""
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    ts: datetime
+    text: str                                     # the contrastive, actionable lesson
+    regime: str | None = None                     # quadrant it applies to; None = all regimes
+    symbol: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    importance: int = Field(default=5, ge=1, le=10)
+    polarity: Polarity = "restrictive"            # restrictive | enabling | process
+    state: LessonState = "candidate"              # Reflector proposes; eval harness promotes
+    confirmations: int = 0
+    provenance: list[str] = Field(default_factory=list)  # source journal decision id(s)

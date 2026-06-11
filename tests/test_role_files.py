@@ -16,6 +16,18 @@ ANALYST_ROLES = [
     "derivatives",
 ]
 
+# Task 4.2 debate + decision + execution + learning roles. Each emits a JSON output validated
+# against its pydantic contract (see test_agent_conformance): Bull/Bear -> AnalystReport (stance
+# bullish/bearish), Research Manager -> ResearchPlan (5-tier rating), Trader -> TraderOutput,
+# Reflector -> Lesson. They carry the SAME mandatory section structure as the analysts.
+DECISION_ROLES = [
+    "bull",
+    "bear",
+    "research_manager",
+    "trader",
+    "reflector",
+]
+
 # Roles exempt from the `## Output (return ONLY this JSON ...)` requirement (deterministic,
 # code-enforced; no LLM JSON). Added in later Phase-4 tasks; listed here so the structural test
 # stays correct as the roster grows.
@@ -25,7 +37,7 @@ DOC_ONLY_ROLES = {"neutrality_constructor", "risk_gate"}
 REQUIRED_SECTIONS = ["## Mission", "## Inputs", "## How you think", "## Example"]
 
 
-@pytest.mark.parametrize("role", ANALYST_ROLES)
+@pytest.mark.parametrize("role", ANALYST_ROLES + DECISION_ROLES)
 def test_analyst_role_file_exists_and_has_mandatory_sections(role):
     p = Path("agents") / f"{role}.md"
     assert p.exists(), f"missing role file: {p}"
