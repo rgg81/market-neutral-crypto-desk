@@ -6,9 +6,12 @@ import pytest
 
 from futures_fund.contracts import (
     CoinGeometry,
+    Pair,
+    Spread,
     TargetWeights,
     WeightLeg,
 )
+from futures_fund.models import MmrBracket, SymbolSpec, TradeProposal
 from futures_fund.neutrality import NeutralityConfig
 from futures_fund.reviewer import (
     check_beta_neutral,
@@ -16,6 +19,11 @@ from futures_fund.reviewer import (
     check_caps,
     check_deployment_floor,
     check_dollar_neutral,
+    check_exchange_filters,
+    check_funding,
+    check_pair_pnl,
+    check_rr_after_costs,
+    check_sharpe_annualization,
 )
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
@@ -274,3 +282,225 @@ def test_cluster_cap_ok(make_tw, cfg):
     checks = check_caps(tw, cfg)  # empty corr => no clustering
     cluster = next(c for c in checks if c.name == "cluster_cap")
     assert cluster.ok is True
+
+
+# === Task 5.3: canonical names 7-13 =========================================================
+
+
+def _funding_geoms(specs: dict[str, dict]) -> list[CoinGeometry]:
+    """CoinGeometry list carrying mark + signed funding_rate + interval for the funding check."""
+    return [
+        CoinGeometry(
+            symbol=s,
+            mark=d["mark"],
+            funding_rate=d["funding_rate"],
+            funding_interval_hours=d.get("interval", 8.0),
+            beta_btc=1.0,
+            adv_usd=1e9,
+        )
+        for s, d in specs.items()
+    ]
+
+
+# --- names 7 + 8: funding_sign + funding_amount -------------------------------------------
+
+def test_funding_sign_short_credit(make_tw):
+    # A SHORT leg with POSITIVE funding RECEIVES funding => the realized settlement is a CREDIT
+    # (positive balance contribution). The reviewer re-derives the sign from realized_funding and
+    # the funding_sign check must reflect that a short-on-positive-funding is a credit (ok=True),
+    # while an artifact that flips the sign is caught.
+    geoms = _funding_geoms({"ETH/USDT:USDT": {"mark": 100.0, "funding_rate": 0.001}})
+    tw = make_tw([("ETH/USDT:USDT", "short", 5000.0)])
+    checks = check_funding(tw, geoms)
+    names = {c.name for c in checks}
+    assert names == {"funding_sign", "funding_amount"}
+    sign = next(c for c in checks if c.name == "funding_sign")
+    # short + positive funding => realized credit (positive) => recomputed sign is positive
+    assert sign.expected > 0
+    assert sign.ok is True
+
+
+def test_funding_amount_matches_realized(make_tw):
+    # The funding_amount check re-derives the per-leg realized funding via
+    # funding_intervals.realized_funding and totals it. A geometry whose funding_rate is internally
+    # consistent matches; the amount equals the realized primitive over the leg's qty.
+    from futures_fund.funding_intervals import realized_funding
+
+    geoms = _funding_geoms({"ETH/USDT:USDT": {"mark": 100.0, "funding_rate": 0.001}})
+    tw = make_tw([("ETH/USDT:USDT", "short", 5000.0)])
+    checks = check_funding(tw, geoms)
+    amt = next(c for c in checks if c.name == "funding_amount")
+    qty = 5000.0 / 100.0
+    expected = realized_funding(-5000.0, 100.0, qty, 0.001, "short")
+    assert amt.expected == pytest.approx(expected)
+    assert amt.ok is True
+
+
+# --- names 9 + 10: pair_pnl_attribution + pair_leg_hedge_ratio ----------------------------
+
+def _pair() -> Pair:
+    return Pair(
+        pair_id="AAAUSDT__BBBUSDT",
+        symbol_y="AAA/USDT:USDT",
+        symbol_x="BBB/USDT:USDT",
+        hedge_ratio=2.0,
+        method="engle_granger",
+        adf_pvalue=0.01,
+        half_life=5.0,
+        theta=0.1,
+        mu=0.0,
+        sigma_eq=1.0,
+        formed_cycle=1,
+    )
+
+
+def test_pair_pnl_at_spread_level(make_tw):  # noqa: ARG001
+    # PnL is attributed at the SPREAD level: a long_spread (long y, short hedge_ratio*x) earns
+    # qty_y*(spread_now - spread_entry). The reviewer re-derives the spread-level PnL from the
+    # leg qtys and compares to the artifact's realized_pnl. A tampered realized_pnl is caught.
+    pair = _pair()
+    spread = Spread(
+        pair_id=pair.pair_id,
+        spread_value=3.0,
+        zscore=-1.0,
+        state="long_spread",
+        qty_y=10.0,
+        qty_x=20.0,           # = hedge_ratio(2.0) * qty_y(10.0) => sized by hedge ratio
+        notional_y=1000.0,
+        notional_x=2000.0,
+        realized_pnl=999999.0,  # tampered claim
+    )
+    checks = check_pair_pnl([spread], [pair])
+    names = {c.name for c in checks}
+    assert names == {"pair_pnl_attribution", "pair_leg_hedge_ratio"}
+    attribution = next(c for c in checks if c.name == "pair_pnl_attribution")
+    assert attribution.ok is False  # 999999 nowhere near the re-derived spread PnL
+
+
+def test_pair_legs_sized_by_hedge_ratio():
+    # The hedge-ratio check verifies the x leg is sized at hedge_ratio * qty_y. A spread whose
+    # qty_x is NOT hedge_ratio*qty_y leaves a residual beta in the pair => ok=False.
+    pair = _pair()  # hedge_ratio 2.0
+    spread = Spread(
+        pair_id=pair.pair_id,
+        spread_value=0.0,
+        zscore=0.0,
+        state="long_spread",
+        qty_y=10.0,
+        qty_x=15.0,            # should be 20.0 (2.0 * 10.0) => mis-hedged
+        realized_pnl=0.0,
+    )
+    checks = check_pair_pnl([spread], [pair])
+    hedge = next(c for c in checks if c.name == "pair_leg_hedge_ratio")
+    assert hedge.ok is False
+
+
+def test_pair_legs_sized_by_hedge_ratio_ok():
+    pair = _pair()  # hedge_ratio 2.0
+    spread = Spread(
+        pair_id=pair.pair_id,
+        spread_value=0.0,
+        zscore=0.0,
+        state="long_spread",
+        qty_y=10.0,
+        qty_x=20.0,            # exactly hedge_ratio * qty_y
+        realized_pnl=0.0,
+    )
+    checks = check_pair_pnl([spread], [pair])
+    hedge = next(c for c in checks if c.name == "pair_leg_hedge_ratio")
+    assert hedge.ok is True
+
+
+# --- name 11: rr_after_costs ---------------------------------------------------------------
+
+def _proposal(*, entry: float, stop: float, tp: float) -> TradeProposal:
+    return TradeProposal(
+        symbol="ETH/USDT:USDT",
+        direction="long",
+        entry=entry,
+        stop=stop,
+        take_profits=[tp],
+        atr=1.0,
+        confidence=0.6,
+        horizon_hours=24.0,
+        funding_rate=0.0001,
+    )
+
+
+def test_rr_after_costs_ge_2():
+    # RR re-derived via risk_gate._reward_risk must be >= 2.0. A proposal with reward = 2x risk
+    # passes; one below the floor fails.
+    ok_prop = _proposal(entry=100.0, stop=99.0, tp=102.0)   # reward 2, risk 1 => RR 2.0
+    bad_prop = _proposal(entry=100.0, stop=99.0, tp=101.5)  # reward 1.5 => RR 1.5 < 2
+    ok_chk = check_rr_after_costs([ok_prop])
+    bad_chk = check_rr_after_costs([bad_prop])
+    assert ok_chk.name == "rr_after_costs"
+    assert ok_chk.ok is True
+    assert bad_chk.ok is False
+
+
+# --- name 12: sharpe_annualization ---------------------------------------------------------
+
+def test_sharpe_daily_365_weekly_52():
+    # The annualization factor must be 365 for daily and 52 for weekly cadence (NOT the inherited
+    # 2190 4h factor). The reviewer re-derives the periods_per_year from the cadence.
+    daily = check_sharpe_annualization("daily")
+    weekly = check_sharpe_annualization("weekly")
+    assert daily.name == "sharpe_annualization"
+    assert daily.expected == pytest.approx(365.0)
+    assert daily.ok is True
+    assert weekly.expected == pytest.approx(52.0)
+    assert weekly.ok is True
+
+
+# --- name 13: exchange_filter_compliance ---------------------------------------------------
+
+def _spec(
+    symbol: str, *, min_notional: float, tick: float = 0.01, step: float = 0.001
+) -> SymbolSpec:
+    return SymbolSpec(
+        symbol=symbol,
+        tick_size=tick,
+        step_size=step,
+        min_notional=min_notional,
+        mmr_brackets=[
+            MmrBracket(
+                notional_floor=0.0,
+                notional_cap=1e9,
+                mmr=0.005,
+                maint_amount=0.0,
+                max_leverage=20.0,
+            )
+        ],
+    )
+
+
+def _filter_geoms(specs: dict[str, tuple[float, SymbolSpec]]) -> list[CoinGeometry]:
+    return [
+        CoinGeometry(symbol=s, mark=mark, beta_btc=1.0, adv_usd=1e9, spec=spec)
+        for s, (mark, spec) in specs.items()
+    ]
+
+
+def test_exchange_filter_min_notional(make_tw):
+    # A leg whose notional is BELOW the exchange min_notional must be flagged non-compliant.
+    geoms = _filter_geoms(
+        {"ETH/USDT:USDT": (100.0, _spec("ETH/USDT:USDT", min_notional=1_000_000.0))}
+    )
+    tw = make_tw([("ETH/USDT:USDT", "long", 5000.0)])  # 5000 < 1,000,000 min
+    checks = check_exchange_filters(tw, geoms)
+    names = {c.name for c in checks}
+    assert names == {"exchange_filter_compliance"}
+    chk = checks[0]
+    assert chk.ok is False
+
+
+def test_exchange_filter_min_notional_ok(make_tw):
+    geoms = _filter_geoms(
+        {"ETH/USDT:USDT": (100.0, _spec("ETH/USDT:USDT", min_notional=10.0))}
+    )
+    tw = make_tw([("ETH/USDT:USDT", "long", 5000.0)])  # 5000 >= 10 min, qty/price on grid
+    checks = check_exchange_filters(tw, geoms)
+    chk = checks[0]
+    assert chk.name == "exchange_filter_compliance"
+    assert chk.ok is True

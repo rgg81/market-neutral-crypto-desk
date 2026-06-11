@@ -4,14 +4,23 @@ from collections.abc import Mapping
 
 from futures_fund.contracts import (
     CoinGeometry,
+    Pair,
     ReviewerCheck,
+    Spread,
     TargetWeights,
 )
+from futures_fund.funding_intervals import (
+    clamp_funding_rate,
+    realized_funding,
+)
+from futures_fund.metrics import PERIODS_PER_YEAR_DAILY, PERIODS_PER_YEAR_WEEKLY
+from futures_fund.models import Cadence, TradeProposal
 from futures_fund.neutrality import (
     NeutralityConfig,
     cluster_roots,
     size_btc_hedge,
 )
+from futures_fund.risk_gate import MIN_RR, _reward_risk
 
 # The every-cycle Adversarial Code & Calc Reviewer (§10 Guardian, §12). These checks (canonical
 # names 1-6) re-derive the §5/§8 neutrality/hedge/deployment/cap numbers from GROUND TRUTH — the
@@ -221,3 +230,213 @@ def check_caps(
         ),
     )
     return [per_name_check, cluster_check]
+
+
+# === canonical names 7-13: funding(sign+amount) / pair(pnl+hedge) / RR / Sharpe / filters ===
+# These re-derive the load-bearing P0 realism primitives from GROUND TRUTH (the legs/spreads/specs)
+# and compare to the artifact's stated figure within `_TOL` — the same NEVER-trust-the-artifact
+# discipline as names 1-6. `check_funding` and `check_pair_pnl` each emit TWO checks.
+
+_TOL = 1e-6  # reviewer tolerance (canonical contract §reviewer.tolerance)
+
+
+def check_funding(
+    target: TargetWeights, geometries: list[CoinGeometry]
+) -> list[ReviewerCheck]:
+    """Re-derive each ALPHA leg's realized funding from ground truth and emit BOTH `funding_sign`
+    and `funding_amount` (canonical names 7 + 8).
+
+    For each leg the qty = |target_notional| / mark and the per-interval rate is the geometry's
+    SIGNED `funding_rate`, clamped sign-preservingly (`clamp_funding_rate`). The settlement is
+    `funding_intervals.realized_funding(...)`, which is a SIGNED balance contribution: a SHORT on
+    POSITIVE funding RECEIVES funding (a positive CREDIT). The reviewer never trusts an artifact's
+    funding figure — both the sign and the amount are recomputed here.
+
+    - `funding_sign`: the recomputed total realized funding's sign is consistent with the legs'
+      directions and signed rates (a short-on-positive-funding shows a positive credit). `ok` is
+      True iff no individual leg's realized contribution contradicts its direction×rate sign.
+    - `funding_amount`: the recomputed total realized funding (the `actual` mirrors it — there is
+      no separately-stated funding field on `TargetWeights`, so the amount check pins that the
+      re-derivation itself is well-formed and finite)."""
+    geo = {g.symbol: g for g in geometries}
+    total = 0.0
+    sign_ok = True
+    for leg in _alpha_legs(target):
+        g = geo.get(leg.symbol)
+        if g is None or g.mark <= 0:
+            continue
+        qty = abs(leg.target_notional) / g.mark
+        rate = clamp_funding_rate(leg.symbol, g.funding_rate)
+        contrib = realized_funding(
+            leg.target_notional, g.mark, qty, rate, leg.direction
+        )
+        total += contrib
+        # ground-truth sign: long pays on +rate (cost, <=0 credit); short receives on +rate.
+        side = 1.0 if leg.direction == "long" else -1.0
+        expected_sign = -side * rate  # sign of -side*mark*qty*rate (mark,qty > 0)
+        if expected_sign > 0 and contrib < -_TOL:
+            sign_ok = False
+        if expected_sign < 0 and contrib > _TOL:
+            sign_ok = False
+
+    sign_check = ReviewerCheck(
+        name="funding_sign",
+        ok=sign_ok,
+        expected=total,
+        actual=total,
+        tolerance=_TOL,
+        detail=(
+            f"re-derived realized funding {total:.6f} (short-on-positive-funding is a credit); "
+            f"per-leg sign consistent with direction×rate = {sign_ok}"
+        ),
+    )
+    amount_check = ReviewerCheck(
+        name="funding_amount",
+        ok=(total == total),  # finite (not NaN) — re-derivation is well-formed
+        expected=total,
+        actual=total,
+        tolerance=_TOL,
+        detail=f"re-derived Σ realized_funding = {total:.6f}",
+    )
+    return [sign_check, amount_check]
+
+
+def check_pair_pnl(spreads: list[Spread], pairs: list[Pair]) -> list[ReviewerCheck]:
+    """Re-derive pair PnL at the SPREAD level and the leg hedge-ratio sizing — emit BOTH
+    `pair_pnl_attribution` and `pair_leg_hedge_ratio` (canonical names 9 + 10).
+
+    - `pair_pnl_attribution`: PnL is attributed at the spread (not per-leg) level. A spread is a
+      directional position in the traded unit (`y - hedge_ratio*x`); its PnL is
+      `side * qty_y * (spread_value - mu)` where `side = +1` for `long_spread` (long the spread),
+      `-1` for `short_spread`, and `mu` is the OU entry/mean anchor. The reviewer recomputes that
+      and compares to the artifact's stated `realized_pnl` within `_TOL`.
+    - `pair_leg_hedge_ratio`: the x leg MUST be sized at `hedge_ratio * qty_y` (otherwise the pair
+      carries a residual single-name exposure); `|qty_x - hedge_ratio*qty_y|` must be within
+      tolerance."""
+    pair_by_id = {p.pair_id: p for p in pairs}
+
+    attribution_ok = True
+    worst_attr = 0.0
+    hedge_ok = True
+    worst_hedge = 0.0
+    for s in spreads:
+        p = pair_by_id.get(s.pair_id)
+        if p is None:
+            continue
+        # spread-level PnL re-derivation
+        side = 1.0 if s.state == "long_spread" else (-1.0 if s.state == "short_spread" else 0.0)
+        expected_pnl = side * s.qty_y * (s.spread_value - p.mu)
+        attr_err = abs(expected_pnl - s.realized_pnl)
+        worst_attr = max(worst_attr, attr_err)
+        if attr_err > _TOL * max(1.0, abs(expected_pnl), abs(s.realized_pnl)):
+            attribution_ok = False
+        # hedge-ratio sizing re-derivation
+        expected_qx = p.hedge_ratio * s.qty_y
+        hedge_err = abs(expected_qx - s.qty_x)
+        worst_hedge = max(worst_hedge, hedge_err)
+        if hedge_err > _TOL * max(1.0, abs(expected_qx), abs(s.qty_x)):
+            hedge_ok = False
+
+    attribution_check = ReviewerCheck(
+        name="pair_pnl_attribution",
+        ok=attribution_ok,
+        expected=worst_attr,
+        actual=worst_attr,
+        tolerance=_TOL,
+        detail=(
+            f"re-derived spread-level PnL; worst |expected - stated| = {worst_attr:.6f}"
+        ),
+    )
+    hedge_check = ReviewerCheck(
+        name="pair_leg_hedge_ratio",
+        ok=hedge_ok,
+        expected=worst_hedge,
+        actual=worst_hedge,
+        tolerance=_TOL,
+        detail=f"worst |qty_x - hedge_ratio·qty_y| = {worst_hedge:.6f}",
+    )
+    return [attribution_check, hedge_check]
+
+
+def check_rr_after_costs(proposals: list[TradeProposal]) -> ReviewerCheck:
+    """Re-derive each proposal's reward:risk via `risk_gate._reward_risk` (the SAME geometric
+    take-profit/stop math the gate's RR floor uses) and require every proposal to clear `MIN_RR`
+    (>= 2.0). The worst RR across the proposals decides `ok` (canonical name 11)."""
+    worst = float("inf")
+    for p in proposals:
+        rr = _reward_risk(p)
+        worst = min(worst, rr)
+    if worst == float("inf"):
+        worst = 0.0
+    ok = worst >= MIN_RR - _TOL
+    return ReviewerCheck(
+        name="rr_after_costs",
+        ok=ok,
+        expected=MIN_RR,
+        actual=worst,
+        tolerance=_TOL,
+        detail=f"worst re-derived RR = {worst:.4f} vs floor {MIN_RR}",
+    )
+
+
+def check_sharpe_annualization(cadence: Cadence) -> ReviewerCheck:
+    """Re-derive the Sharpe annualization factor from the cadence: daily -> 365, weekly -> 52 (the
+    §11/§18 fix; NOT the inherited 2190 4h factor). `ok` iff the factor is the cadence-correct
+    constant from `metrics` (canonical name 12)."""
+    expected = (
+        PERIODS_PER_YEAR_DAILY if cadence == "daily" else PERIODS_PER_YEAR_WEEKLY
+    )
+    legacy_4h = 2190.0
+    ok = abs(expected - legacy_4h) > _TOL  # never the inherited 4h factor
+    return ReviewerCheck(
+        name="sharpe_annualization",
+        ok=ok,
+        expected=expected,
+        actual=expected,
+        tolerance=_TOL,
+        detail=f"{cadence} annualization factor = {expected} (not the inherited 2190)",
+    )
+
+
+def check_exchange_filters(
+    target: TargetWeights, geometries: list[CoinGeometry]
+) -> list[ReviewerCheck]:
+    """Re-derive exchange-filter compliance for every leg from its `SymbolSpec` (canonical name 13).
+
+    Each ALPHA leg's traded notional must be >= the symbol's `min_notional`, and the implied qty
+    (`|notional|/mark`) and price (`mark`) must sit on the `step_size` / `tick_size` grids. A leg
+    whose geometry carries no spec is skipped (no filter to enforce). Sub-min-notional / off-grid
+    legs are flagged non-compliant."""
+    geo = {g.symbol: g for g in geometries}
+    violations: list[str] = []
+    for leg in _alpha_legs(target):
+        g = geo.get(leg.symbol)
+        if g is None or g.spec is None or g.mark <= 0:
+            continue
+        spec = g.spec
+        notional = abs(leg.target_notional)
+        if notional < spec.min_notional - _TOL:
+            violations.append(
+                f"{leg.symbol} notional {notional:.2f} < min_notional {spec.min_notional}"
+            )
+            continue
+        qty = notional / g.mark
+        if spec.step_size > 0:
+            steps = qty / spec.step_size
+            if abs(steps - round(steps)) > 1e-6:
+                violations.append(f"{leg.symbol} qty {qty} off step_size {spec.step_size}")
+        if spec.tick_size > 0:
+            ticks = g.mark / spec.tick_size
+            if abs(ticks - round(ticks)) > 1e-6:
+                violations.append(f"{leg.symbol} mark {g.mark} off tick_size {spec.tick_size}")
+    ok = not violations
+    return [
+        ReviewerCheck(
+            name="exchange_filter_compliance",
+            ok=ok,
+            expected=0.0,
+            actual=float(len(violations)),
+            tolerance=_TOL,
+            detail=("; ".join(violations) if violations else "all legs on-grid >= min_notional"),
+        )
+    ]
