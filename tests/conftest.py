@@ -1,14 +1,44 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt
+from futures_fund.scheduling import floor_tf
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
+
+
+@pytest.fixture
+def write_served_report():
+    """Seed a completed cycle's report.json that SERVES the candle containing `served`.
+
+    The cadence due-gate (`scheduling.cycle_due`) keys off report['candle'] = floor_tf(gate-start),
+    so a report carrying `candle == floor_tf(served, tf_minutes)` marks that candle as already
+    served and forces SKIP for any `now` inside it. `cycle_dir` is the FULL cycle directory the gate
+    scans (e.g. state/daily/cycle/1) — the writer and the due-gate reader share this one root."""
+
+    def _write(cycle_dir, *, served: datetime, tf_minutes: int) -> Path:
+        candle = floor_tf(served, tf_minutes)
+        d = Path(cycle_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        report = d / "report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "candle": candle.isoformat(),
+                    "ran_at": served.isoformat(),
+                }
+            )
+        )
+        return report
+
+    return _write
 
 
 @pytest.fixture
