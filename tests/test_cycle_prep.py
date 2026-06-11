@@ -7,8 +7,12 @@ import numpy as np
 import pandas as pd
 
 from futures_fund.contracts import CoinGeometry as _CG
-from futures_fund.contracts import GeometryBundle
-from futures_fund.cycle_prep import build_geometries, build_sleeves
+from futures_fund.contracts import GeometryBundle, Pair, Spread
+from futures_fund.cycle_prep import (
+    build_geometries,
+    build_pairs_and_spreads,
+    build_sleeves,
+)
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
@@ -115,3 +119,54 @@ def test_sleeves_round_trip_through_the_control_loop_cli_shape():
     payload = {"sleeves": [s.model_dump(mode="json") for s in sleeves]}
     reloaded = [SleeveSignal.model_validate(s) for s in payload["sleeves"]]
     assert len(reloaded) == 4
+
+
+class _CointExchange:
+    """Two cointegrated legs (y = 2x + noise) + an independent leg."""
+
+    def __init__(self):
+        rng = np.random.default_rng(7)
+        n = 200
+        x = np.cumsum(rng.normal(0, 1, n)) + 100.0
+        noise = rng.normal(0, 0.5, n)
+        self._series = {
+            "AAA/USDT:USDT": pd.Series(x),
+            "BBB/USDT:USDT": pd.Series(2.0 * x + noise),       # cointegrated with AAA
+            "CCC/USDT:USDT": pd.Series(np.cumsum(rng.normal(0, 1, n)) + 50.0),  # independent
+        }
+        self._marks = {"AAA/USDT:USDT": float(x[-1]),
+                       "BBB/USDT:USDT": float(2.0 * x[-1] + noise[-1]),
+                       "CCC/USDT:USDT": 50.0}
+
+    def ohlcv(self, symbol, timeframe="4h", limit=500):
+        s = self._series[symbol]
+        ts = pd.date_range("2026-01-01", periods=len(s), freq="4h", tz="UTC")
+        return pd.DataFrame({"timestamp": ts, "open": s, "high": s, "low": s,
+                             "close": s, "volume": 1.0})
+
+    def mark_price(self, symbol):
+        return self._marks[symbol]
+
+
+def test_build_pairs_finds_the_cointegrated_pair():
+    ex = _CointExchange()
+    syms = ["AAA/USDT:USDT", "BBB/USDT:USDT", "CCC/USDT:USDT"]
+    pairs, spreads = build_pairs_and_spreads(ex, syms, cycle=1, now=NOW,
+                                             adf_pvalue_max=0.05, fdr_method="bh")
+    assert all(isinstance(p, Pair) for p in pairs)
+    assert all(isinstance(s, Spread) for s in spreads)
+    # the AAA/BBB pair (cointegrated) survives FDR + select_pairs; one spread per kept pair
+    kept_ids = {p.pair_id for p in pairs}
+    assert any("AAA" in pid and "BBB" in pid for pid in kept_ids)
+    assert {s.pair_id for s in spreads} == kept_ids
+
+
+def test_build_pairs_round_trips_through_artifact_shape():
+    ex = _CointExchange()
+    pairs, spreads = build_pairs_and_spreads(
+        ex, ["AAA/USDT:USDT", "BBB/USDT:USDT", "CCC/USDT:USDT"],
+        cycle=1, now=NOW)
+    pairs_payload = {"pairs": [p.model_dump(mode="json") for p in pairs]}
+    spreads_payload = {"spreads": [s.model_dump(mode="json") for s in spreads]}
+    assert [Pair.model_validate(p) for p in pairs_payload["pairs"]] == pairs
+    assert [Spread.model_validate(s) for s in spreads_payload["spreads"]] == spreads

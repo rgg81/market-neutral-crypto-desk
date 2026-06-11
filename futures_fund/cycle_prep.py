@@ -10,11 +10,13 @@ it); they NEVER persist — `cycle_prep_cli.py` owns persistence.
 from __future__ import annotations
 
 from datetime import datetime
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
 
 from futures_fund.beta import beta_for_symbols
+from futures_fund.cointegration import build_pair, build_spread, fdr_adjust
 from futures_fund.contracts import CoinGeometry, GeometryBundle, Pair, SleeveSignal, Spread
 from futures_fund.funding_intervals import (
     clamp_funding_rate,
@@ -28,6 +30,7 @@ from futures_fund.sleeves import (
     pairs_signal,
     sentiment_factor_signal,
 )
+from futures_fund.sleeves.pairs import select_pairs
 
 
 def _marks_frame(exchange, symbols: list[str]) -> dict[str, pd.Series]:
@@ -123,3 +126,52 @@ def build_sleeves(
     ]
     budgets = risk_parity_budgets(sleeves)
     return [s.model_copy(update={"risk_budget_frac": budgets[s.sleeve]}) for s in sleeves]
+
+
+def build_pairs_and_spreads(
+    exchange,
+    symbols: list[str],
+    *,
+    cycle: int,
+    now: datetime,
+    adf_pvalue_max: float = 0.05,
+    fdr_method: str = "bh",
+    max_candidates: int = 30,
+) -> tuple[list[Pair], list[Spread]]:
+    """Enumerate candidate pairs over `symbols`, Engle-Granger + OU-fit each (`build_pair`),
+    FDR-correct the candidate ADF p-values (`fdr_adjust`), keep survivors (`select_pairs`), and
+    mark each survivor's live spread (`build_spread`). Returns (kept_pairs, spreads). Closes the
+    C1 + C2 gaps: produces the `pairs.json`/`spreads.json` the loop never had and the reviewer's
+    `check_pair_pnl` needs to stop skipping every spread.
+
+    A pair is dropped if either leg's OHLCV is unreadable (cannot test cointegration). The
+    candidate set is capped at `max_candidates` (cheapest by symbol order) to bound the O(n^2)
+    Engle-Granger sweep on a large universe. `now` is accepted for caller symmetry with the other
+    producers; the Pair/Spread contracts carry no timestamp field."""
+    series: dict[str, pd.Series] = {}
+    marks: dict[str, float] = {}
+    for sym in symbols:
+        try:
+            series[sym] = exchange.ohlcv(sym)["close"].astype(float).reset_index(drop=True)
+            marks[sym] = float(exchange.mark_price(sym))
+        except Exception:
+            continue
+    usable = [s for s in symbols if s in series and s in marks]
+    candidates: list[Pair] = []
+    for y_sym, x_sym in list(combinations(usable, 2))[:max_candidates]:
+        try:
+            candidates.append(build_pair(
+                series[y_sym], series[x_sym], y_sym, x_sym, cycle=cycle,
+                method="engle_granger"))
+        except Exception:
+            continue
+    if not candidates:
+        return [], []
+    adj = fdr_adjust([p.adf_pvalue for p in candidates], alpha=adf_pvalue_max, method=fdr_method)
+    candidates = [
+        p.model_copy(update={"adf_pvalue_adj": a})
+        for p, a in zip(candidates, adj, strict=True)
+    ]
+    kept = select_pairs(candidates, adf_pvalue_max=adf_pvalue_max)
+    spreads = [build_spread(p, marks[p.symbol_y], marks[p.symbol_x]) for p in kept]
+    return kept, spreads
