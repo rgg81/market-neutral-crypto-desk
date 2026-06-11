@@ -57,7 +57,24 @@ def seeded_proposals(tmp_path):
     return state
 
 
-def test_gate_execute_cli_dispatches_cadence(tmp_path, monkeypatch, seeded_proposals):
+@pytest.fixture
+def passing_reviewer(tmp_path):
+    """Seed a PASSING `reviewer.json` under the same cadence cycle root so the mandatory reviewer
+    precondition (wired in Task 5.4) is satisfied and the CLI proceeds to gate+execute."""
+    save_output(
+        tmp_path / "state",
+        1,
+        "reviewer",
+        {"passed": True, "checks": [], "mismatches": [], "cycle": 1, "cadence": "weekly",
+         "reviewed_at": "2026-06-11T00:00:00+00:00"},
+        cadence="weekly",
+    )
+    return tmp_path / "state"
+
+
+def test_gate_execute_cli_dispatches_cadence(
+    tmp_path, monkeypatch, seeded_proposals, passing_reviewer
+):
     seen = {}
 
     def fake_step(ex, settings, sd, md, now, cyc, props, **kw):
@@ -86,7 +103,7 @@ def test_gate_execute_cli_requires_cadence(tmp_path, monkeypatch, seeded_proposa
 
 
 def test_gate_execute_cli_loads_proposals_and_writes_report(
-    tmp_path, monkeypatch, seeded_proposals
+    tmp_path, monkeypatch, seeded_proposals, passing_reviewer
 ):
     seen = {}
 
@@ -114,3 +131,50 @@ def test_gate_execute_cli_loads_proposals_and_writes_report(
     assert report_path.exists()
     report = json.loads(report_path.read_text())
     assert report["executed"] == [{"symbol": "BTC/USDT:USDT"}]
+
+
+def test_execute_halts_without_reviewer_verdict(tmp_path, monkeypatch, seeded_proposals):
+    # MANDATORY non-skippable reviewer stage (§10/§12): with no reviewer.json under the cadence
+    # cycle root, the deterministic gate flag is absent => the execute CLI HALTs (SystemExit(2))
+    # BEFORE any fill, even though proposals.json is present.
+    monkeypatch.setattr(
+        "scripts.gate_execute_cli.gate_execute_step",
+        lambda *a, **k: {"executed": [], "dropped": []},
+    )
+    monkeypatch.setattr(
+        "scripts.gate_execute_cli.FuturesExchange.from_settings", lambda settings: object()
+    )
+    monkeypatch.chdir(tmp_path)  # no reviewer.json written
+    from scripts.gate_execute_cli import main
+
+    with pytest.raises(SystemExit) as e:
+        main(["--cadence", "weekly", "--cycle", "1"])
+    assert e.value.code == 2
+
+
+def test_execute_proceeds_with_passing_reviewer_verdict(
+    tmp_path, monkeypatch, seeded_proposals
+):
+    # With a PASSING reviewer.json under the cadence cycle root, the gate flag is true => the
+    # execute path runs (no HALT) and persists report.json.
+    save_output(
+        tmp_path / "state",
+        1,
+        "reviewer",
+        {"passed": True, "checks": [], "mismatches": [], "cycle": 1, "cadence": "weekly",
+         "reviewed_at": "2026-06-11T00:00:00+00:00"},
+        cadence="weekly",
+    )
+    monkeypatch.setattr(
+        "scripts.gate_execute_cli.gate_execute_step",
+        lambda *a, **k: {"executed": [{"symbol": "BTC/USDT:USDT"}], "dropped": []},
+    )
+    monkeypatch.setattr(
+        "scripts.gate_execute_cli.FuturesExchange.from_settings", lambda settings: object()
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.gate_execute_cli import main
+
+    main(["--cadence", "weekly", "--cycle", "1"])
+    report_path = tmp_path / "state" / "weekly" / "cycle" / "1" / "report.json"
+    assert report_path.exists()

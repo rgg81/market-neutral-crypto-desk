@@ -30,6 +30,7 @@ from futures_fund.cycle_io import load_output, save_output
 from futures_fund.exchange import FuturesExchange
 from futures_fund.models import Cadence
 from futures_fund.orchestration import gate_execute_step
+from futures_fund.reviewer import reviewer_gate_ok
 
 _STATE_DIR = "state"
 
@@ -43,6 +44,20 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--state-dir", default=_STATE_DIR)
     args = ap.parse_args(argv)
     cadence: Cadence = args.cadence
+
+    # MANDATORY non-skippable reviewer stage (§10/§12): the every-cycle Adversarial Code & Calc
+    # Reviewer must have written a PASSING `reviewer.json` (ReviewerVerdict.passed) under this
+    # cadence cycle root BEFORE any fill. A missing/false verdict HALTs the execute boundary with
+    # SystemExit(2) — absence HALTs just as hard as an explicit veto, so a skipped reviewer can
+    # never let a book through. This precondition runs FIRST, before the exchange is even built.
+    if not reviewer_gate_ok(args.state_dir, args.cycle, cadence):
+        print(
+            "HALT: reviewer gate not satisfied — no passing reviewer.json for "
+            f"{cadence} cycle {args.cycle} (mandatory non-skippable stage, §10/§12). "
+            "Run scripts/reviewer_cli.py first.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     settings = load_settings()
     ex = FuturesExchange.from_settings(settings)

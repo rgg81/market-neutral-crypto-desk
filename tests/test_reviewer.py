@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from futures_fund.contracts import (
     CoinGeometry,
     Pair,
+    SentimentReport,
+    SentimentSource,
     Spread,
     TargetWeights,
     WeightLeg,
@@ -17,13 +19,17 @@ from futures_fund.reviewer import (
     check_beta_neutral,
     check_btc_hedge,
     check_caps,
+    check_crypto_only,
     check_deployment_floor,
     check_dollar_neutral,
     check_exchange_filters,
     check_funding,
     check_pair_pnl,
     check_rr_after_costs,
+    check_sentiment,
     check_sharpe_annualization,
+    review_cycle,
+    reviewer_gate_ok,
 )
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
@@ -662,3 +668,227 @@ def test_exchange_filter_below_min_after_rounding(make_tw):
     checks = check_exchange_filters(tw, geoms)
     assert checks[0].ok is False
     assert "executable notional" in checks[0].detail
+
+
+# === Task 5.4: canonical names 14-17 + review_cycle + gate flag =============================
+
+
+def _sentiment_report(
+    symbol: str,
+    *,
+    level: str,
+    s: float,
+    as_of: datetime,
+    source_offsets_hours: list[float] | None = None,
+) -> SentimentReport:
+    """A SentimentReport with sources published `offset` hours BEFORE as_of (point-in-time).
+
+    A NEGATIVE offset would make a source published AT/AFTER the decision anchor — a PIT breach.
+    """
+    offsets = source_offsets_hours if source_offsets_hours is not None else [1.0]
+    sources = [
+        SentimentSource(url=f"https://x/{symbol}/{i}", published_ts=as_of - timedelta(hours=off))
+        for i, off in enumerate(offsets)
+    ]
+    return SentimentReport(
+        symbol=symbol, level=level, s=s, confidence=0.8, sources=sources, as_of_ts=as_of
+    )
+
+
+# --- name 14: sentiment_range -------------------------------------------------------------
+
+def test_sentiment_level_s_range(make_tw):
+    # A report whose stated `s` round-trips its `level` (level_to_s / s_to_level, §7.1) passes the
+    # range check; a report whose s contradicts its level is caught.
+    before = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    after = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    good = _sentiment_report("ETH/USDT:USDT", level="positive", s=0.5, as_of=NOW)
+    checks = check_sentiment([good], before, after)
+    names = {c.name for c in checks}
+    assert names == {"sentiment_range", "sentiment_cap_respected", "sentiment_point_in_time"}
+    rng_chk = next(c for c in checks if c.name == "sentiment_range")
+    assert rng_chk.ok is True
+
+    bad = _sentiment_report("ETH/USDT:USDT", level="positive", s=-1.0, as_of=NOW)
+    rng_bad = next(
+        c for c in check_sentiment([bad], before, after) if c.name == "sentiment_range"
+    )
+    assert rng_bad.ok is False
+
+
+# --- name 15: sentiment_cap_respected -----------------------------------------------------
+
+def test_sentiment_cap_respected(make_tw):
+    # |Δw| between target_before and target_after must be within the 25% cap. A tilt that GROWS the
+    # leg by exactly 20% is within cap; one that grows it by 40% breaches.
+    rep = _sentiment_report("ETH/USDT:USDT", level="positive", s=0.5, as_of=NOW)
+
+    before = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    after_ok = make_tw([("ETH/USDT:USDT", "long", 6000.0)])  # +20% of |w| <= 25% cap
+    cap_ok = next(
+        c for c in check_sentiment([rep], before, after_ok) if c.name == "sentiment_cap_respected"
+    )
+    assert cap_ok.ok is True
+
+    after_over = make_tw([("ETH/USDT:USDT", "long", 7000.0)])  # +40% of |w| > 25% cap
+    cap_bad = next(
+        c
+        for c in check_sentiment([rep], before, after_over)
+        if c.name == "sentiment_cap_respected"
+    )
+    assert cap_bad.ok is False
+
+
+# --- name 16: sentiment_point_in_time -----------------------------------------------------
+
+def test_sentiment_sources_pit(make_tw):
+    # Every source.published_ts must be < the report's as_of_ts. A source published AFTER the
+    # decision anchor (post-decision leakage) is caught.
+    before = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    after = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    pit_ok = _sentiment_report(
+        "ETH/USDT:USDT", level="neutral", s=0.0, as_of=NOW, source_offsets_hours=[1.0, 5.0]
+    )
+    chk_ok = next(
+        c for c in check_sentiment([pit_ok], before, after) if c.name == "sentiment_point_in_time"
+    )
+    assert chk_ok.ok is True
+
+    pit_bad = _sentiment_report(
+        "ETH/USDT:USDT", level="neutral", s=0.0, as_of=NOW, source_offsets_hours=[1.0, -2.0]
+    )  # one source published 2h AFTER the anchor
+    chk_bad = next(
+        c for c in check_sentiment([pit_bad], before, after) if c.name == "sentiment_point_in_time"
+    )
+    assert chk_bad.ok is False
+
+
+# --- name 17: crypto_only_universe --------------------------------------------------------
+
+def test_crypto_only_no_tokenized_stock():
+    # check_crypto_only reuses is_crypto_perp on each geometry's market metadata. A COIN perp
+    # passes; a tokenized-stock / commodity wrapper (EQUITY / COMMODITY underlyingType) is flagged.
+    crypto = [
+        CoinGeometry(
+            symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9,
+            market_info={"underlyingType": "COIN", "contractType": "PERPETUAL"},
+        ),
+        CoinGeometry(
+            symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.1, adv_usd=1e9,
+            market_info={"underlyingType": "COIN", "contractType": "PERPETUAL"},
+        ),
+    ]
+    chk_ok = check_crypto_only(crypto)
+    assert chk_ok.name == "crypto_only_universe"
+    assert chk_ok.ok is True
+
+    tainted = crypto + [
+        CoinGeometry(
+            symbol="AAPL/USDT:USDT", mark=190.0, beta_btc=0.2, adv_usd=5e8,
+            market_info={"underlyingType": "EQUITY", "contractType": "PERPETUAL"},
+        )
+    ]
+    chk_bad = check_crypto_only(tainted)
+    assert chk_bad.name == "crypto_only_universe"
+    assert chk_bad.ok is False
+
+
+# --- review_cycle: AND of all 17 + HALT on a breach ---------------------------------------
+
+def _clean_target(make_tw) -> TargetWeights:
+    """A fully neutral, in-band book: both sides deploy 0.90 of the 10000 side-budget (4500 per leg,
+    two legs per side => each leg 4500/20000 = 0.225 equity-weight < the 0.25 per-name cap), all
+    beta 1.0 so the dollar+beta residuals and the BTC hedge are zero."""
+    return make_tw(
+        [
+            ("BTC/USDT:USDT", "long", 4500.0),
+            ("SOL/USDT:USDT", "long", 4500.0),
+            ("ETH/USDT:USDT", "short", 4500.0),
+            ("XRP/USDT:USDT", "short", 4500.0),
+        ],
+        betas={
+            "BTC/USDT:USDT": 1.0,
+            "SOL/USDT:USDT": 1.0,
+            "ETH/USDT:USDT": 1.0,
+            "XRP/USDT:USDT": 1.0,
+        },
+        deploy_long_frac=0.90,
+        deploy_short_frac=0.90,
+    )
+
+
+def _review_geoms() -> list[CoinGeometry]:
+    return [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9,
+                     market_info={"underlyingType": "COIN"}),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.0, adv_usd=4e8,
+                     market_info={"underlyingType": "COIN"}),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.0, adv_usd=1e9,
+                     market_info={"underlyingType": "COIN"}),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=1.0, adv_usd=3e8,
+                     market_info={"underlyingType": "COIN"}),
+    ]
+
+
+def test_review_cycle_passes_clean_book(make_tw, cfg, tmp_path):
+    target = _clean_target(make_tw)
+    rep = _sentiment_report("ETH/USDT:USDT", level="neutral", s=0.0, as_of=NOW)
+    v = review_cycle(
+        tmp_path / "state", tmp_path / "memory", cycle=1, cadence="weekly",
+        target=target, geometries=_review_geoms(), spreads=[], sentiment=[rep], cfg=cfg,
+        returns=None,
+    )
+    assert v.passed is True
+    assert v.mismatches == []
+    # all 17 canonical checks present
+    assert len(v.checks) == 17
+
+
+def test_review_cycle_halts_on_sentiment_cap_breach(make_tw, cfg, tmp_path):
+    target = _clean_target(make_tw)
+    rep = _sentiment_report("ETH/USDT:USDT", level="neutral", s=0.0, as_of=NOW)
+    # before/after diverge by >25% on a leg => sentiment_cap_respected fails => verdict HALTs.
+    before = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+    after_over_cap = make_tw([("ETH/USDT:USDT", "long", 7000.0)])  # +40%
+    v = review_cycle(
+        tmp_path / "state", tmp_path / "memory", cycle=1, cadence="weekly",
+        target=target, geometries=_review_geoms(), spreads=[], sentiment=[rep], cfg=cfg,
+        returns=None, target_before=before, target_after=after_over_cap,
+    )
+    assert v.passed is False
+    assert "sentiment_cap_respected" in v.mismatches
+    # mismatches is exactly the failed-check names
+    assert v.mismatches == [c.name for c in v.checks if not c.ok]
+
+
+# --- reviewer_gate_ok: the deterministic HALT flag ----------------------------------------
+
+def test_reviewer_gate_ok_missing_is_false(tmp_path):
+    # No reviewer.json written => gate is NOT ok (execute must HALT).
+    assert reviewer_gate_ok(tmp_path / "state", 1, "weekly") is False
+
+
+def test_reviewer_gate_ok_reads_persisted_pass(make_tw, cfg, tmp_path):
+    from futures_fund.cycle_io import save_output
+
+    target = _clean_target(make_tw)
+    v = review_cycle(
+        tmp_path / "state", tmp_path / "memory", cycle=1, cadence="weekly",
+        target=target, geometries=_review_geoms(), spreads=[],
+        sentiment=[_sentiment_report("ETH/USDT:USDT", level="neutral", s=0.0, as_of=NOW)],
+        cfg=cfg, returns=None,
+    )
+    save_output(tmp_path / "state", 1, "reviewer", v, cadence="weekly")
+    assert reviewer_gate_ok(tmp_path / "state", 1, "weekly") is v.passed is True
+
+
+def test_reviewer_gate_ok_false_when_verdict_failed(tmp_path):
+    from futures_fund.cycle_io import save_output
+
+    save_output(
+        tmp_path / "state", 1, "reviewer",
+        {"passed": False, "checks": [], "mismatches": ["sentiment_cap_respected"], "cycle": 1,
+         "cadence": "weekly", "reviewed_at": NOW.isoformat()},
+        cadence="weekly",
+    )
+    assert reviewer_gate_ok(tmp_path / "state", 1, "weekly") is False

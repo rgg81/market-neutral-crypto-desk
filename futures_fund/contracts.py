@@ -119,6 +119,10 @@ class CoinGeometry(BaseModel):
     # liquidity / filters
     adv_usd: float = 0.0
     spec: SymbolSpec | None = None
+    # crypto-only universe audit: the exchange `market["info"]` (carries `underlyingType` /
+    # `contractType`) the reviewer feeds to `market_data.is_crypto_perp` to reject TradFi-wrapper
+    # perps (tokenized stocks / commodities / indices). None => no metadata (treated as crypto).
+    market_info: dict | None = None
 
 
 class GeometryBundle(BaseModel):

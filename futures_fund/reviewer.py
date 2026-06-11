@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
+from datetime import UTC, datetime
 
 from futures_fund.contracts import (
     CoinGeometry,
     Pair,
     ReviewerCheck,
+    ReviewerVerdict,
+    SentimentReport,
     Spread,
     TargetWeights,
 )
+from futures_fund.cycle_io import cycle_dir
 from futures_fund.funding_intervals import (
     clamp_funding_rate,
     realized_funding,
 )
+from futures_fund.market_data import is_crypto_perp
 from futures_fund.metrics import PERIODS_PER_YEAR_DAILY, PERIODS_PER_YEAR_WEEKLY
 from futures_fund.models import Cadence, TradeProposal
 from futures_fund.neutrality import (
@@ -22,6 +28,7 @@ from futures_fund.neutrality import (
     size_btc_hedge,
 )
 from futures_fund.risk_gate import MIN_RR, _reward_risk
+from futures_fund.sentiment_ingest import level_to_s, s_to_level, validate_point_in_time
 
 # The every-cycle Adversarial Code & Calc Reviewer (§10 Guardian, §12). These checks (canonical
 # names 1-6) re-derive the §5/§8 neutrality/hedge/deployment/cap numbers from GROUND TRUTH — the
@@ -416,13 +423,21 @@ def check_pair_pnl(spreads: list[Spread], pairs: list[Pair]) -> list[ReviewerChe
 def check_rr_after_costs(proposals: list[TradeProposal]) -> ReviewerCheck:
     """Re-derive each proposal's reward:risk via `risk_gate._reward_risk` (the SAME geometric
     take-profit/stop math the gate's RR floor uses) and require every proposal to clear `MIN_RR`
-    (>= 2.0). The worst RR across the proposals decides `ok` (canonical name 11)."""
+    (>= 2.0). The worst RR across the proposals decides `ok` (canonical name 11). With NO proposals
+    the floor is vacuously satisfied (a cycle that opens nothing cannot violate the RR floor)."""
+    if not proposals:
+        return ReviewerCheck(
+            name="rr_after_costs",
+            ok=True,
+            expected=MIN_RR,
+            actual=MIN_RR,
+            tolerance=_TOL,
+            detail="no proposals to gate => RR floor vacuously satisfied",
+        )
     worst = float("inf")
     for p in proposals:
         rr = _reward_risk(p)
         worst = min(worst, rr)
-    if worst == float("inf"):
-        worst = 0.0
     ok = worst >= MIN_RR - _TOL
     return ReviewerCheck(
         name="rr_after_costs",
@@ -554,3 +569,212 @@ def check_exchange_filters(
             ),
         )
     ]
+
+
+# === canonical names 14-17: sentiment range/cap/PIT + crypto-only universe ==================
+# These re-derive the §7 sentiment discipline and the §3 crypto-only mandate from GROUND TRUTH
+# (the level<->s mapping, the before/after tilt magnitude, the source timestamps, the exchange
+# market metadata) — the same NEVER-trust-the-artifact discipline as names 1-13. `check_sentiment`
+# emits THREE checks (range + cap + point-in-time).
+
+SENTIMENT_CAP = 0.25  # §7.2 conviction-tilt cap: |Δw| <= cap*|w| between target_before/after
+
+
+def _leg_weights(target: TargetWeights) -> dict[str, float]:
+    """Per-symbol signed equity-weight from the legs (sign from `direction`), for the cap delta."""
+    out: dict[str, float] = {}
+    for leg in target.legs:
+        out[leg.symbol] = out.get(leg.symbol, 0.0) + _signed_notional(
+            leg.direction, leg.target_notional
+        )
+    return out
+
+
+def check_sentiment(
+    sentiment: list[SentimentReport],
+    target_before: TargetWeights,
+    target_after: TargetWeights,
+    *,
+    cap: float = SENTIMENT_CAP,
+) -> list[ReviewerCheck]:
+    """Re-derive the §7 sentiment discipline from ground truth and emit THREE checks (canonical
+    names 14 + 15 + 16). The reviewer NEVER trusts a report's stated figure — it round-trips the
+    `level<->s` mapping itself, recomputes the tilt magnitude from the before/after books, and
+    re-reads every source timestamp.
+
+    - `sentiment_range`: every report's stated `s` must round-trip its `level` via the §7.1 ordinal
+      mapping (`s_to_level(s) == level` AND `s == level_to_s(level)` within tolerance). A report
+      whose numeric score contradicts its ordinal level (e.g. level "positive" but s -1.0) is
+      caught.
+    - `sentiment_cap_respected`: the per-symbol tilt the optimizer applied is `|w_after - w_before|`
+      (signed equity-notional weights re-derived from the legs); it must be `<= cap*|w_before|` for
+      every symbol. A tilt that grows a leg beyond the §7.2 cap (default 25%) is caught — this is
+      the hard-veto the gate keys off when a sentiment tilt over-sizes a leg.
+    - `sentiment_point_in_time`: every `SentimentSource.published_ts` must be strictly BEFORE its
+      report's `as_of_ts` (`sentiment_ingest.validate_point_in_time`). A source published at/after
+      the decision anchor (post-decision leakage) is caught."""
+    # --- name 14: range (level <-> s round-trip) ---
+    range_ok = True
+    worst_sym = ""
+    for r in sentiment:
+        mapped_s = level_to_s(r.level)
+        if abs(mapped_s - r.s) > 1e-9 or s_to_level(r.s) != r.level:
+            range_ok = False
+            worst_sym = r.symbol
+    range_check = ReviewerCheck(
+        name="sentiment_range",
+        ok=range_ok,
+        expected=0.0,
+        actual=0.0 if range_ok else 1.0,
+        tolerance=1e-9,
+        detail=(
+            f"{worst_sym} stated s does not round-trip its level (§7.1 mapping)"
+            if not range_ok
+            else "every report's s round-trips its ordinal level"
+        ),
+    )
+
+    # --- name 15: cap (|Δw| <= cap*|w_before|) ---
+    before_w = _leg_weights(target_before)
+    after_w = _leg_weights(target_after)
+    cap_ok = True
+    worst_delta = 0.0
+    worst_cap_sym = ""
+    for sym in set(before_w) | set(after_w):
+        wb = before_w.get(sym, 0.0)
+        wa = after_w.get(sym, 0.0)
+        delta = abs(wa - wb)
+        allowed = cap * abs(wb)
+        if delta > allowed + 1e-9:
+            cap_ok = False
+        if delta > worst_delta:
+            worst_delta = delta
+            worst_cap_sym = sym
+    cap_check = ReviewerCheck(
+        name="sentiment_cap_respected",
+        ok=cap_ok,
+        expected=cap,
+        actual=worst_delta,
+        tolerance=1e-9,
+        detail=(
+            f"worst |w_after - w_before| = {worst_delta:.2f} ({worst_cap_sym}) "
+            f"vs cap {cap}·|w_before|"
+        ),
+    )
+
+    # --- name 16: point-in-time (every source published before as_of) ---
+    pit_ok = all(validate_point_in_time(r) for r in sentiment)
+    pit_check = ReviewerCheck(
+        name="sentiment_point_in_time",
+        ok=pit_ok,
+        expected=0.0,
+        actual=0.0 if pit_ok else 1.0,
+        tolerance=0.0,
+        detail=(
+            "every source.published_ts < report.as_of_ts"
+            if pit_ok
+            else "a source was published at/after the decision anchor (PIT leakage)"
+        ),
+    )
+    return [range_check, cap_check, pit_check]
+
+
+def check_crypto_only(geometries: list[CoinGeometry]) -> ReviewerCheck:
+    """Re-verify the §3 CRYPTO-ONLY mandate: every traded geometry must be a cryptocurrency COIN
+    perp (canonical name 17). Reuses `market_data.is_crypto_perp` on each geometry's `market_info`
+    (the exchange `market["info"]`, carrying `underlyingType` / `contractType`) so a TradFi-wrapper
+    perp — a tokenized stock (EQUITY), commodity (gold/silver/oil), index basket — is flagged. A
+    geometry with no metadata is treated as crypto (fail-open on a metadata gap is the same posture
+    `is_crypto_perp`'s `contractType` fallback takes)."""
+    violations: list[str] = []
+    for g in geometries:
+        market = {"info": g.market_info or {}}
+        if not is_crypto_perp(market):
+            utype = (g.market_info or {}).get("underlyingType")
+            violations.append(f"{g.symbol} ({utype})")
+    ok = not violations
+    return ReviewerCheck(
+        name="crypto_only_universe",
+        ok=ok,
+        expected=0.0,
+        actual=float(len(violations)),
+        tolerance=0.0,
+        detail=(
+            "all geometries are cryptocurrency COIN perps"
+            if ok
+            else "non-crypto (TradFi-wrapper) perps in universe: " + ", ".join(violations)
+        ),
+    )
+
+
+# === review_cycle (AND of all 17) + the deterministic gate flag ============================
+
+
+def review_cycle(
+    state_dir,
+    memory_dir,
+    cycle: int,
+    cadence: Cadence,
+    *,
+    target: TargetWeights,
+    geometries: list[CoinGeometry],
+    spreads: list[Spread],
+    sentiment: list[SentimentReport],
+    cfg: NeutralityConfig,
+    returns: list[float] | None = None,  # noqa: ARG001 — reserved for a future realized-Sharpe check
+    pairs: list[Pair] | None = None,
+    proposals: list[TradeProposal] | None = None,
+    corr: Mapping[tuple[str, str], float] | None = None,
+    target_before: TargetWeights | None = None,
+    target_after: TargetWeights | None = None,
+) -> ReviewerVerdict:
+    """Run every canonical reviewer check (the full 17) against the cycle's artifacts, re-derived
+    from ground truth, and AND them into a single deterministic `ReviewerVerdict` (§10 Guardian,
+    §12). `passed` is the AND of all 17 `ReviewerCheck.ok`; `mismatches` is exactly the names of
+    the failed checks (`[c.name for c in checks if not c.ok]`). This is the hard-veto verdict the
+    execute step keys off via `reviewer_gate_ok`.
+
+    The sentiment cap compares `target_before` vs `target_after` (the conviction-tilt before/after
+    books, §7.3 ordering invariant); if not supplied they default to `target` (no tilt => cap
+    trivially respected)."""
+    before = target_before if target_before is not None else target
+    after = target_after if target_after is not None else target
+    checks: list[ReviewerCheck] = [
+        check_dollar_neutral(target, cfg),                       # 1
+        check_beta_neutral(target, geometries, cfg),             # 2
+        check_btc_hedge(target, geometries, cfg),                # 3
+        check_deployment_floor(target, cfg),                     # 4
+        *check_caps(target, cfg, corr=corr),                     # 5 + 6
+        *check_funding(target, geometries),                      # 7 + 8
+        *check_pair_pnl(spreads, pairs or []),                   # 9 + 10
+        check_rr_after_costs(proposals or []),                   # 11
+        check_sharpe_annualization(cadence),                     # 12
+        *check_exchange_filters(target, geometries),             # 13
+        *check_sentiment(sentiment, before, after),              # 14 + 15 + 16
+        check_crypto_only(geometries),                           # 17
+    ]
+    mismatches = [c.name for c in checks if not c.ok]
+    return ReviewerVerdict(
+        passed=not mismatches,
+        checks=checks,
+        mismatches=mismatches,
+        cycle=cycle,
+        cadence=cadence,
+        reviewed_at=datetime.now(UTC),
+    )
+
+
+def reviewer_gate_ok(state_dir, cycle: int, cadence: Cadence) -> bool:
+    """Read the persisted `reviewer.json` for this cadence cycle and return its `passed` flag — the
+    DETERMINISTIC HALT flag the execute step checks before ANY fill (§10/§12, mandatory
+    non-skippable stage). A MISSING verdict (the reviewer never ran) is treated as NOT ok, exactly
+    like a failed one: absence must HALT just as hard as an explicit veto, so a skipped reviewer can
+    never let a book through."""
+    path = cycle_dir(state_dir, cycle, cadence=cadence) / "reviewer.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(data.get("passed", False))
