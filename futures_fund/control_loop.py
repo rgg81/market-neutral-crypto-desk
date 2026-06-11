@@ -14,7 +14,14 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from futures_fund.contracts import CoinGeometry, SleeveSignal, TargetWeights, WeightLeg
+from futures_fund.contracts import (
+    CoinGeometry,
+    SleeveSignal,
+    SleeveTilt,
+    Spread,
+    TargetWeights,
+    WeightLeg,
+)
 from futures_fund.cycle_io import save_output
 from futures_fund.models import Cadence
 from futures_fund.neutrality import NeutralityConfig, optimize_book, risk_parity_budgets
@@ -118,3 +125,92 @@ def neutrality_breached(target: TargetWeights, cfg: NeutralityConfig) -> bool:
         target.dollar_residual_frac > cfg.dollar_band
         or abs(target.beta_residual) > cfg.beta_band
     )
+
+
+def _sleeves_from_legs(legs: list[WeightLeg], as_of_ts: datetime) -> list[SleeveSignal]:
+    """Reconstitute the per-sleeve tilt signals from a prior book's alpha legs (§9 fixed set).
+
+    The Daily Rebalance Meeting keeps the SAME symbol set as the weekly target, so we re-derive the
+    sleeve tilts from that book's legs rather than re-selecting. The BTC hedge leg is excluded — it
+    is sized by the optimizer from the alpha legs' residual beta, never a tilt input. Each alpha
+    leg's `weight` (signed by direction) becomes its sleeve's `SleeveTilt.target_weight`, grouped by
+    the leg's originating `sleeve` so `optimize_book` re-runs against an identical universe."""
+    by_sleeve: dict[str, list[SleeveTilt]] = {}
+    for leg in legs:
+        if leg.sleeve == "hedge":
+            continue
+        signed = abs(leg.weight) if leg.direction == "long" else -abs(leg.weight)
+        by_sleeve.setdefault(leg.sleeve, []).append(
+            SleeveTilt(
+                symbol=leg.symbol,
+                direction=leg.direction,
+                target_weight=signed,
+                pair_id=leg.pair_id,
+            )
+        )
+    return [
+        SleeveSignal(sleeve=sleeve, tilts=tilts, risk_budget_frac=1.0, as_of_ts=as_of_ts)
+        for sleeve, tilts in by_sleeve.items()
+    ]
+
+
+def daily_rebalance(
+    state_dir,
+    target: TargetWeights,
+    geometries: list[CoinGeometry],
+    spreads: list[Spread],
+    *,
+    equity: float,
+    cfg: NeutralityConfig,
+    cycle: int,
+) -> TargetWeights:
+    """Daily Rebalance Meeting (§9): nudge the SAME symbol set back toward target within a band.
+
+    Keeps the weekly `target`'s symbol set fixed (no re-selection), recomputes residuals/z/funding/
+    sentiment by re-running `optimize_book` against that set (`prior_legs=target.legs`, so the
+    turnover/no-trade band excludes unchanged legs), then trades ONLY the deltas via
+    `rebalance_deltas(prior=target, target=recomputed)`. Two overrides force a trade on an
+    otherwise in-band leg: any `Spread.state == "stop"` forces that pair's legs into the delta book
+    (broken z-stop), and a `neutrality_breached` recomputed book forces the full recomputed leg set
+    (dollar/beta drift off-neutral). The returned `TargetWeights` carries the recomputed book's
+    residual/deployment metadata but its `legs` are the delta book the Trader must execute — an
+    in-band, no-stop, neutral book therefore yields ZERO delta legs (no churn). Persisted under the
+    cadence-segmented daily root `state/daily/cycle/<cycle>/target_weights.json` (the SAME root the
+    daily due-gate reads — CADENCE-ROOT INVARIANT)."""
+    sleeves = _sleeves_from_legs(target.legs, target.as_of_ts)
+    recomputed = optimize_book(
+        sleeves,
+        geometries,
+        equity=equity,
+        prior_legs=target.legs,
+        cfg=cfg,
+    )
+
+    # base delta book: only names whose notional moved (carry-over excludes unchanged overlap)
+    delta_by_key: dict[tuple[str, str], WeightLeg] = {
+        (leg.symbol, leg.direction): leg
+        for leg in rebalance_deltas(target, recomputed)
+    }
+
+    # z-stop override: a stopped spread forces its pair's legs into the delta book. The pair_id is
+    # carried on the PRIOR target's legs (the fixed set), so resolve stopped pairs -> symbols there,
+    # then force the recomputed legs for those symbols (recompute may re-derive pair_id only for the
+    # pairs sleeve, so we key the override by symbol, not by recomputed pair_id).
+    stopped_pairs = {sp.pair_id for sp in spreads if sp.state == "stop"}
+    if stopped_pairs:
+        stopped_symbols = {
+            leg.symbol for leg in target.legs if leg.pair_id in stopped_pairs
+        }
+        for leg in recomputed.legs:
+            if leg.symbol in stopped_symbols:
+                delta_by_key[(leg.symbol, leg.direction)] = leg
+
+    # neutrality-breach override: an off-neutral recomputed book forces the FULL recomputed set.
+    if neutrality_breached(recomputed, cfg):
+        for leg in recomputed.legs:
+            delta_by_key[(leg.symbol, leg.direction)] = leg
+
+    delta_legs = list(delta_by_key.values())
+    rebalanced = recomputed.model_copy(update={"legs": delta_legs})
+    save_output(state_dir, cycle, "target_weights", rebalanced, cadence="daily")
+    return rebalanced

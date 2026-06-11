@@ -4,10 +4,17 @@ from pathlib import Path
 import pytest
 
 import futures_fund.control_loop as cl
-from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt, TargetWeights
+from futures_fund.contracts import (
+    CoinGeometry,
+    SleeveSignal,
+    SleeveTilt,
+    Spread,
+    TargetWeights,
+)
 from futures_fund.control_loop import (
     cadence_cycle_root,
     cadence_due,
+    daily_rebalance,
     drift_exceeded,
     neutrality_breached,
     rebalance_deltas,
@@ -220,3 +227,71 @@ def test_cadence_root_binds_writer_to_gate_reader(tmp_path, write_served_report,
     write_served_report(write_dir, served=now, tf_minutes=tf)
     mode, n, _ = cadence_due(tmp_path / "s", now, cadence)  # real cycle_due, no monkeypatch
     assert (mode, n) == ("SKIP", 1)
+
+
+def _stop_spread(pair_id: str) -> Spread:
+    """A `Spread` flipped to the z-stop state (|z| past stop_z) — its legs MUST be force-traded."""
+    return Spread(pair_id=pair_id, spread_value=0.0, zscore=3.5, state="stop")
+
+
+def test_daily_rebalance_same_set(tmp_path):
+    # Daily Rebalance Meeting (§9): keep the SAME symbol set as the weekly target, recompute
+    # residuals/z/funding/sentiment, and (with an in-band book and no z-stops) emit ZERO delta legs
+    # so the carry-over book is not churned. Still persists a TargetWeights under the daily root.
+    cfg = NeutralityConfig()
+    geometries = _broad_geometries()
+    sleeves = _broad_sleeves(NOW)
+    target = weekly_selection(
+        tmp_path / "s", geometries, sleeves,
+        equity=20000.0, prior=None, cfg=cfg, cycle=1,
+    )
+    weekly_symbols = {leg.symbol for leg in target.legs}
+
+    result = daily_rebalance(
+        tmp_path / "s", target, geometries, spreads=[],
+        equity=20000.0, cfg=cfg, cycle=1,
+    )
+    assert isinstance(result, TargetWeights)
+    # SAME symbol set: the recompute introduced no new names and dropped none.
+    assert {leg.symbol for leg in result.legs} <= weekly_symbols
+    # in-band, no z-stop, no neutrality breach -> zero delta legs (no churn)
+    assert result.legs == []
+    # persisted under state/daily/cycle/1/target_weights.json (cadence-segmented daily root)
+    persisted = tmp_path / "s" / "daily" / "cycle" / "1" / "target_weights.json"
+    assert persisted.exists()
+    reloaded = TargetWeights.model_validate(
+        load_output(tmp_path / "s", 1, "target_weights", cadence="daily")
+    )
+    assert reloaded.legs == []
+
+
+def test_daily_rebalance_zstop_forces(tmp_path):
+    # A Spread flipped to "stop" must force ITS legs into the delta book even when every leg is
+    # individually inside its drift band (an otherwise in-band, no-churn rebalance).
+    cfg = NeutralityConfig()
+    geometries = _broad_geometries()
+    sleeves = _broad_sleeves(NOW)
+    target = weekly_selection(
+        tmp_path / "s", geometries, sleeves,
+        equity=20000.0, prior=None, cfg=cfg, cycle=1,
+    )
+    # Pick two real symbols from the weekly book and bind them into a pair whose spread is stopped.
+    syms = [leg.symbol for leg in target.legs]
+
+    def _slug(sym: str) -> str:
+        return sym.replace("/", "").replace(":", "")
+
+    pair_id = f"{_slug(syms[0])}__{_slug(syms[1])}"
+    # stamp the pair_id onto the two legs so the forced spread maps back to real book legs
+    forced = target.model_copy(update={"legs": [
+        leg.model_copy(update={"pair_id": pair_id}) if leg.symbol in (syms[0], syms[1]) else leg
+        for leg in target.legs
+    ]})
+
+    result = daily_rebalance(
+        tmp_path / "s", forced, geometries, spreads=[_stop_spread(pair_id)],
+        equity=20000.0, cfg=cfg, cycle=2,
+    )
+    forced_syms = {leg.symbol for leg in result.legs}
+    # the stopped pair's legs are forced into the delta book despite being in drift band
+    assert {syms[0], syms[1]} <= forced_syms
