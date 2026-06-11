@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel
@@ -192,4 +194,74 @@ def apply_hrp_weights(
             continue
         for s in side:
             out[s] = sign * side_gross * (hrp_side[s] / hrp_sum)
+    return out
+
+
+def apply_per_name_cap(
+    weights: dict[str, float], *, per_name_cap: float
+) -> dict[str, float]:
+    """Clamp each symbol's weight magnitude to `per_name_cap`, preserving sign."""
+    out: dict[str, float] = {}
+    for sym, w in weights.items():
+        if abs(w) > per_name_cap:
+            out[sym] = per_name_cap if w > 0 else -per_name_cap
+        else:
+            out[sym] = w
+    return out
+
+
+def _corr_lookup(corr: Mapping[tuple[str, str], float], a: str, b: str) -> float:
+    if (a, b) in corr:
+        return corr[(a, b)]
+    if (b, a) in corr:
+        return corr[(b, a)]
+    return 0.0
+
+
+def apply_cluster_cap(
+    weights: dict[str, float],
+    *,
+    corr: Mapping[tuple[str, str], float],
+    cluster_cap: float,
+    threshold: float = 0.7,
+) -> dict[str, float]:
+    """'Correlated-as-one' heat cap. Union-find groups SAME-SIDE symbols whose pairwise
+    correlation >= threshold (a long and short in correlated names are a natural hedge and
+    are NOT clustered). Scales down each cluster so its combined |weight| <= cluster_cap.
+    Adapted from crypto-trade-claude-code-weekly portfolio_risk.cluster_heat."""
+    syms = list(weights.keys())
+    n = len(syms)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        parent[find(a)] = find(b)
+
+    def side(w: float) -> int:
+        return 1 if w > 0 else (-1 if w < 0 else 0)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if side(weights[syms[i]]) != 0 and side(weights[syms[i]]) == side(weights[syms[j]]):
+                if _corr_lookup(corr, syms[i], syms[j]) >= threshold:
+                    union(i, j)
+
+    cluster_mag: dict[int, float] = {}
+    for idx, sym in enumerate(syms):
+        root = find(idx)
+        cluster_mag[root] = cluster_mag.get(root, 0.0) + abs(weights[sym])
+
+    out: dict[str, float] = {}
+    for idx, sym in enumerate(syms):
+        root = find(idx)
+        mag = cluster_mag[root]
+        if mag > cluster_cap and mag > 0.0:
+            out[sym] = weights[sym] * (cluster_cap / mag)
+        else:
+            out[sym] = weights[sym]
     return out
