@@ -14,6 +14,40 @@ from futures_fund.models import (
     SymbolSpec,
 )
 
+# --- analyst-roster type aliases (Phase 4; adapted from the weekly desk's contracts) ---
+Lean = Literal["long", "short", "watch"]      # Universe Scout candidate lean
+Stance = Literal["bullish", "bearish", "neutral"]   # analyst read direction
+
+
+class Candidate(BaseModel):
+    """One symbol the Universe Scout nominates for deeper analysis. Adapted from the weekly
+    `Candidate`: a triage lean + score, never a sized trade."""
+    symbol: str                                   # ccxt unified symbol, e.g. BTC/USDT:USDT
+    lean: Lean
+    rationale: str = ""
+    score: float = Field(ge=0.0, le=1.0)          # triage priority, NOT a probability of profit
+    correlation_group: str | None = None          # e.g. "majors", "alt-l1"; null = stands alone
+
+
+class WatcherOutput(BaseModel):
+    """The Universe Scout's bundle: a two-sided shortlist of candidates."""
+    candidates: list[Candidate] = Field(default_factory=list)
+
+
+class AnalystReport(BaseModel):
+    """One analyst's per-symbol read for the market-neutral desk. Adapted from the weekly
+    `AnalystReport`, but on the desk's field set (`stance/conviction/thesis/signals/horizon`).
+    `extra="allow"` so each analyst can attach its own structured `signals` keys (e.g. the Pair
+    researcher's `hedge_ratio`/`adf_pvalue`, the Carry desk's `signed_funding`/`funding_interval_h`)
+    while the shared envelope stays validated."""
+    model_config = ConfigDict(extra="allow")
+    symbol: str                                   # ccxt unified id, or a pair_id for the Pair desk
+    stance: Stance                                # the READ direction (both sides co-equal)
+    conviction: float = Field(ge=0.0, le=1.0)     # how strongly the evidence backs the stance
+    thesis: str = ""                              # one-paragraph rationale citing the signals
+    signals: dict = Field(default_factory=dict)   # the computed evidence (analyst-specific keys)
+    horizon: str = ""                             # intended hold horizon, e.g. "weekly", "1-3 days"
+
 
 class SentimentSource(BaseModel):
     model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
