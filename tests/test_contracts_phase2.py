@@ -14,6 +14,8 @@ from futures_fund.contracts import (
     SentimentBatch,
     SentimentReport,
     SentimentSource,
+    SleeveSignal,
+    SleeveTilt,
     Spread,
 )
 
@@ -144,3 +146,26 @@ def test_spread_defaults():
     assert s.stop_z == 3.0
     assert s.realized_pnl == 0.0
     assert s.qty_y == 0.0
+
+
+def test_sleeve_tilt_defaults():
+    t = SleeveTilt(symbol="BTC/USDT:USDT", direction="long", target_weight=0.2)
+    assert t.raw_score == 0.0
+    assert t.pair_id is None
+
+
+def test_sleeve_signal_valid():
+    sig = SleeveSignal(
+        sleeve="carry",
+        tilts=[SleeveTilt(symbol="BTC/USDT:USDT", direction="short", target_weight=-0.3)],
+        risk_budget_frac=0.25,
+        as_of_ts=_NOW,
+    )
+    assert sig.sleeve == "carry"
+    assert sig.tilts[0].direction == "short"
+    assert sig.diagnostics == {}
+
+
+def test_sleeve_signal_risk_budget_out_of_range_rejected():
+    with pytest.raises(ValidationError):
+        SleeveSignal(sleeve="carry", risk_budget_frac=1.5, as_of_ts=_NOW)
