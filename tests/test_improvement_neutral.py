@@ -22,6 +22,7 @@ from futures_fund.improvement import (
     alpha_sharpe_trend,
     both_sides_deployment_rate,
     carry_capture_rate,
+    deployment_rate,
     improvement_panel,
     pair_survival_rate,
     reviewer_veto_rate,
@@ -49,6 +50,24 @@ def _target_weights(*, long_frac: float, short_frac: float) -> dict:
     }
 
 
+def _report(*, cycle: int, executed: list[dict], triggers: list[dict]) -> dict:
+    """Production-shaped report.json as emitted by `orchestration.gate_execute_step`.
+
+    The real report records `executed`/`triggers` as LISTS (not `opened`/`triggers_armed` counts),
+    plus the other gate fields — this is what `deployment_rate` must read on real artifacts."""
+    return {
+        "loop": "weekly",
+        "cycle": cycle,
+        "ran_at": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        "live": False,
+        "executed": executed,
+        "dropped": [],
+        "management": [],
+        "triggers": triggers,
+        "cancel_triggers": [],
+    }
+
+
 def _reviewer(*, cycle: int, passed: bool) -> dict:
     return {
         "passed": passed,
@@ -70,6 +89,28 @@ def _seed_journal_leg(
 ) -> None:
     append_decision(memory_dir, cycle=cycle, symbol=symbol, direction=direction, payload={})
     patch_outcome(memory_dir, cycle=cycle, symbol=symbol, direction=direction, outcome=outcome)
+
+
+# --------------------------------------------------------------------------------------------------
+# deployment_rate — reads the PRODUCTION report.json shape (executed/triggers LISTS)
+# --------------------------------------------------------------------------------------------------
+def test_deployment_rate_reads_production_report_shape(tmp_path):
+    # cycle 1: executed leg -> active; cycle 2: only a trigger armed -> active;
+    # cycle 3: nothing executed, no triggers -> inactive. 2/3 active, 2 total opens (cycle 1+4).
+    save_output(tmp_path, 1, "report",
+                _report(cycle=1, executed=[{"symbol": "BTC/USDT:USDT"}], triggers=[]),
+                cadence="weekly")
+    save_output(tmp_path, 2, "report",
+                _report(cycle=2, executed=[], triggers=[{"symbol": "ETH/USDT:USDT"}]),
+                cadence="weekly")
+    save_output(tmp_path, 3, "report",
+                _report(cycle=3, executed=[], triggers=[]),
+                cadence="weekly")
+    save_output(tmp_path, 4, "report",
+                _report(cycle=4, executed=[{"symbol": "SOL/USDT:USDT"}], triggers=[]),
+                cadence="weekly")
+    out = deployment_rate(tmp_path, last_n=4)
+    assert out == {"deployment_rate": 0.75, "cycles": 4, "active": 3, "opens": 2}
 
 
 # --------------------------------------------------------------------------------------------------

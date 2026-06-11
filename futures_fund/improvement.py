@@ -85,6 +85,10 @@ def _decisions_by_cycle(memory_dir, last_n: int) -> list[dict]:
 def deployment_rate(state_dir, last_n: int = 10) -> dict:
     """Over the last `last_n` cycle reports: fraction that deployed risk (opened a position OR armed
     a trigger). Near-zero = the under-deployment alarm. Reads `state/<cadence>/cycle/*/report.json`.
+
+    The production report.json (`orchestration.gate_execute_step`) records `executed` and `triggers`
+    as LISTS — not `opened`/`triggers_armed` counts — so a cycle is "active" when either list is
+    non-empty, and `opens` counts the executed legs.
     """
     reports = [d / "report.json" for d in _cycle_dirs(state_dir)]
     reports = [p for p in reports if p.exists()][-last_n:]
@@ -96,10 +100,11 @@ def deployment_rate(state_dir, last_n: int = 10) -> dict:
         r = _read_json(p)
         if r is None:
             continue
-        o = int(r.get("opened", 0) or 0)
-        armed = int(r.get("triggers_armed", 0) or 0)
+        executed = r.get("executed") or []
+        triggers = r.get("triggers") or []
+        o = len(executed)
         opens += o
-        if o > 0 or armed > 0:
+        if o > 0 or len(triggers) > 0:
             active += 1
     return {"deployment_rate": round(active / n, 3), "cycles": n, "active": active, "opens": opens}
 
