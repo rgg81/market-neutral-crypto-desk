@@ -6,6 +6,7 @@ Adapted for the market-neutral desk; statsmodels-backed. Pure functions, fail-so
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -123,3 +124,29 @@ def spread_state(z: float, *, entry_z: float = 2.0, exit_z: float = 0.0, stop_z:
     if az <= exit_z:
         return "flat"
     return prev_state
+
+
+def fdr_adjust(pvalues: list[float], *, alpha: float = 0.05,
+               method: Literal["bh", "bonferroni"] = "bh") -> list[float]:
+    """Benjamini-Hochberg (default) or Bonferroni correction across candidate pairs.
+
+    Returns adjusted p-values in the ORIGINAL input order, each clamped to [0, 1]. BH adjustment:
+    p_adj(i) = min over k>=rank(i) of (m/k * p_sorted(k)), enforced monotone non-decreasing.
+    """
+    m = len(pvalues)
+    if m == 0:
+        return []
+    if method == "bonferroni":
+        return [min(1.0, p * m) for p in pvalues]
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    adj_sorted = [0.0] * m
+    prev = 1.0
+    for rank in range(m, 0, -1):                    # rank = m..1 (largest p first)
+        idx = order[rank - 1]
+        val = min(1.0, pvalues[idx] * m / rank)
+        prev = min(prev, val)
+        adj_sorted[rank - 1] = prev
+    out = [0.0] * m
+    for rank, idx in enumerate(order):
+        out[idx] = adj_sorted[rank]
+    return out

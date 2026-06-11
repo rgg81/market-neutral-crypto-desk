@@ -112,3 +112,22 @@ def test_spread_state_transitions():
     assert co.spread_state(1.5, prev_state="short_spread") == "short_spread"
     # between exit and entry from flat: stay flat (no new entry)
     assert co.spread_state(1.5, prev_state="flat") == "flat"
+
+
+def test_fdr_bh_is_monotone_and_ge_raw():
+    raw = [0.001, 0.01, 0.03, 0.5]
+    adj = co.fdr_adjust(raw, method="bh")
+    assert len(adj) == 4
+    assert all(a >= r - 1e-12 for a, r in zip(adj, raw, strict=True))   # adjusted p >= raw p
+    assert all(a <= 1.0 + 1e-12 for a in adj)
+
+
+def test_fdr_bonferroni_multiplies_by_m():
+    raw = [0.01, 0.02]
+    adj = co.fdr_adjust(raw, method="bonferroni")
+    assert abs(adj[0] - 0.02) < 1e-12              # 0.01 * 2
+    assert abs(adj[1] - 0.04) < 1e-12              # 0.02 * 2
+
+
+def test_fdr_empty_returns_empty():
+    assert co.fdr_adjust([]) == []
