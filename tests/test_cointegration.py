@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -29,3 +31,20 @@ def test_engle_granger_non_cointegrated_high_pvalue():
     x = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 50.0)   # two independent random walks
     _, pvalue, _ = co.engle_granger(y, x)
     assert pvalue > 0.05
+
+
+def test_johansen_detects_cointegration_rank():
+    y, x = _cointegrated_pair()
+    frame = pd.DataFrame({"y": y, "x": x})
+    out = co.johansen(frame)
+    assert out["rank"] >= 1                        # at least one cointegrating relationship
+    assert out["trace_stat"] > out["crit_95"]      # trace stat exceeds the 95% critical value
+    assert math.isfinite(out["hedge_ratio"])
+
+
+def test_johansen_independent_walks_rank_zero():
+    rng = np.random.default_rng(3)
+    a = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 50.0)
+    b = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 50.0)
+    out = co.johansen(pd.DataFrame({"a": a, "b": b}))
+    assert out["rank"] == 0

@@ -8,6 +8,7 @@ from __future__ import annotations
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 
 def engle_granger(y: pd.Series, x: pd.Series) -> tuple[float, float, float]:
@@ -26,3 +27,26 @@ def engle_granger(y: pd.Series, x: pd.Series) -> tuple[float, float, float]:
     resid = yv.to_numpy() - hedge_ratio * xv.to_numpy() - float(model.params[0])
     stat, pvalue, *_ = adfuller(resid, autolag="AIC")
     return hedge_ratio, float(pvalue), float(stat)
+
+
+def johansen(frame: pd.DataFrame, det_order: int = 0, k_ar_diff: int = 1) -> dict:
+    """Johansen trace test on a (T x n) price frame.
+
+    Returns {trace_stat, crit_95, hedge_ratio, rank}: trace_stat/crit_95 for the r=0 hypothesis,
+    rank = number of cointegrating vectors at 95%, hedge_ratio normalized from the first
+    eigenvector so the first column has coefficient 1 (spread = col0 - hedge_ratio*col1).
+    """
+    arr = frame.dropna().to_numpy(dtype=float)
+    res = coint_johansen(arr, det_order, k_ar_diff)
+    trace = res.lr1                                  # trace statistics, descending r
+    crit_95 = res.cvt[:, 1]                          # 95% critical values column
+    rank = int(sum(1 for i in range(len(trace)) if trace[i] > crit_95[i]))
+    vec = res.evec[:, 0]                             # first cointegrating eigenvector
+    base = vec[0] if vec[0] != 0 else 1.0
+    hedge_ratio = float(-vec[1] / base) if len(vec) > 1 else 0.0
+    return {
+        "trace_stat": float(trace[0]),
+        "crit_95": float(crit_95[0]),
+        "hedge_ratio": hedge_ratio,
+        "rank": rank,
+    }
