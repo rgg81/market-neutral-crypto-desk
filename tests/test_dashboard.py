@@ -30,7 +30,7 @@ from futures_fund.cycle_io import save_output
 from futures_fund.dashboard import build_kpi_dashboard
 from futures_fund.equity_log import record_equity
 from futures_fund.journal import append_decision, patch_outcome
-from futures_fund.metrics import max_drawdown, sharpe, sortino
+from futures_fund.metrics import max_drawdown, sharpe
 
 
 def _target_weights(*, long_frac: float, short_frac: float,
@@ -142,18 +142,16 @@ def test_dashboard_no_losing_month_fraction(state_dir, memory_dir):
     assert d["no_losing_month"] == pytest.approx(0.5)
 
 
-def test_dashboard_max_drawdown_and_sortino_match_metrics(state_dir, memory_dir,
-                                                          seeded_daily_returns):
+def test_dashboard_max_drawdown_matches_metrics(state_dir, memory_dir):
     d = build_kpi_dashboard(state_dir, memory_dir)
     assert d["max_drawdown"] == pytest.approx(max_drawdown(_EQUITY_POINTS))
-    assert d["sortino"] == pytest.approx(sortino(seeded_daily_returns, periods_per_year=365))
 
 
 def test_dashboard_reuses_improvement_process_kpis(state_dir, memory_dir):
     d = build_kpi_dashboard(state_dir, memory_dir)
     assert d["both_sides_deployment_rate"] == pytest.approx(0.75)
     assert d["reviewer_veto_rate"] == pytest.approx(0.25)
-    assert d["carry_capture_rate"] == pytest.approx(1.2)
+    assert d["carry_capture"] == pytest.approx(1.2)
     assert d["pair_survival"] == pytest.approx(1.0)
     assert d["sentiment_hit_rate"] == pytest.approx(1.0)
 
@@ -169,12 +167,11 @@ def test_dashboard_has_all_kpi_keys(state_dir, memory_dir):
     for key in (
         "no_losing_month",
         "daily_sharpe",
-        "sortino",
         "max_drawdown",
         "both_sides_deployment_rate",
         "neutrality_adherence",
         "pair_survival",
-        "carry_capture_rate",
+        "carry_capture",
         "sentiment_hit_rate",
         "reviewer_veto_rate",
     ):
@@ -187,4 +184,4 @@ def test_dashboard_empty_state_is_fail_safe(tmp_path):
     assert d["daily_sharpe"] == 0.0
     assert d["max_drawdown"] == 0.0
     assert d["no_losing_month"] == 0.0
-    assert math.isnan(d["carry_capture_rate"])
+    assert math.isnan(d["carry_capture"])

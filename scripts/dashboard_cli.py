@@ -22,12 +22,11 @@ from futures_fund.dashboard import build_kpi_dashboard
 _ROWS: tuple[tuple[str, str], ...] = (
     ("no_losing_month", "No-losing-month (primary, target 1.0)"),
     ("daily_sharpe", "Daily Sharpe (×365)"),
-    ("sortino", "Sortino (×365)"),
     ("max_drawdown", "Max drawdown"),
     ("both_sides_deployment_rate", "Both-sides deployment rate"),
     ("neutrality_adherence", "Neutrality-residual adherence"),
     ("pair_survival", "Pair-survival rate"),
-    ("carry_capture_rate", "Carry-capture rate"),
+    ("carry_capture", "Carry-capture rate"),
     ("sentiment_hit_rate", "Sentiment hit-rate"),
     ("reviewer_veto_rate", "Reviewer veto-rate"),
 )

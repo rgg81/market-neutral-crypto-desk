@@ -5,7 +5,7 @@ A single read-only function, `build_kpi_dashboard(state_dir, memory_dir)`, that 
 building blocks — never reimplements them:
 
 - the equity series from `equity_log` (the return-series source),
-- `metrics.sharpe` / `metrics.sortino` / `metrics.max_drawdown` (the success metrics),
+- `metrics.sharpe` / `metrics.max_drawdown` (the success metrics),
 - the `improvement` process KPIs (`both_sides_deployment_rate`, `pair_survival_rate`,
   `carry_capture_rate`, `sentiment_hit_rate`, `reviewer_veto_rate` — Task 6.3),
 - the `NeutralityConfig` bands (the same bands the reviewer re-derives against).
@@ -34,7 +34,6 @@ from futures_fund.metrics import (
     PERIODS_PER_YEAR_DAILY,
     max_drawdown,
     sharpe,
-    sortino,
 )
 from futures_fund.neutrality import NeutralityConfig
 
@@ -92,11 +91,11 @@ def build_kpi_dashboard(state_dir, memory_dir, *, last_n: int = 10) -> dict:
     """Bundle the desk's success + process KPIs for the end-of-run scorecard (spec §18).
 
     SUCCESS (read off the equity series in `state_dir`): `no_losing_month` (PRIMARY, fraction of
-    calendar months positive), `daily_sharpe` (`metrics.sharpe` ×365), `sortino` (×365),
-    `max_drawdown`. PROCESS (reused from the `improvement` panel — artifact KPIs read `state_dir`,
-    journal KPIs read `memory_dir`): `both_sides_deployment_rate`, `neutrality_adherence`,
-    `pair_survival`, `carry_capture_rate`, `sentiment_hit_rate`, `reviewer_veto_rate`. Pure /
-    read-only and fail-safe on a cold log."""
+    calendar months positive), `daily_sharpe` (`metrics.sharpe` ×365), `max_drawdown`. PROCESS
+    (reused from the `improvement` panel — artifact KPIs read `state_dir`, journal KPIs read
+    `memory_dir`): `both_sides_deployment_rate`, `neutrality_adherence`, `pair_survival`,
+    `carry_capture`, `sentiment_hit_rate`, `reviewer_veto_rate`. Pure / read-only and fail-safe on
+    a cold log."""
     series = equity_series(state_dir)
     equity = [e for _, e in series]
     rets = returns_series(state_dir)
@@ -104,13 +103,12 @@ def build_kpi_dashboard(state_dir, memory_dir, *, last_n: int = 10) -> dict:
         # success KPIs
         "no_losing_month": _no_losing_month(series),
         "daily_sharpe": sharpe(rets, periods_per_year=PERIODS_PER_YEAR_DAILY),
-        "sortino": sortino(rets, periods_per_year=PERIODS_PER_YEAR_DAILY),
         "max_drawdown": max_drawdown(equity),
         # process KPIs (reused verbatim from improvement / Task 6.3)
         "both_sides_deployment_rate": both_sides_deployment_rate(state_dir, last_n=last_n),
         "neutrality_adherence": _neutrality_adherence(state_dir, last_n=last_n),
         "pair_survival": pair_survival_rate(memory_dir, last_n=last_n),
-        "carry_capture_rate": carry_capture_rate(memory_dir, last_n=last_n),
+        "carry_capture": carry_capture_rate(memory_dir, last_n=last_n),
         "sentiment_hit_rate": sentiment_hit_rate(memory_dir, last_n=last_n),
         "reviewer_veto_rate": reviewer_veto_rate(state_dir, last_n=last_n),
     }
