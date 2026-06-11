@@ -112,3 +112,52 @@ def test_apply_fills_increase_to_a_larger_target_blends_entry_vwap():
     assert abs(pos.qty - 2.0) < 1e-9               # 4400/2200
     # blended VWAP: (1.0 @ 2000 + 1.0 @ 2200) / 2.0 = 2100
     assert abs(pos.entry_price - 2100.0) < 1e-6
+
+
+def test_apply_fills_reduce_to_smaller_target_realizes_partial_pnl():
+    acct = PaperAccount(cash=20_000.0)
+    costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 4000.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs)            # long qty 2 @ 2000
+    cash_after_open = acct.cash
+    # lower target to 2200 @ mark 2200 -> target qty 1.0, reduce 1.0 @ 2200, realize 1*(2200-2000)
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 2200.0}],
+        {"ETH/USDT:USDT": 2200.0}, costs)
+    pos = acct.positions["ETH/USDT:USDT"]
+    assert pos.direction == "long"
+    assert abs(pos.qty - 1.0) < 1e-9               # 2200/2200
+    assert abs(acct.realized_pnl - 1.0 * (2200.0 - 2000.0)) < 1e-6
+    assert abs(pos.realized_pnl - 200.0) < 1e-6
+    assert acct.cash > cash_after_open             # got the realized credit (fee>0, slip=0)
+
+
+def test_apply_fills_zero_target_closes_and_pops():
+    acct = PaperAccount(cash=20_000.0)
+    costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 4000.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs)
+    # target 0 at the SAME mark closes the whole 2.0 qty flat
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 0.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs)
+    assert "ETH/USDT:USDT" not in acct.positions
+    assert abs(acct.realized_pnl) < 1e-6           # closed flat -> ~0 price pnl
+
+
+def test_apply_fills_opposite_target_flips_side():
+    acct = PaperAccount(cash=20_000.0)
+    costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 2000.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs)            # long qty 1 @ 2000
+    # target a SHORT 4000 @ 2000 -> target signed qty -2.0; close the +1 (flat pnl), open 2 short
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "short", "target_notional": 4000.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs)
+    pos = acct.positions["ETH/USDT:USDT"]
+    assert pos.direction == "short"
+    assert abs(pos.qty - 2.0) < 1e-9               # |−2.0| target
+    assert pos.entry_price == 2000.0

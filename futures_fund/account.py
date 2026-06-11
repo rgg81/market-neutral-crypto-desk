@@ -173,4 +173,31 @@ class PaperAccount(BaseModel):
         self, existing: Position, sym: str, direction: Direction,
         target_signed_qty: float, mark: float, fee: float, slip: float, ts: datetime,
     ) -> None:
-        raise NotImplementedError("reduce/close/flip implemented in Task 4")
+        """Drive the held qty TOWARD `target_signed_qty` when the delta opposes the held side:
+        reduce -> (close) -> (flip). Realize P&L on the closed portion, charge the
+        (already-computed) frictions, and open the residual the other way on a flip. Frictions were
+        sized on the FULL |delta notional| by `apply_fills`, so they are charged once here."""
+        self._charge_frictions(sym, fee, slip, existing)
+        current_signed_qty = _signed_qty(existing)
+        # qty being closed on the held side = min(|delta|, held qty), capped at a full close.
+        delta_signed = target_signed_qty - current_signed_qty
+        closed_qty = min(abs(delta_signed), existing.qty)
+        if existing.direction == "long":
+            realized = closed_qty * (mark - existing.entry_price)
+        else:
+            realized = closed_qty * (existing.entry_price - mark)
+        self.realized_pnl += realized
+        existing.realized_pnl += realized
+        self.cash += realized
+
+        residual_held = existing.qty - closed_qty
+        if residual_held > 1e-12:
+            existing.qty = residual_held
+            return
+        # fully closed this side -> pop it; reopen the residual on the target side if flipping.
+        self.positions.pop(sym, None)
+        residual_new_qty = abs(target_signed_qty)
+        if residual_new_qty > 1e-12:                # FLIP: open to reach the opposite-side target
+            self.positions[sym] = Position(
+                symbol=sym, direction=direction, qty=residual_new_qty, entry_price=mark,
+                opened_ts=ts, accrued_fees=0.0, accrued_slippage=0.0)
