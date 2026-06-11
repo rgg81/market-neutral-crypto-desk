@@ -521,6 +521,38 @@ def test_cli_daily_resolves_latest_weekly_target_not_daily_cycle(
     assert isinstance(reloaded, TargetWeights)
 
 
+def test_cli_daily_runs_without_daily_sleeves_artifact(
+    tmp_path, monkeypatch, balanced_settings
+):
+    # The daily Rebalance Meeting re-derives its sleeve tilts from the resolved weekly target legs
+    # (daily_rebalance -> _sleeves_from_legs, §9) and never consumes a daily sleeves.json. So a
+    # daily upstream stage that writes ONLY geometries (+ a weekly target on disk) MUST still run —
+    # the CLI must NOT demand a sleeves artifact it never reads (spurious fail-closed dependency).
+    # We seed the geometries but DELIBERATELY OMIT the daily sleeves artifact (unlike
+    # _seed_daily_inputs).
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    state = tmp_path / "state"
+    main(["--cadence", "weekly", "--cycle", "1"])  # the only weekly target on disk
+
+    # daily inputs: geometries only, NO sleeves at the daily root
+    bundle = GeometryBundle(geometries=_broad_geometries(), as_of_ts=NOW)
+    save_output(state, 5, "geometries", bundle, cadence="daily")
+    assert not (state / "daily" / "cycle" / "5" / "sleeves.json").exists()
+
+    main(["--cadence", "daily", "--cycle", "5"])  # must NOT SystemExit(2) on the absent sleeves
+    persisted = state / "daily" / "cycle" / "5" / "target_weights.json"
+    assert persisted.exists()
+    reloaded = TargetWeights.model_validate(
+        load_output(state, 5, "target_weights", cadence="daily")
+    )
+    assert isinstance(reloaded, TargetWeights)
+
+
 def test_cli_daily_fail_closed_when_no_weekly_target(tmp_path, monkeypatch, balanced_settings):
     # Fail-closed: with daily inputs present but NO weekly target_weights anywhere, the daily branch
     # has no fixed set to rebalance toward -> SystemExit(2) (never runs on a missing book).
