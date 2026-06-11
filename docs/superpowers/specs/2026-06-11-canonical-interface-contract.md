@@ -634,7 +634,7 @@ graduation:
 - **`Pair.half_life`, OU params (`theta/mu/sigma_eq`)** are measured in CYCLES, consumed by `cointegration.zscore`/`spread_state` and the `pairs` config z-thresholds.
 - **`TargetWeights` residual fields** (`dollar_residual_frac`, `beta_residual`, `deploy_long_frac`, `deploy_short_frac`) are exactly what `reviewer.check_*` and the extended `self_audit.py` re-derive against `NeutralityConfig` bands (§12).
 - **`ReviewerVerdict.passed`** is the deterministic flag `reviewer.reviewer_gate_ok` reads; the execution CLI raises `SystemExit(2)` if absent/false (§10 mandatory stage).
-- **Cadence roots:** `control_loop.cadence_due` calls `scheduling.cycle_due(loop="weekly", tf_minutes=10080)` / `(loop="daily", tf_minutes=1440)`; cycle artifacts under `state/cycle/<cadence>/<N>/` (§14).
+- **Cadence roots:** `control_loop.cadence_due` calls `scheduling.cycle_due(loop="weekly", tf_minutes=10080)` / `(loop="daily", tf_minutes=1440)`; cycle artifacts under `state/<cadence>/cycle/<N>/` (§14) — the SAME root the gate reads (never `state/cycle/<cadence>/N`; see the binding CADENCE-ROOT INVARIANT).
 - **New deps** the plan must add to `pyproject.toml` (§16): `statsmodels` (ADF/Johansen/OU), `scikit-learn` (Ledoit-Wolf), and `cvxpy` OR keep `scipy.optimize` (already have `scipy`).
 
 **Relevant absolute paths** (net-new files this contract defines):
