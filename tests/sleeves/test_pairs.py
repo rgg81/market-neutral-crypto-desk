@@ -8,12 +8,13 @@ from futures_fund.sleeves.pairs import pairs_signal, select_pairs
 _NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
 
-def _pair(pid: str, adj: float | None, *, cointegrated: bool = True) -> Pair:
+def _pair(pid: str, adj: float | None, *, cointegrated: bool = True,
+          hedge_ratio: float = 2.0) -> Pair:
     return Pair(
         pair_id=pid, symbol_y="BTC/USDT:USDT", symbol_x="ETH/USDT:USDT",
-        hedge_ratio=2.0, method="engle_granger", adf_pvalue=0.01, adf_pvalue_adj=adj,
-        half_life=5.0, theta=0.139, mu=0.0, sigma_eq=10.0, formed_cycle=1,
-        cointegrated=cointegrated,
+        hedge_ratio=hedge_ratio, method="engle_granger", adf_pvalue=0.01,
+        adf_pvalue_adj=adj, half_life=5.0, theta=0.139, mu=0.0, sigma_eq=10.0,
+        formed_cycle=1, cointegrated=cointegrated,
     )
 
 
@@ -54,6 +55,37 @@ def test_pairs_signal_long_spread_flips_legs():
     by_sym = {t.symbol: t for t in sig.tilts}
     assert by_sym["BTC/USDT:USDT"].direction == "long"    # long the spread -> long y
     assert by_sym["ETH/USDT:USDT"].direction == "short"   # short hedge x
+
+
+def test_pairs_signal_negative_hedge_ratio_short_spread():
+    # spread = y - hedge_ratio*x with hedge_ratio=-1.5 -> spread = y + 1.5*x.
+    # Shorting that spread requires SHORT y AND SHORT 1.5 units of x (NOT long x).
+    pair = _pair("p1", 0.01, hedge_ratio=-1.5)
+    sig = pairs_signal([pair], [_spread("p1", "short_spread", 2.5)],
+                       risk_budget_frac=0.25, now=_NOW)
+    by_sym = {t.symbol: t for t in sig.tilts}
+    y = by_sym["BTC/USDT:USDT"]
+    x = by_sym["ETH/USDT:USDT"]
+    assert y.direction == "short"
+    assert y.target_weight == -1.0                     # base_w (n=1), short y
+    # x leg: base_w * hedge_ratio = 1.0 * -1.5 = -1.5 -> SHORT (sign-consistent with weight)
+    assert x.target_weight == -1.5
+    assert x.direction == "short"
+
+
+def test_pairs_signal_negative_hedge_ratio_long_spread():
+    # Longing spread = y + 1.5*x requires LONG y AND LONG 1.5 units of x.
+    pair = _pair("p1", 0.01, hedge_ratio=-1.5)
+    sig = pairs_signal([pair], [_spread("p1", "long_spread", -2.5)],
+                       risk_budget_frac=0.25, now=_NOW)
+    by_sym = {t.symbol: t for t in sig.tilts}
+    y = by_sym["BTC/USDT:USDT"]
+    x = by_sym["ETH/USDT:USDT"]
+    assert y.direction == "long"
+    assert y.target_weight == 1.0
+    # x leg: -base_w * hedge_ratio = -1.0 * -1.5 = +1.5 -> LONG
+    assert x.target_weight == 1.5
+    assert x.direction == "long"
 
 
 def test_pairs_signal_flat_and_stop_emit_no_legs():
