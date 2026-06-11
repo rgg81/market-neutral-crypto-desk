@@ -6,6 +6,7 @@ import pytest
 import futures_fund.control_loop as cl
 from futures_fund.contracts import (
     CoinGeometry,
+    GeometryBundle,
     SleeveSignal,
     SleeveTilt,
     Spread,
@@ -17,11 +18,12 @@ from futures_fund.control_loop import (
     cadence_due,
     daily_rebalance,
     drift_exceeded,
+    latest_cadence_cycle,
     neutrality_breached,
     rebalance_deltas,
     weekly_selection,
 )
-from futures_fund.cycle_io import load_output
+from futures_fund.cycle_io import load_output, save_output
 from futures_fund.neutrality import NeutralityConfig
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
@@ -446,3 +448,130 @@ def test_cli_fail_closed_when_inputs_missing(tmp_path, monkeypatch, balanced_set
     with pytest.raises(SystemExit) as exc:
         main(["--cadence", "weekly", "--cycle", "7"])
     assert exc.value.code == 2
+
+
+# --- latest_cadence_cycle: resolve the most recent cadence cycle holding an artifact ---
+
+
+def test_latest_cadence_cycle_picks_highest_with_artifact(tmp_path):
+    # Highest cycle dir that actually persisted the artifact wins (NOT max(dir)): cycle 5 holds the
+    # artifact, a later empty cycle 9 dir (no target_weights.json) must be skipped.
+    state = tmp_path / "s"
+    tw = _tw_with_residuals(dollar_residual_frac=0.0, beta_residual=0.0)
+    save_output(state, 2, "target_weights", tw, cadence="weekly")
+    save_output(state, 5, "target_weights", tw, cadence="weekly")
+    (cadence_cycle_root(state, "weekly") / "9").mkdir(parents=True, exist_ok=True)  # empty dir
+    assert latest_cadence_cycle(state, "weekly", "target_weights") == 5
+
+
+def test_latest_cadence_cycle_none_when_absent(tmp_path):
+    # No weekly cycle has produced the artifact (root missing) -> None (caller fails closed).
+    assert latest_cadence_cycle(tmp_path / "s", "weekly", "target_weights") is None
+    # A root that exists but holds only a different artifact is still None for target_weights.
+    save_output(tmp_path / "s", 1, "geometries", {"x": 1}, cadence="weekly")
+    assert latest_cadence_cycle(tmp_path / "s", "weekly", "target_weights") is None
+
+
+# --- Task 3.7: control_loop_cli DAILY entrypoint (cross-cadence weekly-target resolution) ---
+
+
+def _seed_daily_inputs(state_dir, daily_cycle: int) -> None:
+    """Seed the geometries/sleeves the daily branch loads under the DAILY root at `daily_cycle`."""
+    bundle = GeometryBundle(geometries=_broad_geometries(), as_of_ts=NOW)
+    save_output(state_dir, daily_cycle, "geometries", bundle, cadence="daily")
+    save_output(
+        state_dir,
+        daily_cycle,
+        "sleeves",
+        {"sleeves": [s.model_dump(mode="json") for s in _broad_sleeves(NOW)]},
+        cadence="daily",
+    )
+
+
+def test_cli_daily_resolves_latest_weekly_target_not_daily_cycle(
+    tmp_path, monkeypatch, balanced_settings
+):
+    # CROSS-CADENCE bug regression: weekly and daily cycle counters are INDEPENDENT and daily runs
+    # ~7x faster, so the daily `--cycle` does NOT index the weekly book. Here the only weekly target
+    # lives at WEEKLY cycle 1, but we run the daily meeting at DAILY cycle 8 (a daily index that has
+    # OUTRUN the weekly count). The daily branch must resolve the latest EXISTING weekly cycle (1)
+    # rather than look for weekly cycle 8 (which does not exist) and spuriously fail closed.
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    state = tmp_path / "state"
+    # produce the weekly book at WEEKLY cycle 1 (the only weekly target on disk)
+    main(["--cadence", "weekly", "--cycle", "1"])
+    assert (state / "weekly" / "cycle" / "1" / "target_weights.json").exists()
+    assert not (state / "weekly" / "cycle" / "8").exists()  # no weekly cycle 8 to key off
+
+    # daily inputs live at DAILY cycle 8 (the fast counter has outrun the weekly one)
+    _seed_daily_inputs(state, daily_cycle=8)
+
+    main(["--cadence", "daily", "--cycle", "8"])  # must NOT SystemExit(2)
+    # persisted under the DAILY root at the daily cycle (8), keyed off weekly target cycle 1
+    persisted = state / "daily" / "cycle" / "8" / "target_weights.json"
+    assert persisted.exists()
+    reloaded = TargetWeights.model_validate(
+        load_output(state, 8, "target_weights", cadence="daily")
+    )
+    assert isinstance(reloaded, TargetWeights)
+
+
+def test_cli_daily_fail_closed_when_no_weekly_target(tmp_path, monkeypatch, balanced_settings):
+    # Fail-closed: with daily inputs present but NO weekly target_weights anywhere, the daily branch
+    # has no fixed set to rebalance toward -> SystemExit(2) (never runs on a missing book).
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    _seed_daily_inputs(tmp_path / "state", daily_cycle=3)
+    with pytest.raises(SystemExit) as exc:
+        main(["--cadence", "daily", "--cycle", "3"])  # no weekly target exists
+    assert exc.value.code == 2
+
+
+def test_cli_daily_spreads_zstop_flattens_pair(tmp_path, monkeypatch, balanced_settings):
+    # The daily branch loads its spreads from the DAILY root and threads them to daily_rebalance: a
+    # z-STOPPED spread (the cointegration-break EXIT, §6.2) must flatten its pair's legs (zero
+    # notional) in the persisted daily book — exercising the spreads-present path the empty-list
+    # fallback otherwise hides.
+    monkeypatch.setattr(
+        "scripts.control_loop_cli.load_settings", lambda *_a, **_k: balanced_settings
+    )
+    monkeypatch.chdir(tmp_path)
+    from scripts.control_loop_cli import main
+
+    state = tmp_path / "state"
+    main(["--cadence", "weekly", "--cycle", "1"])
+    weekly = TargetWeights.model_validate(load_output(state, 1, "target_weights", cadence="weekly"))
+    syms = [leg.symbol for leg in weekly.legs]
+
+    def _slug(sym: str) -> str:
+        return sym.replace("/", "").replace(":", "")
+
+    pair_id = f"{_slug(syms[0])}__{_slug(syms[1])}"
+    # stamp the pair_id onto two real weekly legs so the stopped spread maps back to the book, and
+    # re-persist the weekly target so the daily branch reloads the pair-tagged set.
+    forced = weekly.model_copy(update={"legs": [
+        leg.model_copy(update={"pair_id": pair_id}) if leg.symbol in (syms[0], syms[1]) else leg
+        for leg in weekly.legs
+    ]})
+    save_output(state, 1, "target_weights", forced, cadence="weekly")
+
+    _seed_daily_inputs(state, daily_cycle=4)
+    stop = Spread(pair_id=pair_id, spread_value=0.0, zscore=3.5, state="stop")
+    save_output(state, 4, "spreads", {"spreads": [stop.model_dump(mode="json")]}, cadence="daily")
+
+    main(["--cadence", "daily", "--cycle", "4"])
+    daily = TargetWeights.model_validate(load_output(state, 4, "target_weights", cadence="daily"))
+    flat = {leg.symbol: leg for leg in daily.legs if leg.symbol in (syms[0], syms[1])}
+    assert set(flat) == {syms[0], syms[1]}  # the stopped pair's legs entered the delta book
+    for leg in flat.values():
+        assert leg.target_notional == 0.0  # flattened, not re-marked at target notional
+        assert leg.weight == 0.0

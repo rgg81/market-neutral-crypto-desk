@@ -41,6 +41,28 @@ def cadence_cycle_root(state_dir, cadence: Cadence) -> Path:
     return Path(state_dir) / cadence / "cycle"
 
 
+def latest_cadence_cycle(state_dir, cadence: Cadence, artifact: str) -> int | None:
+    """Highest cadence cycle whose `<artifact>.json` exists, or None if none do.
+
+    The daily and weekly cycle counters are INDEPENDENT (each `cadence_due` scans its own
+    `state/<cadence>/cycle/*` root and returns `highest_dir+1`), and daily increments ~7x faster
+    than weekly, so a daily cycle number does NOT index the corresponding weekly cycle. To pick up
+    the MOST RECENT weekly book a daily rebalance should track, scan the weekly root for the highest
+    cycle dir that actually persisted `artifact` rather than reusing the daily cycle number. Returns
+    None when no cycle has produced the artifact yet (caller fails closed)."""
+    root = cadence_cycle_root(state_dir, cadence)
+    if not root.exists():
+        return None
+    cycles = sorted(
+        (int(p.name) for p in root.glob("*") if p.is_dir() and p.name.isdigit()),
+        reverse=True,
+    )
+    for n in cycles:
+        if (root / str(n) / f"{artifact}.json").exists():
+            return n
+    return None
+
+
 def cadence_due(state_dir, now_utc: datetime, cadence: Cadence) -> tuple[str, int, str]:
     """Decide whether the current candle of `cadence` still needs a cycle (mode, n, reason).
 

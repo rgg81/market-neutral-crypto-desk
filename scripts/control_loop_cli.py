@@ -17,7 +17,11 @@ import sys
 
 from futures_fund.config import Settings, load_settings
 from futures_fund.contracts import GeometryBundle, SleeveSignal, Spread, TargetWeights
-from futures_fund.control_loop import daily_rebalance, weekly_selection
+from futures_fund.control_loop import (
+    daily_rebalance,
+    latest_cadence_cycle,
+    weekly_selection,
+)
 from futures_fund.cycle_io import load_output
 from futures_fund.models import Cadence
 from futures_fund.neutrality import NeutralityConfig
@@ -88,14 +92,17 @@ def main(argv: list[str] | None = None) -> None:
             cycle=args.cycle,
         )
     else:
-        # Daily Rebalance keeps the SAME symbol set as the most recent weekly target — fail closed
-        # if that target is missing (no fixed set to rebalance toward).
-        try:
-            target = TargetWeights.model_validate(
-                load_output(args.state_dir, args.cycle, "target_weights", cadence="weekly")
-            )
-        except FileNotFoundError as exc:
-            raise SystemExit(2) from exc
+        # Daily Rebalance keeps the SAME symbol set as the MOST RECENT weekly target. Weekly and
+        # daily cycle counters are INDEPENDENT (each cadence's due-gate scans its own root and
+        # daily increments ~7x faster), so the daily `args.cycle` does NOT index the matching weekly
+        # cycle — resolve the highest weekly cycle that actually persisted a target_weights book
+        # instead. Fail closed if no weekly target exists yet (no fixed set to rebalance toward).
+        weekly_cycle = latest_cadence_cycle(args.state_dir, "weekly", "target_weights")
+        if weekly_cycle is None:
+            raise SystemExit(2)
+        target = TargetWeights.model_validate(
+            load_output(args.state_dir, weekly_cycle, "target_weights", cadence="weekly")
+        )
         try:
             raw_spreads = load_output(args.state_dir, args.cycle, "spreads", cadence="daily")
             spreads = [Spread.model_validate(s) for s in raw_spreads["spreads"]]
