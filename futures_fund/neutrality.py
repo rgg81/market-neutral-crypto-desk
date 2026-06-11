@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel
 from scipy.cluster.hierarchy import linkage
+from scipy.optimize import minimize
 from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
 
@@ -125,6 +126,23 @@ def ledoit_wolf_cov(returns: pd.DataFrame) -> np.ndarray:
         n = returns.shape[1]
         return np.eye(n)
     return LedoitWolf().fit(clean.to_numpy()).covariance_
+
+
+def cov_to_corr(cov: np.ndarray, labels: list[str]) -> dict[tuple[str, str], float]:
+    """Pairwise correlation map {(a, b): rho} from a covariance matrix, for the cluster cap's
+    union-find. Derived from the SAME Ledoit-Wolf covariance HRP uses, so the 'correlated-as-
+    one' heat cap (spec §3/§9) runs on a real cross-correlation snapshot inside optimize_book
+    rather than the empty map that made it inert."""
+    std = np.sqrt(np.clip(np.diag(cov), 1e-18, None))
+    outer = np.outer(std, std)
+    outer[outer == 0.0] = 1e-18
+    corr = np.clip(cov / outer, -1.0, 1.0)
+    out: dict[tuple[str, str], float] = {}
+    n = len(labels)
+    for i in range(n):
+        for j in range(i + 1, n):
+            out[(labels[i], labels[j])] = float(corr[i, j])
+    return out
 
 
 def _ivp(cov: np.ndarray, idx: list[int]) -> np.ndarray:
@@ -283,17 +301,16 @@ def _corr_lookup(corr: Mapping[tuple[str, str], float], a: str, b: str) -> float
     return 0.0
 
 
-def apply_cluster_cap(
+def cluster_roots(
     weights: dict[str, float],
     *,
     corr: Mapping[tuple[str, str], float],
-    cluster_cap: float,
     threshold: float = 0.7,
-) -> dict[str, float]:
-    """'Correlated-as-one' heat cap. Union-find groups SAME-SIDE symbols whose pairwise
-    correlation >= threshold (a long and short in correlated names are a natural hedge and
-    are NOT clustered). Scales down each cluster so its combined |weight| <= cluster_cap.
-    Adapted from crypto-trade-claude-code-weekly portfolio_risk.cluster_heat."""
+) -> dict[str, str]:
+    """Map each symbol to its cluster root (a representative symbol). Union-find groups
+    SAME-SIDE symbols whose pairwise correlation >= threshold (a long and short in correlated
+    names are a natural hedge and are NOT clustered). Shared by `apply_cluster_cap` and the
+    final post-projection cluster-cap audit so both see identical clustering."""
     syms = list(weights.keys())
     n = len(syms)
     parent = list(range(n))
@@ -315,15 +332,27 @@ def apply_cluster_cap(
             if side(weights[syms[i]]) != 0 and side(weights[syms[i]]) == side(weights[syms[j]]):
                 if _corr_lookup(corr, syms[i], syms[j]) >= threshold:
                     union(i, j)
+    return {syms[idx]: syms[find(idx)] for idx in range(n)}
 
-    cluster_mag: dict[int, float] = {}
-    for idx, sym in enumerate(syms):
-        root = find(idx)
+
+def apply_cluster_cap(
+    weights: dict[str, float],
+    *,
+    corr: Mapping[tuple[str, str], float],
+    cluster_cap: float,
+    threshold: float = 0.7,
+) -> dict[str, float]:
+    """'Correlated-as-one' heat cap. Union-find groups SAME-SIDE symbols whose pairwise
+    correlation >= threshold (a long and short in correlated names are a natural hedge and
+    are NOT clustered). Scales down each cluster so its combined |weight| <= cluster_cap.
+    Adapted from crypto-trade-claude-code-weekly portfolio_risk.cluster_heat."""
+    roots = cluster_roots(weights, corr=corr, threshold=threshold)
+    cluster_mag: dict[str, float] = {}
+    for sym, root in roots.items():
         cluster_mag[root] = cluster_mag.get(root, 0.0) + abs(weights[sym])
 
     out: dict[str, float] = {}
-    for idx, sym in enumerate(syms):
-        root = find(idx)
+    for sym, root in roots.items():
         mag = cluster_mag[root]
         if mag > cluster_cap and mag > 0.0:
             out[sym] = weights[sym] * (cluster_cap / mag)
@@ -456,6 +485,168 @@ def _scale_to_deploy_target(
     return {s: w * k for s, w in weights.items()}, hedge_notional * k
 
 
+def _cap_violations(
+    weights: dict[str, float],
+    *,
+    corr: Mapping[tuple[str, str], float],
+    per_name_cap: float,
+    cluster_cap: float,
+    corr_threshold: float,
+    tol: float = 1e-6,
+) -> tuple[list[tuple[str, float]], dict[str, float]]:
+    """Find caps breached by the FINAL book, in signed equity-weight units (the same units the
+    pre-projection `apply_per_name_cap` / `apply_cluster_cap` clamp: |w| <= per_name_cap on the
+    fraction-of-equity weight, spec §4). Returns (per_name_overages, cluster_over): a per-name
+    overage is (symbol, signed_weight_at_cap); cluster_over maps each over-cap >=2-member cluster
+    root -> its combined |weight|. The dollar+beta-neutral, deploy-scaled book re-concentrates
+    weight onto the high-beta absorbers, so this is re-checked AFTER projection+scale, not just
+    before (a pre-projection-only cap is silently breached by the emitted book)."""
+    per_name: list[tuple[str, float]] = []
+    for sym, w in weights.items():
+        if abs(w) > per_name_cap + tol:
+            per_name.append((sym, per_name_cap if w > 0 else -per_name_cap))
+    roots = cluster_roots(weights, corr=corr, threshold=corr_threshold)
+    cluster_mag: dict[str, float] = {}
+    members_of: dict[str, int] = {}
+    for sym, root in roots.items():
+        cluster_mag[root] = cluster_mag.get(root, 0.0) + abs(weights[sym])
+        members_of[root] = members_of.get(root, 0) + 1
+    cluster_over: dict[str, float] = {}
+    for root, mag in cluster_mag.items():
+        if members_of[root] >= 2 and mag > cluster_cap + tol:
+            cluster_over[root] = mag
+    return per_name, cluster_over
+
+
+def _enforce_caps_neutral(
+    alpha_weights: dict[str, float],
+    betas: dict[str, float],
+    hedge_notional: float,
+    *,
+    corr: Mapping[tuple[str, str], float],
+    equity: float,
+    side_budget: float,
+    deploy_target_frac: float,
+    per_name_cap: float,
+    cluster_cap: float,
+    corr_threshold: float,
+) -> tuple[dict[str, float], float, bool]:
+    """Enforce the per-name and cluster caps on the FINAL (post-projection, post-scale) book
+    WITHOUT re-breaking neutrality OR the deployment target. Projection + the positive-scalar
+    deploy scale re-concentrate weight onto the high-residual-beta absorbers, so caps applied
+    only pre-projection (step 4) can be silently breached by the emitted book.
+
+    A single positive re-scale after a clamp just re-breaks the cap (cap-then-scale oscillates),
+    so we solve the capped book directly as one bounded least-distance projection over BOTH the
+    alpha weights AND the BTC hedge magnitude: find the book closest to the deploy-scaled seed
+    subject to (a) dollar+beta neutrality (the hedge is a beta-1.0 carrier and a real DOF, so it
+    re-sizes to whatever the capped alpha legs leave residual), (b) each side's gross equal to its
+    deploy target (floor + dry-powder band still hold), (c) sign-preserving per-name box
+    |w_i| <= per_name_cap, (d) each correlated same-side cluster's combined |w| <= cluster_cap, and
+    (e) the hedge magnitude inside one side's budget (spec §5). Returns
+    (alpha_weights, hedge_notional, caps_ok); caps_ok=False (=> feasible=False upstream) when no
+    cap-respecting neutral fully-deployed book exists for this universe (e.g. too few names per
+    side: a side needs >= ceil(deploy_target*side_budget/equity / per_name_cap) names) — surfaced
+    honestly rather than silently breaching a spec invariant. The dedicated BTC hedge is the
+    benchmark hedge (spec §5), so it is NOT subject to the alpha per-name/cluster caps.
+
+    Returns the input unchanged with caps_ok=True when the seed already respects the caps."""
+    per_name0, cluster0 = _cap_violations(
+        alpha_weights, corr=corr, per_name_cap=per_name_cap, cluster_cap=cluster_cap,
+        corr_threshold=corr_threshold,
+    )
+    if not per_name0 and not cluster0:
+        return dict(alpha_weights), hedge_notional, True
+    if equity <= 0.0 or side_budget <= 0.0:
+        return dict(alpha_weights), hedge_notional, False
+
+    syms = list(alpha_weights.keys())
+    seed = np.array([alpha_weights[s] for s in syms], dtype=float)
+    signs = np.sign(seed)
+    b = np.array([betas.get(s, 1.0) for s in syms], dtype=float)
+    seed_hedge_w = hedge_notional / equity
+    # the hedge keeps the sign size_btc_hedge picked (which side absorbs the residual beta) but its
+    # MAGNITUDE re-sizes inside the solve; pick a non-zero sign so the deployment splits cleanly.
+    hs = 1.0 if seed_hedge_w > 0 else (-1.0 if seed_hedge_w < 0 else -1.0)
+    side_gross = deploy_target_frac * side_budget / equity  # equity-weight gross per side
+    hedge_max = side_budget / equity                         # hedge inside one side's budget (§5)
+
+    n = len(syms)
+    long_idx = [i for i in range(n) if signs[i] > 0]
+    short_idx = [i for i in range(n) if signs[i] < 0]
+
+    # decision vector x = [w_0..w_{n-1}, hm]; hm >= 0 is the hedge magnitude (signed by hs).
+    seed_x = np.append(seed, abs(seed_hedge_w))
+    bounds: list[tuple[float, float]] = []
+    for i in range(n):
+        if signs[i] > 0:
+            bounds.append((0.0, per_name_cap))
+        elif signs[i] < 0:
+            bounds.append((-per_name_cap, 0.0))
+        else:
+            bounds.append((0.0, 0.0))
+    bounds.append((0.0, hedge_max))  # hedge magnitude
+
+    roots = cluster_roots(alpha_weights, corr=corr, threshold=corr_threshold)
+    clusters: dict[str, list[int]] = {}
+    for i, s in enumerate(syms):
+        clusters.setdefault(roots[s], []).append(i)
+
+    cons: list[dict] = [
+        {"type": "eq", "fun": lambda x: float(np.sum(x[:n]) + hs * x[n])},        # dollar
+        {"type": "eq", "fun": lambda x: float(np.dot(x[:n], b) + hs * x[n])},     # beta (hedge β=1)
+    ]
+    # per-side deployment: alpha gross + the hedge's contribution to that side == side_gross.
+    hedge_long = hs if hs > 0 else 0.0
+    hedge_short = -hs if hs < 0 else 0.0
+    if long_idx:
+        cons.append({"type": "eq", "fun": lambda x, ix=long_idx, hc=hedge_long:
+                     float(np.sum(x[ix]) + hc * x[n] - side_gross)})
+    if short_idx:
+        cons.append({"type": "eq", "fun": lambda x, ix=short_idx, hc=hedge_short:
+                     float(-np.sum(x[ix]) + hc * x[n] - side_gross)})
+    for members in clusters.values():
+        if len(members) >= 2:
+            cons.append({"type": "ineq", "fun": lambda x, ix=members:
+                         float(cluster_cap - np.sum(np.abs(x[ix]))) })
+
+    def objective(x: np.ndarray) -> float:
+        d = x - seed_x
+        return float(np.dot(d, d))
+
+    res = minimize(objective, seed_x, method="SLSQP", bounds=bounds, constraints=cons,
+                   options={"maxiter": 300, "ftol": 1e-12})
+    x_sol = res.x
+    out = {syms[i]: float(x_sol[i]) for i in range(n)}
+    hedge_out = hs * float(x_sol[n]) * equity
+    hedge_w_out = hs * float(x_sol[n])
+    per_name1, cluster1 = _cap_violations(
+        out, corr=corr, per_name_cap=per_name_cap, cluster_cap=cluster_cap,
+        corr_threshold=corr_threshold,
+    )
+    # verify the solver actually hit neutrality + deployment (SLSQP can return on a non-feasible
+    # point when the constraint set is empty for this universe).
+    dollar_ok = abs(sum(out.values()) + hedge_w_out) <= 1e-5
+    beta_ok = abs(sum(out[s] * betas.get(s, 1.0) for s in out) + hedge_w_out) <= 1e-5
+    long_g = sum(v for v in out.values() if v > 0) + (hedge_w_out if hedge_w_out > 0 else 0.0)
+    short_g = -sum(v for v in out.values() if v < 0) + (-hedge_w_out if hedge_w_out < 0 else 0.0)
+    deploy_ok = (
+        (not long_idx or abs(long_g - side_gross) <= 1e-4)
+        and (not short_idx or abs(short_g - side_gross) <= 1e-4)
+    )
+    caps_ok = (
+        bool(res.success) and not per_name1 and not cluster1
+        and dollar_ok and beta_ok and deploy_ok
+    )
+    if not caps_ok:
+        # No cap-respecting, fully-deployed, neutral book exists for this (tiny / adverse-beta)
+        # universe. NEVER sacrifice neutrality or the deployment floor to chase the cap: return
+        # the ORIGINAL neutral, deployed seed UNCHANGED and flag caps_ok=False so optimize_book
+        # sets feasible=False (the spec invariant is surfaced, not silently breached).
+        return dict(alpha_weights), hedge_notional, False
+    return out, hedge_out, True
+
+
 def optimize_book(
     sleeves: list[SleeveSignal],
     geometries: list[CoinGeometry],
@@ -505,17 +696,21 @@ def optimize_book(
     )
     weights = {t.symbol: t.target_weight for t in tilted_tilts}
 
-    # 3. HRP shaping: Ledoit-Wolf shrunk covariance -> HRP -> reshape per-name split per side
+    # 3. HRP shaping: Ledoit-Wolf shrunk covariance -> HRP -> reshape per-name split per side.
+    #    The SAME covariance also yields the cross-correlation snapshot the cluster cap needs
+    #    (step 4 + the final cap audit), so 'correlated-as-one' is functional in the real solver
+    #    path rather than degenerating into a redundant per-name clamp on an empty corr map.
+    corr: dict[tuple[str, str], float] = {}
     if returns is not None and not returns.empty:
         labels = [s for s in weights if s in returns.columns]
         if len(labels) >= 2:
             cov = ledoit_wolf_cov(returns[labels])
             hrp = hrp_weights(cov, labels)
             weights = apply_hrp_weights(weights, hrp)
+            corr = cov_to_corr(cov, labels)
 
-    # 4. per-name + cluster caps
+    # 4. per-name + cluster caps (first pass, pre-projection)
     weights = apply_per_name_cap(weights, per_name_cap=cfg.per_name_cap)
-    corr: dict[tuple[str, str], float] = {}  # no cross-corr snapshot in pure-math layer
     weights = apply_cluster_cap(
         weights, corr=corr, cluster_cap=cfg.cluster_cap, threshold=cfg.corr_threshold
     )
@@ -554,6 +749,18 @@ def optimize_book(
     alpha_weights, hedge_notional = _scale_to_deploy_target(
         alpha_weights, hedge_notional, equity=equity,
         side_budget=cfg.side_budget_usdt, deploy_target_frac=cfg.deploy_target_frac,
+    )
+
+    # 7b. enforce the per-name & cluster caps on the FINAL (post-projection, post-scale) book.
+    #     Projection + the deploy scale re-concentrate weight onto the high-beta absorbers, so the
+    #     pre-projection caps (step 4) can be breached by the emitted book; this loop clamps the
+    #     overage and re-projects/re-scales the free legs to a neutral fixed point. caps_ok=False
+    #     => feasible=False (the caps and the deployment floor cannot both hold here).
+    alpha_weights, hedge_notional, caps_ok = _enforce_caps_neutral(
+        alpha_weights, betas, hedge_notional,
+        corr=corr, equity=equity, side_budget=cfg.side_budget_usdt,
+        deploy_target_frac=cfg.deploy_target_frac, per_name_cap=cfg.per_name_cap,
+        cluster_cap=cfg.cluster_cap, corr_threshold=cfg.corr_threshold,
     )
 
     # 8. assemble legs (alpha legs) + the hedge leg
@@ -599,6 +806,16 @@ def optimize_book(
     deploy_long = gross_long / cfg.side_budget_usdt if cfg.side_budget_usdt > 0 else 0.0
     deploy_short = gross_short / cfg.side_budget_usdt if cfg.side_budget_usdt > 0 else 0.0
 
+    # Verify the per-name & cluster caps on the EMITTED book (alpha legs only; the dedicated
+    # BTC hedge is the benchmark hedge, capped inside one side's budget by size_btc_hedge).
+    # Measured as fraction of a side's budget (spec §4); never silently breach the invariant.
+    alpha_final = {s: w for s, w in full_weights.items() if s != "__hedge__"}
+    per_name_over, cluster_over = _cap_violations(
+        alpha_final, corr=corr, per_name_cap=cfg.per_name_cap, cluster_cap=cfg.cluster_cap,
+        corr_threshold=cfg.corr_threshold,
+    )
+    caps_respected = caps_ok and not per_name_over and not cluster_over
+
     feasible = (
         d_resid_frac <= dollar_band + 1e-6
         and abs(b_resid) <= beta_band + 1e-6
@@ -606,10 +823,16 @@ def optimize_book(
         and deploy_short >= cfg.deployment_floor - 1e-6
         and deploy_long <= (1.0 - cfg.dry_powder_frac) + 1e-6
         and deploy_short <= (1.0 - cfg.dry_powder_frac) + 1e-6
+        and caps_respected
     )
     notes: list[str] = []
     if not feasible:
-        notes.append("constraint set infeasible: residual or deployment-floor breach")
+        if not caps_respected:
+            notes.append(
+                "constraint set infeasible: per-name or cluster cap breached on final book"
+            )
+        else:
+            notes.append("constraint set infeasible: residual or deployment-floor breach")
 
     return TargetWeights(
         legs=legs,

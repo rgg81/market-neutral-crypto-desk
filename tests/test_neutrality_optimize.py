@@ -3,12 +3,43 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import numpy as np
+import pandas as pd
 import pytest
 
-from futures_fund.contracts import SleeveSignal, SleeveTilt, TargetWeights
+from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt, TargetWeights
 from futures_fund.neutrality import NeutralityConfig, optimize_book
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
+
+
+def _broad_geometries():
+    """A 6-name universe (3 long / 3 short capacity) with a BALANCED beta structure, so a
+    fully-deployed dollar+beta-neutral book CAN respect the 25% per-name cap (unlike the
+    adverse-beta 4-name canonical fixture)."""
+    return [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.1, adv_usd=1e9),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.2, adv_usd=4e8),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=1.0, adv_usd=3e8),
+        CoinGeometry(symbol="ADA/USDT:USDT", mark=0.5, beta_btc=1.1, adv_usd=2e8),
+        CoinGeometry(symbol="DOGE/USDT:USDT", mark=0.15, beta_btc=1.2, adv_usd=2e8),
+    ]
+
+
+def _broad_sleeves(now):
+    """3 longs / 3 shorts so each side can spread its 90% gross across enough names to stay
+    under the 25% per-name cap."""
+    return [SleeveSignal(
+        sleeve="factor", risk_budget_frac=1.0, as_of_ts=now,
+        tilts=[
+            SleeveTilt(symbol="BTC/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ADA/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ETH/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="DOGE/USDT:USDT", direction="short", target_weight=-0.5),
+        ],
+    )]
 
 
 def test_optimize_book_returns_target_weights(sleeves, geometries):
@@ -17,7 +48,16 @@ def test_optimize_book_returns_target_weights(sleeves, geometries):
         sleeves, geometries, equity=20000.0, prior_legs=None, cfg=cfg
     )
     assert isinstance(tw, TargetWeights)
-    assert tw.feasible is True
+    # The emitted book is ALWAYS dollar+beta neutral and fully deployed (the hard invariants).
+    assert tw.dollar_residual_frac <= cfg.dollar_band + 1e-6
+    assert abs(tw.beta_residual) <= cfg.beta_band + 1e-6
+    # This canonical 4-name fixture has an adverse beta structure (longs avg beta 1.25 vs shorts
+    # 1.0), so beta-neutralizing a 90%-deployed book forces a short leg past the 25% per-name cap.
+    # No cap-respecting fully-deployed neutral book exists for so few names, so the optimizer
+    # honestly reports feasible=False (it never silently breaches the cap). See
+    # test_per_name_cap_respected_on_feasible_book for the breadth where the cap IS satisfiable.
+    assert tw.feasible is False
+    assert any("cap" in n for n in tw.notes)
     assert tw.as_of_ts is not None
 
 
@@ -113,17 +153,25 @@ def test_property_beta_residual_within_band(seed, geometries):
 
 def test_property_deployment_floor_honored_on_balanced_book(geometries):
     # Spec §15 'deployment floor honored': a NORMAL balanced book must deploy >= floor on
-    # BOTH sides AND <= (1 - dry_powder) on both sides, and be feasible. This is the direct
-    # assertion the prior plan was missing (deploy ~0.766 < 0.90 made feasible always False).
+    # BOTH sides AND <= (1 - dry_powder) on both sides. This is the direct assertion the prior
+    # plan was missing (deploy ~0.766 < 0.90 made feasible always False). The emitted book is
+    # ALWAYS neutral and deployed; the cap audit is a SEPARATE gate on feasible (below).
     cfg = NeutralityConfig()
     tw = optimize_book(_balanced_sleeves(NOW), geometries, equity=20000.0,
                        prior_legs=None, cfg=cfg)
-    assert tw.feasible is True
-    assert tw.deploy_long_frac >= cfg.deployment_floor
-    assert tw.deploy_short_frac >= cfg.deployment_floor
+    assert tw.deploy_long_frac >= cfg.deployment_floor - 1e-6
+    assert tw.deploy_short_frac >= cfg.deployment_floor - 1e-6
     # dry powder honored: never deploy beyond 1 - dry_powder_frac on either side
     assert tw.deploy_long_frac <= 1.0 - cfg.dry_powder_frac + 1e-6
     assert tw.deploy_short_frac <= 1.0 - cfg.dry_powder_frac + 1e-6
+    # neutrality always holds on the emitted book
+    assert tw.dollar_residual_frac <= cfg.dollar_band + 1e-6
+    assert abs(tw.beta_residual) <= cfg.beta_band + 1e-6
+    # This adverse-beta 4-name fixture cannot also satisfy the 25% per-name cap (a short leg is
+    # forced past it to beta-neutralize a 90%-deployed book), so the optimizer reports the cap
+    # breach honestly via feasible=False rather than silently emitting an over-cap leg.
+    assert tw.feasible is False
+    assert any("cap" in n for n in tw.notes)
 
 
 def test_property_gross_near_target_20k(geometries):
@@ -189,9 +237,13 @@ def test_property_turnover_band_keeps_residuals_in_band_with_prior(geometries):
     # rebalance against the first book as prior
     second = optimize_book(_balanced_sleeves(NOW), geometries, equity=20000.0,
                            prior_legs=first.legs, cfg=cfg)
+    # The turnover/no-trade band runs BEFORE projection, so the projected book stays neutral.
     assert second.dollar_residual_frac <= cfg.dollar_band + 1e-6
     assert abs(second.beta_residual) <= cfg.beta_band + 1e-6
-    assert second.feasible is True
+    # feasible tracks the per-name cap, which this adverse-beta 4-name fixture cannot meet at
+    # 90% deployment (see test_property_deployment_floor_honored_on_balanced_book); neutrality
+    # and the turnover band are unaffected by that cap verdict.
+    assert second.feasible is False
 
 
 def test_property_new_sub_drift_band_leg_survives_rebalance(geometries):
@@ -230,3 +282,58 @@ def test_property_no_silent_un_neutral_sets_feasible_flag(geometries):
     if tw.deploy_short_frac < cfg.deployment_floor:
         assert tw.feasible is False
         assert tw.notes
+
+
+def test_per_name_cap_respected_on_feasible_book():
+    # Spec §4/§8 (per-name cap is a HARD constraint): on a book broad enough to satisfy it, the
+    # EMITTED alpha legs must each be <= per_name_cap and the optimizer must report feasible=True.
+    # This is the regression guard the suite was missing: projection + the deploy scale used to
+    # re-concentrate weight (a BTC leg at 0.36 vs cap 0.25) while feasible stayed True.
+    cfg = NeutralityConfig()
+    tw = optimize_book(_broad_sleeves(NOW), _broad_geometries(), equity=20000.0,
+                       prior_legs=None, cfg=cfg)
+    assert tw.feasible is True
+    # neutral + deployed
+    assert tw.dollar_residual_frac <= cfg.dollar_band + 1e-6
+    assert abs(tw.beta_residual) <= cfg.beta_band + 1e-6
+    assert tw.deploy_long_frac >= cfg.deployment_floor - 1e-6
+    assert tw.deploy_short_frac >= cfg.deployment_floor - 1e-6
+    # EVERY non-hedge leg respects the per-name cap on the FINAL book
+    for leg in tw.legs:
+        if leg.sleeve != "hedge":
+            assert abs(leg.weight) <= cfg.per_name_cap + 1e-6, leg.symbol
+
+
+def test_cluster_cap_consolidates_correlated_same_side_legs_via_returns():
+    # Spec §3/§9 'correlated-as-one' cluster cap must be FUNCTIONAL inside optimize_book (the
+    # solver path used to pass an empty corr map, making it inert). Feed a returns frame where
+    # two same-side longs are nearly perfectly correlated; their combined |weight| in the emitted
+    # book must stay <= cluster_cap, and dropping the correlation must let them carry more.
+    cfg = NeutralityConfig()
+    geos = _broad_geometries()
+    idx = pd.date_range("2026-01-01", periods=120, freq="D", tz="UTC")
+    rng = np.random.default_rng(3)
+    btc = pd.Series(rng.normal(0.0, 0.02, size=120), index=idx)
+    common = pd.Series(rng.normal(0.0, 0.02, size=120), index=idx)  # shared driver for BTC+SOL
+
+    def near(driver, k=0.999):
+        return k * driver + (1 - k) * pd.Series(rng.normal(0.0, 0.02, size=120), index=idx)
+
+    corr_returns = pd.DataFrame({
+        "BTC/USDT:USDT": near(common),
+        "SOL/USDT:USDT": near(common),          # ~1.0 correlated with BTC, both LONG
+        "ADA/USDT:USDT": btc * 1.1,
+        "ETH/USDT:USDT": btc * 1.1,
+        "XRP/USDT:USDT": btc * 1.0,
+        "DOGE/USDT:USDT": btc * 1.2,
+    })
+    tw = optimize_book(_broad_sleeves(NOW), geos, equity=20000.0,
+                       prior_legs=None, cfg=cfg, returns=corr_returns)
+
+    def w(sym):
+        return sum(leg.weight for leg in tw.legs if leg.symbol == sym and leg.sleeve != "hedge")
+
+    cluster_mag = abs(w("BTC/USDT:USDT")) + abs(w("SOL/USDT:USDT"))
+    # the correlated same-side cluster's combined weight is held at/under the cluster cap
+    assert cluster_mag <= cfg.cluster_cap + 1e-6
+    assert tw.feasible is True
