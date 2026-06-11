@@ -230,8 +230,17 @@ def risk_parity_budgets(
     if cov is None or cov.shape[0] != len(sleeves):
         raw = np.ones(len(sleeves))
     else:
-        vol = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
-        raw = 1.0 / vol
+        var = np.diag(cov)
+        # A zero/degenerate-variance sleeve would get inv-vol ~ 1/sqrt(1e-12) ~ 1e6 and absorb
+        # ~100% of the budget — the OPPOSITE of risk balance (a dead sleeve cannot dominate).
+        # Treat it as degenerate and route to a sensible fallback: if ANY sleeve has real
+        # variance, drop the degenerate ones to 0 budget; if ALL are degenerate, equal-share.
+        var_floor = 1e-10
+        real = var > var_floor
+        if real.any():
+            raw = np.where(real, 1.0 / np.sqrt(np.clip(var, var_floor, None)), 0.0)
+        else:
+            raw = np.ones(len(sleeves))
     fracs = raw / raw.sum()
     out: dict[SleeveName, float] = {}
     for s, f in zip(sleeves, fracs, strict=True):
@@ -660,6 +669,12 @@ def optimize_book(
     cannot be met. `returns` (optional) is the per-symbol return frame used to build the
     Ledoit-Wolf covariance for HRP shaping; without it the merged split is used."""
     btc = "BTC/USDT:USDT"
+    # {symbol: pair_id} from the pairs sleeve, for pair-level PnL attribution (§1.5). Each
+    # pairs-sleeve SleeveTilt carries the pair_id it belongs to; we stamp it onto the emitted
+    # alpha-leg WeightLeg so the spread is attributable end-to-end. If a symbol is later
+    # absorbed/sized only as a hedge it keeps pair_id=None (the dedicated BTC hedge is never a
+    # pair leg). Backward-compatible: with no pairs sleeve this map is empty and pair_id stays None.
+    pair_id_by_symbol = _pair_ids_from_sleeves(sleeves)
     betas = {g.symbol: g.beta_btc for g in geometries}
     # BTC's beta TO ITSELF is 1.0 by construction (spec §5: BTC is the benchmark / hedge
     # instrument). `size_btc_hedge` sizes the hedge with beta_BTC == 1.0 and the hedge is
@@ -775,6 +790,7 @@ def optimize_book(
             target_notional=notional,
             beta_btc=betas.get(sym, 1.0),
             sleeve=_dominant_sleeve(sym, sleeves),
+            pair_id=pair_id_by_symbol.get(sym),
         ))
     if abs(hedge_notional) > 1.0:
         hedge_w = hedge_notional / equity
@@ -848,6 +864,22 @@ def optimize_book(
         notes=notes,
         as_of_ts=datetime.now(UTC),
     )
+
+
+def _pair_ids_from_sleeves(sleeves: list[SleeveSignal]) -> dict[str, str]:
+    """{symbol: pair_id} for every symbol that originated from the pairs sleeve (§1.5).
+
+    Derived from the pairs-sleeve SleeveTilt.pair_id so pair identity survives the
+    merge_sleeves collapse to dict[str, float]. Used to stamp WeightLeg.pair_id for pair-level
+    PnL attribution. Empty (so pair_id stays None) when there is no pairs sleeve."""
+    out: dict[str, str] = {}
+    for s in sleeves:
+        if s.sleeve != "pairs":
+            continue
+        for t in s.tilts:
+            if t.pair_id is not None:
+                out[t.symbol] = t.pair_id
+    return out
 
 
 def _dominant_sleeve(symbol: str, sleeves: list[SleeveSignal]) -> SleeveName:

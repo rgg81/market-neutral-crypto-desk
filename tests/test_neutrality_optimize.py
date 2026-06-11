@@ -358,6 +358,55 @@ def test_optimize_book_all_unit_beta_capped_is_feasible():
     assert max_w >= cfg.per_name_cap - 1e-3  # the dominant name is pinned at the cap, so it bound
 
 
+def test_optimize_book_threads_pair_id_from_pairs_sleeve_end_to_end():
+    # Fix 2: pair-level PnL attribution (§1.5). A pairs-sleeve SleeveTilt carries the pair_id of
+    # the spread it belongs to; that identity must survive merge_sleeves (which collapses tilts to
+    # dict[str,float]) and be stamped onto the emitted alpha-leg WeightLeg.pair_id. We mix a pairs
+    # sleeve (BTC long / ETH short, both legs of one spread) with a factor sleeve carrying the
+    # other names, on the broad feasible fixture, and assert the pairs legs come out attributed.
+    pid = "BTCUSDT__ETHUSDT"
+    pairs = SleeveSignal(
+        sleeve="pairs", risk_budget_frac=0.5, as_of_ts=NOW,
+        tilts=[
+            SleeveTilt(symbol="BTC/USDT:USDT", direction="long",
+                       target_weight=0.5, pair_id=pid),
+            SleeveTilt(symbol="ETH/USDT:USDT", direction="short",
+                       target_weight=-0.5, pair_id=pid),
+        ],
+    )
+    factor = SleeveSignal(
+        sleeve="factor", risk_budget_frac=0.5, as_of_ts=NOW,
+        tilts=[
+            SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="ADA/USDT:USDT", direction="long", target_weight=0.5),
+            SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.5),
+            SleeveTilt(symbol="DOGE/USDT:USDT", direction="short", target_weight=-0.5),
+        ],
+    )
+    cfg = NeutralityConfig()
+    tw = optimize_book([pairs, factor], _broad_geometries(), equity=20000.0,
+                       prior_legs=None, cfg=cfg)
+    legs_by_symbol = {leg.symbol: leg for leg in tw.legs if leg.sleeve != "hedge"}
+    # both pairs-sleeve legs survived and carry the pair_id end-to-end
+    assert "BTC/USDT:USDT" in legs_by_symbol
+    assert "ETH/USDT:USDT" in legs_by_symbol
+    assert legs_by_symbol["BTC/USDT:USDT"].pair_id == pid
+    assert legs_by_symbol["ETH/USDT:USDT"].pair_id == pid
+    # non-pairs (factor) legs are NOT mis-attributed
+    for sym in ("SOL/USDT:USDT", "ADA/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"):
+        if sym in legs_by_symbol:
+            assert legs_by_symbol[sym].pair_id is None
+
+
+def test_optimize_book_pair_id_none_without_pairs_sleeve():
+    # Backward-compatible: with NO pairs sleeve, every emitted leg's pair_id stays None.
+    cfg = NeutralityConfig()
+    tw = optimize_book(_broad_sleeves(NOW), _broad_geometries(), equity=20000.0,
+                       prior_legs=None, cfg=cfg)
+    for leg in tw.legs:
+        assert leg.pair_id is None
+
+
 def _cluster_geometries():
     """6 names, ALL beta == 1.0, so the BTC hedge stays ~0 and the per-side deployment falls
     entirely on the alpha legs (a non-zero hedge would otherwise soak up the long-side slack and

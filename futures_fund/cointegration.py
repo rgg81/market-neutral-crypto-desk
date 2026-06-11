@@ -11,7 +11,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 from futures_fund.contracts import Pair, Spread
@@ -19,20 +19,26 @@ from futures_fund.models import PairTestMethod, SpreadState
 
 
 def engle_granger(y: pd.Series, x: pd.Series) -> tuple[float, float, float]:
-    """OLS y~x then ADF on the residual spread. Returns (hedge_ratio, adf_pvalue, adf_stat).
+    """Engle-Granger cointegration test. Returns (hedge_ratio, adf_pvalue, adf_stat).
 
     hedge_ratio is the OLS slope (the cointegrating beta: spread = y - hedge_ratio*x).
-    A low adf_pvalue (< 0.05) means the residual is stationary -> the pair is cointegrated.
+    The p-value uses the proper Engle-Granger cointegration null distribution
+    (`statsmodels.tsa.stattools.coint`), NOT a plain ADF on the regression residual: the
+    residual comes from an ESTIMATED cointegrating regression, so the ADF null is wrong and
+    overstates significance (~3x false positives). A low adf_pvalue (< 0.05) means the pair is
+    cointegrated under the correct distribution.
     """
     yv = pd.Series(y).reset_index(drop=True).astype(float)
     xv = pd.Series(x).reset_index(drop=True).astype(float)
     n = min(len(yv), len(xv))
     yv, xv = yv.iloc[:n], xv.iloc[:n]
+    # Hedge ratio: OLS slope of y on x (the cointegrating beta). Re-estimate here so the
+    # returned ratio is the OLS spread coefficient regardless of `coint`'s internals.
     design = sm.add_constant(xv.to_numpy())
     model = sm.OLS(yv.to_numpy(), design).fit()
     hedge_ratio = float(model.params[1])
-    resid = yv.to_numpy() - hedge_ratio * xv.to_numpy() - float(model.params[0])
-    stat, pvalue, *_ = adfuller(resid, autolag="AIC")
+    # p-value + stat from the Engle-Granger cointegration test with its own critical values.
+    stat, pvalue, _crit = coint(yv.to_numpy(), xv.to_numpy(), trend="c", autolag="AIC")
     return hedge_ratio, float(pvalue), float(stat)
 
 

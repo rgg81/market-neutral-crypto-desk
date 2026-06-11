@@ -34,6 +34,26 @@ def test_engle_granger_non_cointegrated_high_pvalue():
     assert pvalue > 0.05
 
 
+def test_engle_granger_false_positive_rate_is_nominal():
+    """The p-value must use the Engle-Granger cointegration null (its own critical values),
+    NOT a plain ADF on the estimated-regression residual. Under the proper distribution the
+    false-positive rate over independent random-walk pairs must be ~nominal 5% (well below the
+    ~15-18% a residual-ADF produces). Regression-locks Fix 1 (statistical correctness)."""
+    rng = np.random.default_rng(12345)
+    trials = 200
+    n = 250
+    false_positives = 0
+    for _ in range(trials):
+        y = pd.Series(np.cumsum(rng.normal(0, 1, n)) + 50.0)
+        x = pd.Series(np.cumsum(rng.normal(0, 1, n)) + 50.0)   # independent random walks
+        _, pvalue, _ = co.engle_granger(y, x)
+        if pvalue < 0.05:
+            false_positives += 1
+    rate = false_positives / trials
+    # Nominal 5% with sampling slack; a residual-ADF (the bug) sits ~0.15-0.18 here.
+    assert rate <= 0.10, f"EG false-positive rate {rate:.3f} too high (proper null gives ~0.05)"
+
+
 def test_johansen_detects_cointegration_rank():
     y, x = _cointegrated_pair()
     frame = pd.DataFrame({"y": y, "x": x})
