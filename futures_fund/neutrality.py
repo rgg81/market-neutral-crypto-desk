@@ -494,9 +494,15 @@ def _cap_violations(
     corr_threshold: float,
     tol: float = 1e-6,
 ) -> tuple[list[tuple[str, float]], dict[str, float]]:
-    """Find caps breached by the FINAL book, in signed equity-weight units (the same units the
+    """Find caps breached by the FINAL book, in signed equity-weight units — the SAME units the
     pre-projection `apply_per_name_cap` / `apply_cluster_cap` clamp: |w| <= per_name_cap on the
-    fraction-of-equity weight, spec §4). Returns (per_name_overages, cluster_over): a per-name
+    fraction-of-EQUITY weight (notional = w * equity). NOTE the enforced unit differs from the
+    design doc's framing (§4 phrases the per-name cap as a fraction of a SIDE's budget): with
+    equity == 2x a side's budget, an at-cap leg (0.25 * equity) is ~50% of a side's budget, i.e.
+    ~2x looser than the doc intends. The equity-fraction convention predates this module and the
+    canonical interface contract pins `per_name_cap = 0.25` to it; this checker enforces exactly
+    that convention rather than silently re-deriving a stricter one. Returns
+    (per_name_overages, cluster_over): a per-name
     overage is (symbol, signed_weight_at_cap); cluster_over maps each over-cap >=2-member cluster
     root -> its combined |weight|. The dollar+beta-neutral, deploy-scaled book re-concentrates
     weight onto the high-beta absorbers, so this is re-checked AFTER projection+scale, not just
@@ -565,9 +571,17 @@ def _enforce_caps_neutral(
     signs = np.sign(seed)
     b = np.array([betas.get(s, 1.0) for s in syms], dtype=float)
     seed_hedge_w = hedge_notional / equity
-    # the hedge keeps the sign size_btc_hedge picked (which side absorbs the residual beta) but its
-    # MAGNITUDE re-sizes inside the solve; pick a non-zero sign so the deployment splits cleanly.
-    hs = 1.0 if seed_hedge_w > 0 else (-1.0 if seed_hedge_w < 0 else -1.0)
+    # The hedge keeps the sign size_btc_hedge picked (which side absorbs the residual beta) but its
+    # MAGNITUDE re-sizes inside the solve. A ZERO seed hedge means the alpha legs already net
+    # beta-neutral (e.g. all betas == 1.0): there is no residual for a hedge to carry, so we must
+    # NOT inject a phantom hedge DOF. With a free hedge column whose dollar and beta coefficients
+    # are both `hs`, the dollar and beta equality rows would be identical when every beta == 1.0 —
+    # a rank deficiency that makes SLSQP fail with 'Singular matrix C in LSQ subproblem' and falsely
+    # report a plainly-feasible book infeasible. When seed_hedge_w == 0 we pin the hedge magnitude
+    # to 0 (bounds (0, 0) below) and zero its constraint coefficients; the equality-row dedup below
+    # then drops any remaining redundancy so the solve runs full-rank on the real alpha DOFs.
+    has_hedge = seed_hedge_w != 0.0
+    hs = 1.0 if seed_hedge_w > 0 else -1.0  # only meaningful when has_hedge
     side_gross = deploy_target_frac * side_budget / equity  # equity-weight gross per side
     hedge_max = side_budget / equity                         # hedge inside one side's budget (§5)
 
@@ -585,26 +599,56 @@ def _enforce_caps_neutral(
             bounds.append((-per_name_cap, 0.0))
         else:
             bounds.append((0.0, 0.0))
-    bounds.append((0.0, hedge_max))  # hedge magnitude
+    # hedge magnitude bound: 0-pinned when there is no seed hedge (no phantom DOF)
+    bounds.append((0.0, hedge_max) if has_hedge else (0.0, 0.0))
 
     roots = cluster_roots(alpha_weights, corr=corr, threshold=corr_threshold)
     clusters: dict[str, list[int]] = {}
     for i, s in enumerate(syms):
         clusters.setdefault(roots[s], []).append(i)
 
-    cons: list[dict] = [
-        {"type": "eq", "fun": lambda x: float(np.sum(x[:n]) + hs * x[n])},        # dollar
-        {"type": "eq", "fun": lambda x: float(np.dot(x[:n], b) + hs * x[n])},     # beta (hedge β=1)
-    ]
-    # per-side deployment: alpha gross + the hedge's contribution to that side == side_gross.
-    hedge_long = hs if hs > 0 else 0.0
-    hedge_short = -hs if hs < 0 else 0.0
+    # Every equality below is LINEAR in x (x = [alpha weights..., hedge magnitude]). We assemble
+    # each as a row (A·x == rhs), then drop linearly-DEPENDENT rows before handing them to SLSQP.
+    # The hedge column (index n) only carries `hs` when there actually is a seed hedge; with no
+    # hedge the column is 0 so it never couples the rows. Redundant rows arise routinely here —
+    # e.g. all betas == 1.0 makes the beta row identical to the dollar row, and the two per-side
+    # deployment rows already imply dollar-neutrality — and feeding SLSQP a rank-deficient equality
+    # set yields a 'Singular matrix C in LSQ subproblem' failure that falsely reports a feasible
+    # book infeasible. Deduplicating to a maximal independent set keeps the SAME feasible region
+    # while giving SLSQP a full-rank Jacobian.
+    hc = hs if has_hedge else 0.0
+    eq_rows: list[tuple[np.ndarray, float]] = []
+    dollar_row = np.zeros(n + 1)
+    dollar_row[:n] = 1.0
+    dollar_row[n] = hc
+    eq_rows.append((dollar_row, 0.0))                                    # dollar neutrality
+    beta_row = np.zeros(n + 1)
+    beta_row[:n] = b
+    beta_row[n] = hc
+    eq_rows.append((beta_row, 0.0))                                   # beta neutrality (hedge β=1)
+    hedge_long = hs if (has_hedge and hs > 0) else 0.0
+    hedge_short = -hs if (has_hedge and hs < 0) else 0.0
     if long_idx:
-        cons.append({"type": "eq", "fun": lambda x, ix=long_idx, hc=hedge_long:
-                     float(np.sum(x[ix]) + hc * x[n] - side_gross)})
+        row = np.zeros(n + 1)
+        row[long_idx] = 1.0
+        row[n] = hedge_long
+        eq_rows.append((row, side_gross))                               # long-side deployment
     if short_idx:
-        cons.append({"type": "eq", "fun": lambda x, ix=short_idx, hc=hedge_short:
-                     float(-np.sum(x[ix]) + hc * x[n] - side_gross)})
+        row = np.zeros(n + 1)
+        row[short_idx] = -1.0
+        row[n] = hedge_short
+        eq_rows.append((row, side_gross))                              # short-side deployment
+
+    cons: list[dict] = []
+    basis: list[np.ndarray] = []  # independent equality-coefficient rows kept so far
+    for coeff, rhs in eq_rows:
+        if basis:
+            stacked = np.vstack([*basis, coeff])
+            # a row is redundant iff appending it does not raise the rank of the basis it joins.
+            if np.linalg.matrix_rank(stacked, tol=1e-9) <= len(basis):
+                continue
+        basis.append(coeff)
+        cons.append({"type": "eq", "fun": lambda x, a=coeff, r=rhs: float(np.dot(a, x) - r)})
     for members in clusters.values():
         if len(members) >= 2:
             cons.append({"type": "ineq", "fun": lambda x, ix=members:
@@ -808,7 +852,10 @@ def optimize_book(
 
     # Verify the per-name & cluster caps on the EMITTED book (alpha legs only; the dedicated
     # BTC hedge is the benchmark hedge, capped inside one side's budget by size_btc_hedge).
-    # Measured as fraction of a side's budget (spec §4); never silently breach the invariant.
+    # Measured in fraction-of-EQUITY weight (|w| <= per_name_cap, notional = w * equity) — the
+    # same convention `apply_per_name_cap` and `_cap_violations` use, NOT the side-budget framing
+    # of the design doc §4 (see `_cap_violations` for why the two diverge). Never silently breach
+    # the invariant.
     alpha_final = {s: w for s, w in full_weights.items() if s != "__hedge__"}
     per_name_over, cluster_over = _cap_violations(
         alpha_final, corr=corr, per_name_cap=cfg.per_name_cap, cluster_cap=cfg.cluster_cap,

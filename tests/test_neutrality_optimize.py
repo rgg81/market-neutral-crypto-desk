@@ -304,36 +304,92 @@ def test_per_name_cap_respected_on_feasible_book():
             assert abs(leg.weight) <= cfg.per_name_cap + 1e-6, leg.symbol
 
 
-def test_cluster_cap_consolidates_correlated_same_side_legs_via_returns():
-    # Spec §3/§9 'correlated-as-one' cluster cap must be FUNCTIONAL inside optimize_book (the
-    # solver path used to pass an empty corr map, making it inert). Feed a returns frame where
-    # two same-side longs are nearly perfectly correlated; their combined |weight| in the emitted
-    # book must stay <= cluster_cap, and dropping the correlation must let them carry more.
-    cfg = NeutralityConfig()
-    geos = _broad_geometries()
+def _cluster_geometries():
+    """6 names, ALL beta == 1.0, so the BTC hedge stays ~0 and the per-side deployment falls
+    entirely on the alpha legs (a non-zero hedge would otherwise soak up the long-side slack and
+    keep the clustered pair off its cap). 3 long / 3 short capacity."""
+    return [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=1e9),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.0, adv_usd=1e9),
+        CoinGeometry(symbol="ADA/USDT:USDT", mark=0.5, beta_btc=1.0, adv_usd=1e9),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.0, adv_usd=1e9),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=1.0, adv_usd=1e9),
+        CoinGeometry(symbol="DOGE/USDT:USDT", mark=0.15, beta_btc=1.0, adv_usd=1e9),
+    ]
+
+
+def _cluster_returns(*, clustered: bool):
+    """Per-symbol return frame for the cluster-cap test. BTC and SOL are the two longs we want the
+    cluster cap to consolidate; when `clustered` they share a common driver (post-Ledoit-Wolf corr
+    ~0.75 > corr_threshold), when not they are independent. ADA (the 3rd long) and DOGE (a short)
+    are HIGH-vol so HRP de-weights them, concentrating each side onto the {BTC,SOL}/{ETH,XRP} pairs
+    so the cluster cap actually has weight to bind on. The short side mirrors the long structure so
+    the residual beta — and thus the BTC hedge — stays ~0 and does not absorb the long-side
+    slack."""
     idx = pd.date_range("2026-01-01", periods=120, freq="D", tz="UTC")
-    rng = np.random.default_rng(3)
-    btc = pd.Series(rng.normal(0.0, 0.02, size=120), index=idx)
-    common = pd.Series(rng.normal(0.0, 0.02, size=120), index=idx)  # shared driver for BTC+SOL
+    rng = np.random.default_rng(11)
+    v = 0.03
+    long_driver = pd.Series(rng.normal(0.0, v, size=120), index=idx)
+    short_driver = pd.Series(rng.normal(0.0, v, size=120), index=idx)
 
     def near(driver, k=0.999):
-        return k * driver + (1 - k) * pd.Series(rng.normal(0.0, 0.02, size=120), index=idx)
+        return k * driver + (1 - k) * pd.Series(rng.normal(0.0, v, size=120), index=idx)
 
-    corr_returns = pd.DataFrame({
-        "BTC/USDT:USDT": near(common),
-        "SOL/USDT:USDT": near(common),          # ~1.0 correlated with BTC, both LONG
-        "ADA/USDT:USDT": btc * 1.1,
-        "ETH/USDT:USDT": btc * 1.1,
-        "XRP/USDT:USDT": btc * 1.0,
-        "DOGE/USDT:USDT": btc * 1.2,
+    def indep():
+        return pd.Series(rng.normal(0.0, v, size=120), index=idx)
+
+    def hi_vol():
+        return pd.Series(rng.normal(0.0, 0.14, size=120), index=idx)
+
+    return pd.DataFrame({
+        "BTC/USDT:USDT": near(long_driver) if clustered else indep(),
+        "SOL/USDT:USDT": near(long_driver) if clustered else indep(),
+        "ADA/USDT:USDT": hi_vol(),                         # HRP-de-weighted long absorber
+        "ETH/USDT:USDT": near(short_driver),
+        "XRP/USDT:USDT": near(short_driver),
+        "DOGE/USDT:USDT": hi_vol(),                        # HRP-de-weighted short absorber
     })
-    tw = optimize_book(_broad_sleeves(NOW), geos, equity=20000.0,
-                       prior_legs=None, cfg=cfg, returns=corr_returns)
 
+
+def _pair_mag(tw, a, b):
     def w(sym):
         return sum(leg.weight for leg in tw.legs if leg.symbol == sym and leg.sleeve != "hedge")
+    return abs(w(a)) + abs(w(b))
 
-    cluster_mag = abs(w("BTC/USDT:USDT")) + abs(w("SOL/USDT:USDT"))
+
+def test_cluster_cap_consolidates_correlated_same_side_legs_via_returns():
+    # Spec §3/§9 'correlated-as-one' cluster cap must be FUNCTIONAL inside optimize_book (the
+    # solver path used to pass an empty corr map, making it inert). With 3 names per side the
+    # HRP-de-weighted absorber (ADA) leaves the deploy slack on the {BTC,SOL} pair, so the cluster
+    # cap is what holds the pair down. This is a real regression guard via TWO independent signals:
+    # (1) effectively removing the cluster cap (raising it to 10.0) on the SAME correlated returns
+    # lets the pair carry MORE -> the cap is binding, not inert; (2) dropping the correlation (the
+    # corr-off counterfactual) lets the same pair carry MORE -> it is the correlation->cluster->cap
+    # mechanism doing the work, and the unconstrained pair exceeds the cap, so a removed cap would
+    # breach it.
+    sleeves = _broad_sleeves(NOW)          # BTC/SOL/ADA long, ETH/XRP/DOGE short
+    geos = _cluster_geometries()
+    cfg = NeutralityConfig()
+
+    tw = optimize_book(sleeves, geos, equity=20000.0, prior_legs=None, cfg=cfg,
+                       returns=_cluster_returns(clustered=True))
+    pair_clustered = _pair_mag(tw, "BTC/USDT:USDT", "SOL/USDT:USDT")
     # the correlated same-side cluster's combined weight is held at/under the cluster cap
-    assert cluster_mag <= cfg.cluster_cap + 1e-6
+    assert pair_clustered <= cfg.cluster_cap + 1e-6
     assert tw.feasible is True
+
+    # (1) cap binds: with the cluster cap effectively OFF the SAME correlated pair carries more.
+    cfg_no_cluster = NeutralityConfig(cluster_cap=10.0)
+    tw_uncapped = optimize_book(sleeves, geos, equity=20000.0, prior_legs=None, cfg=cfg_no_cluster,
+                                returns=_cluster_returns(clustered=True))
+    pair_uncapped = _pair_mag(tw_uncapped, "BTC/USDT:USDT", "SOL/USDT:USDT")
+    assert pair_uncapped > pair_clustered + 1e-3
+
+    # (2) corr-off counterfactual: drop the BTC/SOL correlation (no cluster forms) and the pair
+    # carries MORE, exceeding the cluster cap that constrained the correlated book.
+    tw_corr_off = optimize_book(sleeves, geos, equity=20000.0, prior_legs=None, cfg=cfg,
+                                returns=_cluster_returns(clustered=False))
+    pair_corr_off = _pair_mag(tw_corr_off, "BTC/USDT:USDT", "SOL/USDT:USDT")
+    assert pair_corr_off > pair_clustered + 1e-3
+    # unclustered, the pair breaches the cap that the cluster held it under
+    assert pair_corr_off > cfg.cluster_cap
