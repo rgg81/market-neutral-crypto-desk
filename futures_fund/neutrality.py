@@ -424,12 +424,20 @@ def _scale_to_deploy_target(
     weights: dict[str, float], hedge_notional: float, *, equity: float,
     side_budget: float, deploy_target_frac: float,
 ) -> tuple[dict[str, float], float]:
-    """Scale the projected (dollar+beta-neutral) book by a SINGLE positive scalar so the
-    larger side's gross equals `deploy_target_frac * side_budget`. A positive scalar preserves
-    BOTH neutralities exactly (Sum(k*w)=0, Sum(k*w*beta)=0) and scales each side's gross
-    equally, so this restores the deployment floor WITHOUT re-breaking neutrality. The hedge
-    notional is scaled by the same factor (it is part of the neutral vector). Returns
-    (scaled_weights, scaled_hedge_notional)."""
+    """Scale the projected (dollar+beta-neutral) book by a SINGLE positive scalar so each side's
+    gross equals `deploy_target_frac * side_budget`. A positive scalar preserves BOTH
+    neutralities exactly (Sum(k*w)=0, Sum(k*w*beta)=0) and scales each side's gross equally, so
+    this restores the deployment floor WITHOUT re-breaking neutrality. The hedge notional is
+    scaled by the same factor (it is part of the neutral vector). Returns
+    (scaled_weights, scaled_hedge_notional).
+
+    A dollar-neutral book has long_gross == short_gross in exact arithmetic; the only
+    difference between the two side sums is floating-point summation noise. We scale on the
+    SMALLER positive side so BOTH sides land at-or-above `deploy_target_frac` (never a hair
+    below the floor from FP rounding); the larger side lands above target by at most that FP
+    noise, so it stays inside the [floor, 1-dry_powder] band. The `max` fallback covers a
+    degenerate one-sided book (a side is empty) so we still emit a book (flagged infeasible
+    upstream)."""
     long_gross = sum(w for w in weights.values() if w > 0.0) * equity
     short_gross = -sum(w for w in weights.values() if w < 0.0) * equity
     # include the hedge in the side it sits on
@@ -437,11 +445,14 @@ def _scale_to_deploy_target(
         long_gross += hedge_notional
     elif hedge_notional < 0.0:
         short_gross += -hedge_notional
-    larger = max(long_gross, short_gross)
-    if larger <= 0.0:
+    # bind on the smaller non-empty side so neither side rounds below the deployment floor;
+    # fall back to the larger side if one side is empty (degenerate one-sided book).
+    positive_sides = [g for g in (long_gross, short_gross) if g > 0.0]
+    if not positive_sides:
         return dict(weights), hedge_notional
+    binding = min(positive_sides) if len(positive_sides) == 2 else max(positive_sides)
     target_side_usd = deploy_target_frac * side_budget
-    k = target_side_usd / larger
+    k = target_side_usd / binding
     return {s: w * k for s, w in weights.items()}, hedge_notional * k
 
 
@@ -464,7 +475,14 @@ def optimize_book(
     feasible=False (never silently un-neutral / under-deployed) if the bands or the floor
     cannot be met. `returns` (optional) is the per-symbol return frame used to build the
     Ledoit-Wolf covariance for HRP shaping; without it the merged split is used."""
+    btc = "BTC/USDT:USDT"
     betas = {g.symbol: g.beta_btc for g in geometries}
+    # BTC's beta TO ITSELF is 1.0 by construction (spec §5: BTC is the benchmark / hedge
+    # instrument). `size_btc_hedge` sizes the hedge with beta_BTC == 1.0 and the hedge is
+    # carried as its own leg with beta == 1.0; the projection and the final residual must use
+    # the SAME BTC self-beta, or the alpha-BTC/hedge split leaves a residual w_hedge*(1 - beta)
+    # that breaks beta-neutrality. Normalize it once here so every downstream step agrees.
+    betas[btc] = 1.0
 
     # Stress-tighten bands under a correlation-spike regime.
     band_mult = 1.0
@@ -520,10 +538,8 @@ def optimize_book(
     )
     proj_in = dict(weights)
     proj_betas = dict(betas)
-    btc = "BTC/USDT:USDT"
     if abs(hedge_notional) > 1e-9:
         proj_in[btc] = proj_in.get(btc, 0.0) + hedge_notional / equity
-        proj_betas.setdefault(btc, 1.0)
     projected = project_neutral(proj_in, proj_betas, dollar_band=dollar_band, beta_band=beta_band)
     # split the projected BTC weight back into (alpha BTC leg, hedge): the hedge keeps the
     # residual-beta share, the rest stays an alpha BTC leg. We carry the hedge as its own leg.
