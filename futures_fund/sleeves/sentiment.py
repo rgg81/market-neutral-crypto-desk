@@ -12,7 +12,10 @@ interface contract §2.9); ``neutrality.py`` re-imports them so there is exactly
 """
 from __future__ import annotations
 
-from futures_fund.contracts import CoinGeometry, SleeveTilt
+import math
+from datetime import datetime
+
+from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt
 
 
 def conviction_tilt(
@@ -72,3 +75,28 @@ def apply_conviction_tilts(
         )
         out.append(leg.model_copy(update={"target_weight": tilted}))
     return out
+
+
+def sentiment_factor_signal(geometries: list[CoinGeometry], *, risk_budget_frac: float,
+                            now: datetime, tercile: float = 1 / 3) -> SleeveSignal:
+    """Standalone cross-sectional L/S sleeve: long the highest (sentiment_score*sentiment_conf),
+    short the lowest. Equal-weight within each side (the optimizer re-projects to neutral after)."""
+    n = len(geometries)
+    if n == 0:
+        return SleeveSignal(sleeve="sentiment", tilts=[], risk_budget_frac=risk_budget_frac,
+                            as_of_ts=now)
+    scored = sorted(geometries, key=lambda g: g.sentiment_score * g.sentiment_conf, reverse=True)
+    k = max(1, math.floor(n * tercile))
+    longs = scored[:k]
+    shorts = scored[-k:]
+    long_w = 1.0 / k
+    short_w = 1.0 / k
+    tilts: list[SleeveTilt] = []
+    for g in longs:
+        tilts.append(SleeveTilt(symbol=g.symbol, direction="long", target_weight=long_w,
+                                raw_score=g.sentiment_score * g.sentiment_conf))
+    for g in shorts:
+        tilts.append(SleeveTilt(symbol=g.symbol, direction="short", target_weight=-short_w,
+                                raw_score=g.sentiment_score * g.sentiment_conf))
+    return SleeveSignal(sleeve="sentiment", tilts=tilts, risk_budget_frac=risk_budget_frac,
+                        diagnostics={"k_per_side": k}, as_of_ts=now)

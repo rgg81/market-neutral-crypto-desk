@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from futures_fund.contracts import CoinGeometry, SleeveTilt
-from futures_fund.sleeves.sentiment import apply_conviction_tilts, conviction_tilt
+from futures_fund.sleeves.sentiment import (
+    apply_conviction_tilts,
+    conviction_tilt,
+    sentiment_factor_signal,
+)
 
 _NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
@@ -74,3 +78,28 @@ def test_apply_conviction_tilts_missing_geometry_is_unchanged():
     legs = [SleeveTilt(symbol="Z/USDT:USDT", direction="long", target_weight=0.2)]
     out = apply_conviction_tilts(legs, [], kappa=0.5, cap=0.25)
     assert out[0].target_weight == 0.2              # no geometry -> no tilt (fail-soft neutral)
+
+
+def _sgeo(symbol, s, conf):
+    return CoinGeometry(symbol=symbol, mark=100.0, sentiment_score=s, sentiment_conf=conf)
+
+
+def test_sentiment_factor_signal_long_high_short_low():
+    geos = [
+        _sgeo("A/USDT:USDT", 0.9, 1.0),    # strong positive -> LONG
+        _sgeo("B/USDT:USDT", 0.1, 0.5),
+        _sgeo("C/USDT:USDT", -0.2, 0.5),
+        _sgeo("D/USDT:USDT", -0.9, 1.0),   # strong negative -> SHORT
+    ]
+    sig = sentiment_factor_signal(geos, risk_budget_frac=0.25, now=_NOW, tercile=1 / 3)
+    assert sig.sleeve == "sentiment"
+    by_sym = {t.symbol: t for t in sig.tilts}
+    assert by_sym["A/USDT:USDT"].direction == "long"
+    assert by_sym["D/USDT:USDT"].direction == "short"
+    # score is sentiment_score * sentiment_conf
+    assert by_sym["A/USDT:USDT"].raw_score == 0.9 * 1.0
+
+
+def test_sentiment_factor_signal_empty():
+    sig = sentiment_factor_signal([], risk_budget_frac=0.25, now=_NOW)
+    assert sig.tilts == []
