@@ -79,18 +79,28 @@ def retrieve_lessons(memory_dir, now: datetime, regime: str | None,
     pool = [lz for lz in candidates if lz.state != "validated"]
     out: list[Lesson] = list(validated)  # standing rules are never dropped by the quota
 
-    # Force-include the highest-scored enabling lesson if none is in the set yet.
-    if len(out) < k and not any(lz.polarity == "enabling" for lz in out):
-        enabling = next((lz for lz in pool if lz.polarity == "enabling"), None)
-        if enabling is not None:
-            out.append(enabling)
+    # The effective size floor never truncates away a validated standing rule (spec §6), so the
+    # quota is applied relative to it -- NOT to k. Gating the enabling/two-sided guarantees behind
+    # `len(out) < k` would silently abandon them once a desk accrues >= k validated standing rules
+    # (which are by design never dropped), letting the injected set become entirely one-sided
+    # restrictive -- exactly the all-restrictive never-trade ratchet this function must prevent.
+    cap = max(k, len(validated))
 
-    # Fill the remaining slots by score, capping restrictive FILLS (validated already counted).
+    # Force-include the highest-scored enabling lesson whenever one exists and none is in the set
+    # yet -- UNCONDITIONALLY, so the injected set stays two-sided even past the validated floor.
+    forced: Lesson | None = None
+    if not any(lz.polarity == "enabling" for lz in out):
+        forced = next((lz for lz in pool if lz.polarity == "enabling"), None)
+        if forced is not None:
+            out.append(forced)
+
+    # Fill the remaining slots up to the effective floor by score, capping restrictive FILLS
+    # (validated standing rules already counted, not subject to the fill cap).
     n_restrict = 0
     for lz in pool:
         if lz in out:
             continue
-        if len(out) >= k:
+        if len(out) >= cap:
             break
         if lz.polarity == "restrictive" and n_restrict >= max_restrictive:
             continue  # don't flood the debate with prohibitions
@@ -99,7 +109,12 @@ def retrieve_lessons(memory_dir, now: datetime, regime: str | None,
             n_restrict += 1
 
     out.sort(key=lambda lz: score_lesson(lz, now, query_tags), reverse=True)
-    return out[:max(k, len(validated))]  # never truncate away a validated standing rule
+    kept = out[:cap]  # never truncate away a validated standing rule
+    # If the force-included enabling lesson scored out of the top `cap` (possible when validated
+    # standing rules fill the floor), pin it back in so two-sidedness survives truncation.
+    if forced is not None and forced not in kept:
+        kept.append(forced)
+    return kept
 
 
 def _write_all(memory_dir, lessons: list[Lesson]) -> None:
