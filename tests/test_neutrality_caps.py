@@ -18,13 +18,20 @@ def test_per_name_cap_noop_when_within_cap():
 
 
 def test_cluster_cap_scales_correlated_same_side_group():
-    # A and B are correlated >= 0.7 and same side (both long) => clustered together.
+    # A and B are correlated >= 0.7 and same side (both long) => clustered together. Their
+    # UNCAPPED combined weight (0.3 + 0.3 = 0.6) exceeds cluster_cap (0.40), so the cap MUST BIND:
+    # the cluster is scaled by 0.40/0.60 until its combined |weight| lands exactly at the cap.
     weights = {"A": 0.3, "B": 0.3, "C": -0.4}
     corr = {("A", "B"): 0.9}
-    capped = apply_cluster_cap(weights, corr=corr, cluster_cap=0.40, threshold=0.7)
-    # cluster {A,B} combined long weight 0.6 > 0.40 => scale by 0.40/0.60
+    cluster_cap = 0.40
+    # precondition: the cluster is genuinely over-cap before scaling (so the cap actually binds)
+    assert abs(weights["A"]) + abs(weights["B"]) > cluster_cap
+    capped = apply_cluster_cap(weights, corr=corr, cluster_cap=cluster_cap, threshold=0.7)
+    # cluster {A,B} combined long weight 0.6 > 0.40 => scale by 0.40/0.60 (each 0.3 -> 0.2)
     assert abs(capped["A"] - 0.2) < 1e-9
     assert abs(capped["B"] - 0.2) < 1e-9
+    # the binding constraint: the scaled cluster's combined |weight| sits AT the cap (within tol)
+    assert abs((abs(capped["A"]) + abs(capped["B"])) - cluster_cap) < 1e-9
     # C is in its own cluster, magnitude 0.4 <= cap => unchanged
     assert abs(capped["C"] - (-0.4)) < 1e-9
 

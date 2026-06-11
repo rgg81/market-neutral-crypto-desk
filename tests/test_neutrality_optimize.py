@@ -304,6 +304,60 @@ def test_per_name_cap_respected_on_feasible_book():
             assert abs(leg.weight) <= cfg.per_name_cap + 1e-6, leg.symbol
 
 
+def test_optimize_book_all_unit_beta_capped_is_feasible():
+    # Regression guard for the zero-hedge 'false-infeasible' bug. When EVERY beta == 1.0 the
+    # dollar-neutral alpha legs are already beta-neutral, so size_btc_hedge picks a seed BTC hedge
+    # of EXACTLY 0.0 — there is no residual beta for a hedge to carry. _enforce_caps_neutral must
+    # NOT inject a phantom hedge DOF (its dollar & beta columns would be identical) and must dedup
+    # the redundant equality rows (with all betas == 1.0 the beta row equals the dollar row, and
+    # the two per-side deployment rows already imply dollar-neutrality); otherwise SLSQP fails with
+    # 'Singular matrix C in LSQ subproblem' and a plainly-feasible book is reported infeasible.
+    #
+    # We deliberately concentrate one name per side (0.9 vs 0.05/0.05) so that after the per-side
+    # deploy scale (0.45 equity-gross per side) the dominant leg would land at ~0.30 > the 0.25
+    # per-name cap — forcing _enforce_caps_neutral to actually RUN the bounded least-distance solve
+    # (rather than short-circuiting on an already-cap-respecting seed). The emitted book must be
+    # feasible, dollar+beta neutral, fully deployed on BOTH sides, and per-name-cap respecting.
+    geos = [
+        CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0, beta_btc=1.0, adv_usd=2e9),
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.0, adv_usd=1e9),
+        CoinGeometry(symbol="SOL/USDT:USDT", mark=150.0, beta_btc=1.0, adv_usd=4e8),
+        CoinGeometry(symbol="XRP/USDT:USDT", mark=0.6, beta_btc=1.0, adv_usd=3e8),
+        CoinGeometry(symbol="ADA/USDT:USDT", mark=0.5, beta_btc=1.0, adv_usd=2e8),
+        CoinGeometry(symbol="DOGE/USDT:USDT", mark=0.15, beta_btc=1.0, adv_usd=2e8),
+    ]
+    sleeves = [SleeveSignal(
+        sleeve="factor", risk_budget_frac=1.0, as_of_ts=NOW,
+        tilts=[
+            SleeveTilt(symbol="BTC/USDT:USDT", direction="long", target_weight=0.9),
+            SleeveTilt(symbol="SOL/USDT:USDT", direction="long", target_weight=0.05),
+            SleeveTilt(symbol="ADA/USDT:USDT", direction="long", target_weight=0.05),
+            SleeveTilt(symbol="ETH/USDT:USDT", direction="short", target_weight=-0.9),
+            SleeveTilt(symbol="XRP/USDT:USDT", direction="short", target_weight=-0.05),
+            SleeveTilt(symbol="DOGE/USDT:USDT", direction="short", target_weight=-0.05),
+        ],
+    )]
+    cfg = NeutralityConfig()
+    tw = optimize_book(sleeves, geos, equity=20000.0, prior_legs=None, cfg=cfg)
+
+    # the all-unit-beta zero-hedge solve does NOT falsely report infeasible
+    assert tw.feasible is True
+    assert tw.notes == []
+    # dollar + beta neutral within the config bands
+    assert tw.dollar_residual_frac <= cfg.dollar_band + 1e-6
+    assert abs(tw.beta_residual) <= cfg.beta_band + 1e-6
+    # both sides fully deployed (floor honored, under the dry-powder ceiling)
+    assert tw.deploy_long_frac >= cfg.deployment_floor - 1e-6
+    assert tw.deploy_short_frac >= cfg.deployment_floor - 1e-6
+    assert tw.deploy_long_frac <= (1.0 - cfg.dry_powder_frac) + 1e-6
+    assert tw.deploy_short_frac <= (1.0 - cfg.dry_powder_frac) + 1e-6
+    # the cap actually BOUND here (otherwise the solve never ran): the dominant leg sits AT the cap
+    alpha_legs = [leg for leg in tw.legs if leg.sleeve != "hedge"]
+    max_w = max(abs(leg.weight) for leg in alpha_legs)
+    assert max_w <= cfg.per_name_cap + 1e-6
+    assert max_w >= cfg.per_name_cap - 1e-3  # the dominant name is pinned at the cap, so it bound
+
+
 def _cluster_geometries():
     """6 names, ALL beta == 1.0, so the BTC hedge stays ~0 and the per-side deployment falls
     entirely on the alpha legs (a non-zero hedge would otherwise soak up the long-side slack and

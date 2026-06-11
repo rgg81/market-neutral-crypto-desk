@@ -495,14 +495,15 @@ def _cap_violations(
     tol: float = 1e-6,
 ) -> tuple[list[tuple[str, float]], dict[str, float]]:
     """Find caps breached by the FINAL book, in signed equity-weight units — the SAME units the
-    pre-projection `apply_per_name_cap` / `apply_cluster_cap` clamp: |w| <= per_name_cap on the
-    fraction-of-EQUITY weight (notional = w * equity). NOTE the enforced unit differs from the
-    design doc's framing (§4 phrases the per-name cap as a fraction of a SIDE's budget): with
-    equity == 2x a side's budget, an at-cap leg (0.25 * equity) is ~50% of a side's budget, i.e.
-    ~2x looser than the doc intends. The equity-fraction convention predates this module and the
-    canonical interface contract pins `per_name_cap = 0.25` to it; this checker enforces exactly
-    that convention rather than silently re-deriving a stricter one. Returns
-    (per_name_overages, cluster_over): a per-name
+    pre-projection `apply_per_name_cap` / `apply_cluster_cap` clamp: the per-name cap is enforced
+    as a fraction of EQUITY (notional = w * equity, so an at-cap leg is per_name_cap * equity).
+    This does NOT claim design-doc compliance: with equity == 2x a side's budget, an at-cap leg
+    (0.25 * equity) is ~50% of a side's budget, i.e. ~2x LOOSER than design-doc §4's 'fraction of a
+    side' phrasing. That divergence is a known calibration item, intentionally left to the
+    contract-pinned `per_name_cap = 0.25`: the equity-fraction convention predates this module and
+    the canonical interface contract (and the small synthetic test fixtures) pin 0.25 to it, so
+    this checker enforces exactly that convention rather than silently re-deriving a stricter one.
+    Returns (per_name_overages, cluster_over): a per-name
     overage is (symbol, signed_weight_at_cap); cluster_over maps each over-cap >=2-member cluster
     root -> its combined |weight|. The dollar+beta-neutral, deploy-scaled book re-concentrates
     weight onto the high-beta absorbers, so this is re-checked AFTER projection+scale, not just
@@ -852,10 +853,12 @@ def optimize_book(
 
     # Verify the per-name & cluster caps on the EMITTED book (alpha legs only; the dedicated
     # BTC hedge is the benchmark hedge, capped inside one side's budget by size_btc_hedge).
-    # Measured in fraction-of-EQUITY weight (|w| <= per_name_cap, notional = w * equity) — the
-    # same convention `apply_per_name_cap` and `_cap_violations` use, NOT the side-budget framing
-    # of the design doc §4 (see `_cap_violations` for why the two diverge). Never silently breach
-    # the invariant.
+    # The per-name cap is enforced as a fraction of EQUITY (|w| <= per_name_cap, notional =
+    # w * equity) — the same convention `apply_per_name_cap` and `_cap_violations` use. This is
+    # NOT design-doc compliance: with equity == 2x a side's budget it is ~2x LOOSER than design-doc
+    # §4's 'fraction of a side' phrasing, a known calibration item intentionally left to the
+    # contract-pinned `per_name_cap = 0.25` (see `_cap_violations` for the full rationale). Never
+    # silently breach the invariant that IS enforced here.
     alpha_final = {s: w for s, w in full_weights.items() if s != "__hedge__"}
     per_name_over, cluster_over = _cap_violations(
         alpha_final, corr=corr, per_name_cap=cfg.per_name_cap, cluster_cap=cfg.cluster_cap,
