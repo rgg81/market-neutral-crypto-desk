@@ -13,6 +13,8 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
+from futures_fund.models import SpreadState
+
 
 def engle_granger(y: pd.Series, x: pd.Series) -> tuple[float, float, float]:
     """OLS y~x then ADF on the residual spread. Returns (hedge_ratio, adf_pvalue, adf_stat).
@@ -87,3 +89,37 @@ def half_life(theta: float) -> float:
     if theta <= 0:
         return float("inf")
     return math.log(2) / theta
+
+
+def spread_value(y: float, x: float, hedge_ratio: float) -> float:
+    """The traded unit: y - hedge_ratio * x."""
+    return float(y) - float(hedge_ratio) * float(x)
+
+
+def zscore(spread_value: float, mu: float, sigma_eq: float) -> float:
+    """(spread_value - mu) / sigma_eq; 0.0 if sigma_eq <= 0."""
+    if sigma_eq <= 0:
+        return 0.0
+    return (float(spread_value) - float(mu)) / float(sigma_eq)
+
+
+def spread_state(z: float, *, entry_z: float = 2.0, exit_z: float = 0.0, stop_z: float = 3.0,
+                 prev_state: SpreadState = "flat") -> SpreadState:
+    """OU state machine driving the traded spread.
+
+    |z| >= stop_z  -> "stop" (hard exit).
+    z >= entry_z   -> "short_spread" (spread is rich; short it for reversion).
+    z <= -entry_z  -> "long_spread"  (spread is cheap; long it for reversion).
+    |z| <= exit_z  -> "flat" (mean reached; close).
+    Otherwise hold prev_state (no-trade hysteresis band between exit and entry).
+    """
+    az = abs(z)
+    if az >= stop_z:
+        return "stop"
+    if z >= entry_z:
+        return "short_spread"
+    if z <= -entry_z:
+        return "long_spread"
+    if az <= exit_z:
+        return "flat"
+    return prev_state

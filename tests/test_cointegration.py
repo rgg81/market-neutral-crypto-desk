@@ -84,3 +84,31 @@ def test_half_life_formula():
 def test_half_life_non_mean_reverting_is_inf():
     assert co.half_life(0.0) == float("inf")
     assert co.half_life(-0.1) == float("inf")
+
+
+def test_spread_value():
+    assert co.spread_value(100.0, 40.0, 2.0) == 100.0 - 2.0 * 40.0   # = 20.0
+
+
+def test_zscore_normal():
+    assert co.zscore(20.0, 10.0, 5.0) == 2.0
+
+
+def test_zscore_zero_sigma_is_zero():
+    assert co.zscore(20.0, 10.0, 0.0) == 0.0
+
+
+def test_spread_state_transitions():
+    # flat -> short_spread when z >= entry (spread rich, short the spread)
+    assert co.spread_state(2.5, prev_state="flat") == "short_spread"
+    # flat -> long_spread when z <= -entry (spread cheap, long the spread)
+    assert co.spread_state(-2.5, prev_state="flat") == "long_spread"
+    # |z| >= stop_z dominates -> stop
+    assert co.spread_state(3.5, prev_state="short_spread") == "stop"
+    assert co.spread_state(-3.5, prev_state="long_spread") == "stop"
+    # inside exit band -> flat
+    assert co.spread_state(0.0, prev_state="short_spread") == "flat"
+    # between exit and entry: hold the open position
+    assert co.spread_state(1.5, prev_state="short_spread") == "short_spread"
+    # between exit and entry from flat: stay flat (no new entry)
+    assert co.spread_state(1.5, prev_state="flat") == "flat"
