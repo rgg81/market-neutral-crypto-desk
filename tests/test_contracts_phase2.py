@@ -7,7 +7,13 @@ import pytest
 from pydantic import ValidationError
 
 from futures_fund import models
-from futures_fund.contracts import SentimentBatch, SentimentReport, SentimentSource
+from futures_fund.contracts import (
+    CoinGeometry,
+    GeometryBundle,
+    SentimentBatch,
+    SentimentReport,
+    SentimentSource,
+)
 
 _NOW = datetime(2026, 6, 11, 0, 0, tzinfo=UTC)
 
@@ -78,3 +84,29 @@ def test_sentiment_models_strict_by_default():
                         confidence=0.0, as_of_ts=_NOW, typo_field=1)
     with pytest.raises(ValidationError):
         SentimentBatch(reports=[], extra_field=1)
+
+
+def test_coin_geometry_defaults():
+    g = CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0)
+    assert g.beta_btc == 1.0
+    assert g.beta_lookback_days == 45
+    assert g.funding_interval_hours == 8.0
+    assert g.funding_cap == 0.02
+    assert g.in_pair is False
+    assert g.pair_id is None
+    assert g.sentiment_score == 0.0
+    assert g.sentiment_conf == 0.0
+    assert g.spec is None
+
+
+def test_coin_geometry_sentiment_range_enforced():
+    with pytest.raises(ValidationError):
+        CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, sentiment_score=2.0)
+
+
+def test_geometry_bundle_holds_geometries():
+    b = GeometryBundle(
+        geometries=[CoinGeometry(symbol="BTC/USDT:USDT", mark=60000.0)],
+        as_of_ts=_NOW,
+    )
+    assert b.geometries[0].symbol == "BTC/USDT:USDT"
