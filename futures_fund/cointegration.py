@@ -5,6 +5,9 @@ Adapted for the market-neutral desk; statsmodels-backed. Pure functions, fail-so
 """
 from __future__ import annotations
 
+import math
+
+import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
@@ -50,3 +53,33 @@ def johansen(frame: pd.DataFrame, det_order: int = 0, k_ar_diff: int = 1) -> dic
         "hedge_ratio": hedge_ratio,
         "rank": rank,
     }
+
+
+def ou_fit(spread: pd.Series) -> tuple[float, float, float]:
+    """Fit an OU process via AR(1) on the spread. Returns (theta, mu, sigma_eq).
+
+    Discrete AR(1): s_{t+1} = a + b*s_t + eps. Then theta = 1 - b (mean-reversion speed),
+    mu = a / (1 - b) (long-run mean), and sigma_eq = std(eps) / sqrt(1 - b^2) (equilibrium sd).
+    """
+    s = pd.Series(spread).dropna().reset_index(drop=True).astype(float).to_numpy()
+    if len(s) < 3:
+        return 0.0, float(s.mean()) if len(s) else 0.0, 0.0
+    lagged = s[:-1]
+    nxt = s[1:]
+    design = sm.add_constant(lagged)
+    model = sm.OLS(nxt, design).fit()
+    a = float(model.params[0])
+    b = float(model.params[1])
+    theta = 1.0 - b
+    mu = a / (1.0 - b) if abs(1.0 - b) > 1e-12 else float(s.mean())
+    resid_sd = float(np.std(model.resid, ddof=2)) if len(model.resid) > 2 else 0.0
+    denom = 1.0 - b * b
+    sigma_eq = resid_sd / math.sqrt(denom) if denom > 0 else resid_sd
+    return theta, mu, sigma_eq
+
+
+def half_life(theta: float) -> float:
+    """OU half-life in cycles = ln(2)/theta. inf if theta <= 0 (non-mean-reverting)."""
+    if theta <= 0:
+        return float("inf")
+    return math.log(2) / theta

@@ -48,3 +48,31 @@ def test_johansen_independent_walks_rank_zero():
     b = pd.Series(np.cumsum(rng.normal(0, 1, 400)) + 50.0)
     out = co.johansen(pd.DataFrame({"a": a, "b": b}))
     assert out["rank"] == 0
+
+
+def _ou_path(theta: float, mu: float, sigma: float, n: int = 2000, seed: int = 5) -> pd.Series:
+    """Simulate a discrete OU process: s_{t+1} = s_t + theta*(mu - s_t) + sigma*eps."""
+    rng = np.random.default_rng(seed)
+    s = np.zeros(n)
+    s[0] = mu
+    for t in range(1, n):
+        s[t] = s[t - 1] + theta * (mu - s[t - 1]) + sigma * rng.normal()
+    return pd.Series(s)
+
+
+def test_ou_fit_recovers_theta_and_mu():
+    spread = _ou_path(theta=0.2, mu=5.0, sigma=0.3)
+    theta, mu, sigma_eq = co.ou_fit(spread)
+    assert abs(theta - 0.2) < 0.05
+    assert abs(mu - 5.0) < 0.3
+    assert sigma_eq > 0.0
+
+
+def test_half_life_formula():
+    assert abs(co.half_life(math.log(2)) - 1.0) < 1e-9     # theta = ln2 -> half-life 1 cycle
+    assert abs(co.half_life(0.2) - (math.log(2) / 0.2)) < 1e-9
+
+
+def test_half_life_non_mean_reverting_is_inf():
+    assert co.half_life(0.0) == float("inf")
+    assert co.half_life(-0.1) == float("inf")
