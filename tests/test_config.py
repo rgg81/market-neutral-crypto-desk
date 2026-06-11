@@ -1,4 +1,13 @@
-from futures_fund.config import LoopSettings, _default_loops, load_settings
+import os
+
+from futures_fund.config import (
+    DataSettings,
+    ExchangeSettings,
+    LoopSettings,
+    _default_loops,
+    load_env_file,
+    load_settings,
+)
 
 
 def test_load_settings_parses_account_and_live(tmp_path):
@@ -118,3 +127,100 @@ def test_defaults_when_file_absent(tmp_path):
     assert s.live is False
     assert s.agent_models == {}
     assert s.loops["weekly"].cadence_days == 7
+
+
+def test_load_env_file_missing_returns_empty(tmp_path):
+    # No .env present -> no-op, empty mapping, no env mutation.
+    loaded = load_env_file(tmp_path / ".env")
+    assert loaded == {}
+
+
+def test_load_env_file_strips_quotes_and_skips_comments_blanks(tmp_path, monkeypatch):
+    # Quote stripping, comment/blank/no-'=' skipping, and empty-key skipping.
+    monkeypatch.delenv("MN_PLAIN", raising=False)
+    monkeypatch.delenv("MN_DQUOTED", raising=False)
+    monkeypatch.delenv("MN_SQUOTED", raising=False)
+    monkeypatch.delenv("MN_EQUALS_IN_VALUE", raising=False)
+    p = tmp_path / ".env"
+    p.write_text(
+        "# a comment line\n"
+        "\n"
+        "   \n"
+        "no_equals_sign_here\n"
+        "=orphan_value_no_key\n"
+        "MN_PLAIN=bare\n"
+        'MN_DQUOTED="double quoted"\n'
+        "MN_SQUOTED='single quoted'\n"
+        "MN_EQUALS_IN_VALUE=a=b=c\n"
+    )
+    loaded = load_env_file(p)
+    # Returned mapping reflects only the valid, parsed lines.
+    assert loaded == {
+        "MN_PLAIN": "bare",
+        "MN_DQUOTED": "double quoted",
+        "MN_SQUOTED": "single quoted",
+        "MN_EQUALS_IN_VALUE": "a=b=c",
+    }
+    # Quotes are stripped and split is on the FIRST '=' only.
+    assert os.environ["MN_DQUOTED"] == "double quoted"
+    assert os.environ["MN_SQUOTED"] == "single quoted"
+    assert os.environ["MN_EQUALS_IN_VALUE"] == "a=b=c"
+    # Comment / blank / no-'=' / empty-key lines never reach os.environ.
+    assert "no_equals_sign_here" not in os.environ
+    assert "" not in os.environ
+    assert "orphan_value_no_key" not in os.environ
+
+
+def test_load_env_file_does_not_override_existing_env(tmp_path, monkeypatch):
+    # setdefault semantics: a pre-existing env var WINS over the .env value.
+    monkeypatch.setenv("MN_EXISTING", "from_environment")
+    p = tmp_path / ".env"
+    p.write_text("MN_EXISTING=from_dotenv\n")
+    loaded = load_env_file(p)
+    # The return value records what the file declared...
+    assert loaded["MN_EXISTING"] == "from_dotenv"
+    # ...but os.environ retains the original value (no override).
+    assert os.environ["MN_EXISTING"] == "from_environment"
+
+
+def test_exchange_property_accessors_read_configured_env(monkeypatch):
+    monkeypatch.setenv("MY_KEY_ENV", "key-123")
+    monkeypatch.setenv("MY_SECRET_ENV", "secret-456")
+    ex = ExchangeSettings(key_env="MY_KEY_ENV", secret_env="MY_SECRET_ENV")
+    assert ex.api_key == "key-123"
+    assert ex.api_secret == "secret-456"
+
+
+def test_exchange_property_accessors_none_when_env_absent(monkeypatch):
+    monkeypatch.delenv("ABSENT_KEY_ENV", raising=False)
+    monkeypatch.delenv("ABSENT_SECRET_ENV", raising=False)
+    ex = ExchangeSettings(key_env="ABSENT_KEY_ENV", secret_env="ABSENT_SECRET_ENV")
+    assert ex.api_key is None
+    assert ex.api_secret is None
+
+
+def test_data_fred_api_key_reads_configured_env(monkeypatch):
+    monkeypatch.setenv("MY_FRED_ENV", "fred-789")
+    data = DataSettings(fred_key_env="MY_FRED_ENV")
+    assert data.fred_api_key == "fred-789"
+    monkeypatch.delenv("MY_FRED_ENV", raising=False)
+    assert data.fred_api_key is None
+
+
+def test_load_settings_loads_dotenv_secrets_into_accessors(tmp_path, monkeypatch):
+    # End-to-end: load_settings sources .env next to config.yaml, and the
+    # configured *_env accessors then read those secrets.
+    monkeypatch.delenv("BINANCE_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_SECRET", raising=False)
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        'BINANCE_KEY="env-key"\n'
+        "BINANCE_SECRET=env-secret\n"
+        "FRED_API_KEY='fred-key'\n"
+    )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("account_size_usdt: 20000\n")
+    s = load_settings(cfg)
+    assert s.exchange.api_key == "env-key"
+    assert s.exchange.api_secret == "env-secret"
+    assert s.data.fred_api_key == "fred-key"
