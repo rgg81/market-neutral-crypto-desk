@@ -8,13 +8,17 @@ _NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
 
 def test_conviction_tilt_positive_sentiment_boosts_long():
-    # w*(1 + kappa*s*conf) = 0.2 * (1 + 0.5*0.8*1.0) = 0.2 * 1.4 = 0.28
-    assert abs(conviction_tilt(0.2, 0.8, 1.0, kappa=0.5) - 0.28) < 1e-9
+    # sign-aligned magnitude tilt |w|*(1 + kappa*sign(w)*s*conf) (canonical contract §7.2):
+    # unclamped delta = 0.2 * 0.5*(+1)*0.8*1.0 = +0.08 (+40%), but |delta| <= cap*|w| = 0.25*0.2
+    # => clamped to +0.05, so tilted = 0.2 + 0.05 = 0.25.
+    assert abs(conviction_tilt(0.2, 0.8, 1.0, kappa=0.5) - 0.25) < 1e-9
 
 
 def test_conviction_tilt_negative_sentiment_shrinks_long():
-    # 0.2 * (1 + 0.5*(-0.8)*1.0) = 0.2 * 0.6 = 0.12
-    assert abs(conviction_tilt(0.2, -0.8, 1.0, kappa=0.5) - 0.12) < 1e-9
+    # sign-aligned magnitude tilt |w|*(1 + kappa*sign(w)*s*conf) (canonical contract §7.2):
+    # unclamped delta = 0.2 * 0.5*(+1)*(-0.8)*1.0 = -0.08 (-40%), but |delta| <= cap*|w| = 0.25*0.2
+    # => clamped to -0.05, so tilted = 0.2 - 0.05 = 0.15.
+    assert abs(conviction_tilt(0.2, -0.8, 1.0, kappa=0.5) - 0.15) < 1e-9
 
 
 def test_conviction_tilt_never_flips_sign():
