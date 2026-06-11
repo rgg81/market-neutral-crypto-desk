@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from futures_fund.cycle_io import save_output
 from futures_fund.graduation import graduation_verdict
 from futures_fund.journal import append_decision, patch_outcome
@@ -114,25 +116,51 @@ def test_build_scorecard_injects_neutral_kpis(tmp_path):
 
 def test_scorecard_warnings_are_two_sided(tmp_path):
     """The warnings carry BOTH a drawdown/risk-off brake AND an under-deployment accelerator — a
-    one-way ratchet (only brakes) is the bug this two-sidedness exists to prevent."""
+    one-way ratchet (only brakes) is the bug this two-sidedness exists to prevent. The brake is
+    driven by a REAL measured drawdown of the cumulative-alpha equity curve (a seeded losing
+    series), not a test-only hook."""
     state = tmp_path / "state"
     memory = tmp_path / "memory"
     # Under-deployed: several cycles all-cash / one-sided -> accelerator must fire.
+    # Seed a genuinely losing alpha series so the cumulative-alpha equity curve is in a real
+    # drawdown well past the 5% brake tolerance.
     for i in range(1, 7):
         save_output(state, i, "target_weights", _target_weights(long_frac=0.0, short_frac=0.0),
                     cadence="weekly")
         save_output(state, i, "reviewer", _reviewer(cycle=i, passed=True), cadence="weekly")
+        _seed_leg(memory, cycle=i, symbol="BTC/USDT:USDT", direction="long",
+                  outcome={"realized_funding": 0.0, "projected_funding": 0.0,
+                           "adf_pvalue_at_retest": 0.5, "alpha_return": -0.05})
 
     sc = build_scorecard(state, memory)
     text = " ".join(sc["warnings"]).lower()
     # Accelerator present (counter-signal against the all-cash / one-sided ratchet).
     assert "deploy" in text or "under-deployed" in text
-    # And the brake side is structurally available (drawdown / risk-off vocabulary), proving the
-    # warnings are not an accelerator-only ratchet either.
-    assert any(
-        w_key in " ".join(build_scorecard(state, memory, _force_drawdown=True)["warnings"]).lower()
-        for w_key in ("drawdown", "risk-off")
-    )
+    # Brake fired off a REAL drawdown: six -5% alpha cycles compound to ~26.5% peak-to-trough.
+    # Independent expected: 1 - 0.95**6 = 0.2649...
+    expected_dd = 1.0 - 0.95**6
+    assert sc["alpha_drawdown"] == pytest.approx(expected_dd, abs=1e-9)
+    assert any(w_key in text for w_key in ("drawdown", "risk-off"))
+
+
+def test_drawdown_brake_silent_on_winning_series(tmp_path):
+    """The brake must NOT fire when the cumulative-alpha curve never draws down past tolerance —
+    proving it measures real behavior, not a flag. A monotone-up alpha series => 0 drawdown."""
+    state = tmp_path / "state"
+    memory = tmp_path / "memory"
+    # Both-sides deployed (silence the accelerator) + a strictly winning alpha series.
+    for i in range(1, 7):
+        save_output(state, i, "target_weights", _target_weights(long_frac=0.95, short_frac=0.94),
+                    cadence="weekly")
+        save_output(state, i, "reviewer", _reviewer(cycle=i, passed=True), cadence="weekly")
+        _seed_leg(memory, cycle=i, symbol="BTC/USDT:USDT", direction="long",
+                  outcome={"realized_funding": 0.0, "projected_funding": 0.0,
+                           "adf_pvalue_at_retest": 0.01, "alpha_return": 0.02})
+
+    sc = build_scorecard(state, memory)
+    assert sc["alpha_drawdown"] == 0.0
+    text = " ".join(sc["warnings"]).lower()
+    assert "drawdown" not in text
 
 
 # --------------------------------------------------------------------------------------------------

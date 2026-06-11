@@ -8,11 +8,14 @@ spec (§12/§18/§19) cares about — folding in the Phase-6 `improvement.py` ne
 and the DSR-gated `graduation_verdict`.
 
 The warnings are DELIBERATELY TWO-SIDED — a drawdown/risk-off BRAKE and an under-deployment
-ACCELERATOR. Without the accelerator the injected context is a one-way ratchet that talks the desk
-out of every clean neutral trade (the root cause of standing down to cash, or to a one-sided book,
-for cycles on end). Lifted/adapted from the weekly `scorecard.py` (verify+merge), re-pointed onto
-the neutral KPIs since this repo's substrate is the Phase-6 alpha process, not the weekly raw-return
-equity panel.
+ACCELERATOR. The brake measures a REAL drawdown: it compounds the per-cycle alpha series into a
+cumulative-alpha equity curve and reads its peak-to-trough decline via `metrics.max_drawdown`,
+firing only past a tolerance (the desk is drawdown-tolerant, so it engages on a genuine drawdown,
+not on a single -5% wiggle). Without the accelerator the injected context is a one-way ratchet that
+talks the desk out of every clean neutral trade (the root cause of standing down to cash, or to a
+one-sided book, for cycles on end). Lifted/adapted from the weekly `scorecard.py` (verify+merge),
+re-pointed onto the neutral KPIs since this repo's substrate is the Phase-6 alpha process, not the
+weekly raw-return equity panel.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from futures_fund.improvement import (
     sentiment_hit_rate,
 )
 from futures_fund.journal import read_all_decisions
-from futures_fund.metrics import PERIODS_PER_YEAR_DAILY
+from futures_fund.metrics import PERIODS_PER_YEAR_DAILY, max_drawdown
 
 
 def _alpha_returns(memory_dir, *, window: int) -> list[float]:
@@ -46,20 +49,34 @@ def _alpha_returns(memory_dir, *, window: int) -> list[float]:
     return series[-window:] if window else series
 
 
+def _alpha_drawdown(alpha_rets: list[float]) -> float:
+    """Current drawdown of the cumulative-alpha equity curve from its running peak, as a positive
+    fraction. Builds an equity curve by compounding the per-cycle alpha series (start 1.0) and reads
+    the trough-from-peak via `metrics.max_drawdown` — a REAL measured drawdown, not a flag."""
+    if not alpha_rets:
+        return 0.0
+    equity = [1.0]
+    for r in alpha_rets:
+        equity.append(equity[-1] * (1.0 + r))
+    return max_drawdown(equity)
+
+
 def build_scorecard(state_dir, memory_dir, *, last_n: int = 10, weekly_target: float = 0.05,
                     min_cycles: int = 20, horizon_cycles: int = 120,
-                    _force_drawdown: bool = False) -> dict:
+                    drawdown_brake: float = 0.05) -> dict:
     """The neutral desk's self-portrait, injected into every agent prompt.
 
     Bundles the Phase-6 neutral KPIs, the rolling alpha-Sharpe trend, a DSR-gated graduation verdict
     over the alpha series, and TWO-SIDED warnings (drawdown brake + under-deployment accelerator).
-    Pure / read-only. `_force_drawdown` is a test-only hook to exercise the brake path
-    deterministically without a seeded equity series."""
+    Pure / read-only. The drawdown brake fires on a REAL measured drawdown of the cumulative-alpha
+    equity curve past `drawdown_brake` (the desk is drawdown-tolerant, so it engages on a genuine
+    peak-to-trough loss, not on a single -5% wiggle)."""
     alpha_rets = _alpha_returns(memory_dir, window=last_n)
     # DSR over the alpha series (conservative fixed trial count, like the weekly desk).
     dsr = deflated_sharpe_pvalue(alpha_rets, num_trials=10) if alpha_rets else 0.0
     period_alpha = sum(alpha_rets)
     n_cycles = len(alpha_rets)
+    alpha_drawdown = _alpha_drawdown(alpha_rets)
 
     both_sides = both_sides_deployment_rate(state_dir, last_n=last_n)
     deploy = deployment_rate(state_dir, last_n=last_n)
@@ -71,11 +88,13 @@ def build_scorecard(state_dir, memory_dir, *, last_n: int = 10, weekly_target: f
 
     # ---------- TWO-SIDED WARNINGS (brake + accelerator) ----------
     warnings: list[str] = []
-    # --- BRAKE (risk-off): drawdown / DSR-unproven edge size down. The desk is drawdown-tolerant,
-    # so the brake engages on a real drawdown, not on a -5% wiggle. `_force_drawdown` exercises this
-    # branch in tests where no equity series is seeded. ---
-    if _force_drawdown:
-        warnings.append("in drawdown from the alpha peak — bias risk-off and size conservatively")
+    # --- BRAKE (risk-off): a REAL measured drawdown of the cumulative-alpha equity curve sizes the
+    # book down. The desk is drawdown-tolerant, so the brake engages only past `drawdown_brake`, not
+    # on a single -5% wiggle. ---
+    if alpha_drawdown > drawdown_brake:
+        warnings.append(
+            f"in {alpha_drawdown:.0%} drawdown from the alpha peak — bias risk-off and size "
+            "conservatively")
     if n_cycles >= 11 and dsr < 0.95:  # DSR only computable at >= 10 returns
         warnings.append("alpha edge not statistically proven (DSR < 0.95) — size conservatively")
     # --- ACCELERATOR (counter-signal): under-deployment opportunity cost. Fires when the book is
@@ -103,6 +122,7 @@ def build_scorecard(state_dir, memory_dir, *, last_n: int = 10, weekly_target: f
         "alpha_sharpe_trend": a_trend,
         "alpha_sharpe_annualization": PERIODS_PER_YEAR_DAILY,
         "dsr_pvalue": dsr,
+        "alpha_drawdown": alpha_drawdown,
         "deployment_rate": deploy["deployment_rate"],
         "both_sides_deployment_rate": both_sides,
         "pair_survival_rate": pair_survival_rate(memory_dir, last_n=last_n),
