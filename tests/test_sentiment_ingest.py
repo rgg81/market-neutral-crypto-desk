@@ -120,6 +120,38 @@ def test_gather_sentiment_context_keeps_past_drops_future(monkeypatch):
     assert kept == {"past rfc822", "past iso"}  # only past-dated sources survive the gate
 
 
+def test_gather_sentiment_context_real_newsitem_wiring(monkeypatch):
+    """End-to-end wiring guard: pins the real NewsItem.published_at -> gather_sentiment_context
+    linkage. Build REAL NewsItem objects, wrap them exactly as build_market_context does
+    ({"news": [i.model_dump() for i in items], ...}), and assert the strictly-before gate keeps
+    the past item and drops BOTH the future item and the one EXACTLY at as_of. If published_at were
+    renamed, every news item would silently drop and this test would fail (catching the dict-only
+    blind spot)."""
+    from futures_fund.config import Settings
+    from futures_fund.vendors import NewsItem
+
+    as_of = _utc(0, d=1)  # 2026-06-01T00:00:00+00:00 decision time
+
+    def _item(title: str, published_at: str) -> NewsItem:
+        return NewsItem(title=title, url="https://x", published_at=published_at,
+                        source="src", kind="news", instruments=["BTC"], summary="s")
+
+    items = [
+        _item("past", "2026-05-29T14:20:32+00:00"),                 # clearly PAST -> kept
+        _item("future", "2026-06-03T09:00:00+00:00"),               # clearly FUTURE -> dropped
+        _item("exactly_at_as_of", as_of.isoformat()),               # == as_of -> dropped (strict <)
+    ]
+    # mirror build_market_context's real shape: news is model_dump()ed NewsItems
+    ctx_shape = {"news": [i.model_dump() for i in items], "fear_greed": None, "macro": {},
+                 "social": {"posts": [], "mentions": {}}, "warnings": []}
+    monkeypatch.setattr(si, "build_market_context", lambda *a, **k: ctx_shape)
+
+    ctx = gather_sentiment_context(object(), Settings(), fred_key=None, as_of=as_of)
+
+    kept = {n["title"] for n in ctx["news"]}
+    assert kept == {"past"}  # only strictly-past survives; future AND exactly-at-as_of are dropped
+
+
 def test_gather_sentiment_context_degrades_safely(monkeypatch):
     """When every feed errors, build_market_context yields no news; the gather still records the
     as_of anchor and returns an empty news list (fail-soft)."""

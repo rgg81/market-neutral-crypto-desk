@@ -31,10 +31,56 @@ class _TickerClient:
         }
 
 
+# Every non-crypto TradFi wrapper the desk must exclude, one realistic fixture per excluded
+# contractType/underlyingType the code enumerates (market_data.py:~61-64). Each ranks HIGH by
+# 24h volume on Binance USD-M but must NEVER enter a crypto-only book.
+_TRADFI_WRAPPERS = {
+    "GOLD/USDT:USDT": {"info": {"underlyingType": "COMMODITY",
+                                "contractType": "TRADIFI_PERPETUAL"}},
+    "AAPL/USDT:USDT": {"info": {"underlyingType": "EQUITY",
+                                "contractType": "TRADIFI_PERPETUAL"}},
+    "SAMSUNG/USDT:USDT": {"info": {"underlyingType": "KR_EQUITY",
+                                   "contractType": "TRADIFI_PERPETUAL"}},
+    "PREIPO/USDT:USDT": {"info": {"underlyingType": "EQUITY",
+                                  "contractType": "PREMARKET"}},
+    "SPX/USDT:USDT": {"info": {"underlyingType": "INDEX",
+                               "contractType": "TRADIFI_PERPETUAL"}},
+}
+
+
 def test_is_crypto_perp_rejects_tradfi_wrapper():
     assert is_crypto_perp(_MARKETS["BTC/USDT:USDT"]) is True
     assert is_crypto_perp(_MARKETS["GOLD/USDT:USDT"]) is False
     assert is_crypto_perp({"info": {}}) is True  # metadata gap -> keep plain perp
+
+
+@pytest.mark.parametrize("sym", list(_TRADFI_WRAPPERS))
+def test_is_crypto_perp_rejects_every_tradfi_underlying(sym):
+    # tokenized EQUITY (AAPL), KR_EQUITY (Samsung), PREMARKET pre-IPO, INDEX basket, COMMODITY
+    assert is_crypto_perp(_TRADFI_WRAPPERS[sym]) is False
+    # a plain crypto COIN perp still passes the same gate
+    assert is_crypto_perp(_MARKETS["BTC/USDT:USDT"]) is True
+
+
+def test_scan_universe_excludes_all_tradfi_wrappers():
+    """A normal crypto perp ranks; every tokenized TradFi wrapper (EQUITY/KR_EQUITY/PREMARKET/
+    INDEX/COMMODITY) is excluded from the scanned universe despite high 24h volume."""
+    markets = {"BTC/USDT:USDT": _MARKETS["BTC/USDT:USDT"], **_TRADFI_WRAPPERS}
+
+    class _Client:
+        def fetch_tickers(self):
+            t = {"BTC/USDT:USDT": {"quoteVolume": 1e10, "percentage": 0.1, "last": 70000.0}}
+            # each wrapper has higher volume than BTC, yet must be filtered out
+            for i, s in enumerate(_TRADFI_WRAPPERS):
+                t[s] = {"quoteVolume": 9e10 + i, "percentage": 0.0, "last": 100.0}
+            return t
+
+    _Client.markets = markets
+    rows = scan_universe(_Client(), top_n=10)
+    syms = [r["symbol"] for r in rows]
+    assert syms == ["BTC/USDT:USDT"]  # only the crypto perp survives
+    for s in _TRADFI_WRAPPERS:
+        assert s not in syms
 
 
 def test_scan_universe_drops_tradfi_and_non_perp():

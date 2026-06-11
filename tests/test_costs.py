@@ -61,3 +61,25 @@ def test_slippage_cost_is_filled_times_abs_vwap_gap():
     cost = slippage_cost([(100.0, 1.0), (101.0, 1.0)], qty=1.5, reference_price=100.0)
     filled, vwap = vwap_fill([(100.0, 1.0), (101.0, 1.0)], qty=1.5)
     assert cost == pytest.approx(filled * abs(vwap - 100.0))
+
+
+def test_vwap_fill_empty_book_is_zero():
+    assert vwap_fill([], 1.0) == (0.0, 0.0)
+
+
+def test_vwap_fill_zero_qty_is_zero():
+    assert vwap_fill([(100.0, 1.0)], 0) == (0.0, 0.0)
+
+
+def test_slippage_cost_empty_book_is_zero():
+    assert slippage_cost([], 1.0, 100.0) == 0.0
+
+
+def test_vwap_fill_partial_when_qty_exceeds_book_depth():
+    # request 5 units against a book holding only 1.0 + 2.0 = 3.0 total -> partial fill
+    levels = [(100.0, 1.0), (101.0, 2.0)]
+    filled, vwap = vwap_fill(levels, qty=5.0)
+    assert filled == pytest.approx(3.0)   # capped at total available depth
+    assert filled < 5.0                   # strictly less than requested
+    # vwap over the fully-consumed book: (100*1 + 101*2) / 3
+    assert vwap == pytest.approx((100.0 * 1.0 + 101.0 * 2.0) / 3.0)

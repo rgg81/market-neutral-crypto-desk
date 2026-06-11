@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import pandas as pd
 
+from futures_fund.config import Settings
 from futures_fund.market_data import (
     FundingInfo,
     _filter_field,
@@ -14,9 +13,6 @@ from futures_fund.market_data import (
     parse_symbol_spec,
 )
 from futures_fund.models import MmrBracket, SymbolSpec
-
-if TYPE_CHECKING:  # config.py arrives in Task 8; Settings is used only in type annotations here
-    from futures_fund.config import Settings
 
 
 def build_ccxt(settings: Settings):
@@ -72,16 +68,6 @@ class FuturesExchange:
 
     def _raw_id(self, symbol: str) -> str:
         return self.client.market(symbol)["id"]
-
-    def unified_for_raw(self, raw_id: str) -> str | None:
-        by_id = getattr(self.client, "markets_by_id", None)
-        if by_id and raw_id in by_id:
-            m = by_id[raw_id]
-            return (m[0] if isinstance(m, list) else m)["symbol"]
-        for sym, mk in getattr(self.client, "markets", {}).items():
-            if mk.get("id") == raw_id:
-                return sym
-        return None
 
     def symbol_spec(self, symbol: str) -> SymbolSpec:
         market = self.client.market(symbol)
