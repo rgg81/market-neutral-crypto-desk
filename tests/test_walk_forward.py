@@ -32,6 +32,35 @@ def test_validate_sleeve_param_genuine_edge_passes():
     assert res["dsr_pvalue"] >= 0.95
 
 
+def test_validate_sleeve_param_num_trials_deflates_pvalue_and_flips_pass():
+    # Regression-lock the gate's core purpose: deflation for multiple testing.
+    # In a REALISTIC Sharpe regime (per-period SR ~0.05, n=1000), the OOS Sharpe is the
+    # same regardless of num_trials, but the Deflated-Sharpe p-value must SHRINK as more
+    # param candidates are tried -- enough to flip passed True->False. (A genuinely strong
+    # edge saturates dsr_p to 1.0, hiding this, which is why test_genuine_edge_passes alone
+    # cannot catch a num_trials-ignoring implementation.)
+    rng = np.random.default_rng(0)
+    oos_returns = [list(rng.normal(0.001, 0.01, 250)) for _ in range(4)]  # 1000 pooled obs
+
+    res_1 = validate_sleeve_param(oos_returns, num_trials=1, periods_per_year=365.0,
+                                  dsr_threshold=0.95)
+    res_20 = validate_sleeve_param(oos_returns, num_trials=20, periods_per_year=365.0,
+                                   dsr_threshold=0.95)
+    res_1000 = validate_sleeve_param(oos_returns, num_trials=1000, periods_per_year=365.0,
+                                     dsr_threshold=0.95)
+
+    # OOS Sharpe is a property of the returns, not of how many trials were tried.
+    assert res_1["oos_sharpe"] > 0
+    assert res_1["oos_sharpe"] == res_20["oos_sharpe"] == res_1000["oos_sharpe"]
+
+    # Deflation: more trials -> strictly lower DSR p-value (this is the whole point of the gate).
+    assert res_1["dsr_pvalue"] > res_20["dsr_pvalue"] > res_1000["dsr_pvalue"]
+
+    # And it actually moves the gate decision: a single trial clears it, many trials do not.
+    assert res_1["passed"] is True
+    assert res_1000["passed"] is False
+
+
 def test_validate_sleeve_param_noise_fails():
     rng = np.random.default_rng(1)
     # zero-mean noise -> no edge -> gate rejects
