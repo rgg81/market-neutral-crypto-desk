@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from futures_fund.models import Direction, SentimentLevel, SleeveName, SymbolSpec
 
 
 class SentimentSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
     url: str
     published_ts: datetime          # MUST be < owning report's as_of_ts (point-in-time)
     title: str = ""
@@ -16,6 +17,7 @@ class SentimentSource(BaseModel):
 
 
 class SentimentReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
     symbol: str                     # ccxt unified id, or "MARKET" for the market-wide read
     level: SentimentLevel
     s: float = Field(ge=-1.0, le=1.0)
@@ -27,6 +29,7 @@ class SentimentReport(BaseModel):
 
 
 class SentimentBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
     reports: list[SentimentReport] = Field(default_factory=list)
 
 

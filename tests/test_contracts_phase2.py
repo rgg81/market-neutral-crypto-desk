@@ -66,3 +66,15 @@ def test_sentiment_report_confidence_out_of_range_rejected():
 def test_sentiment_batch_defaults_empty():
     b = SentimentBatch()
     assert b.reports == []
+
+
+def test_sentiment_models_strict_by_default():
+    # Canonical contract (PART 1): these models are "strict-by-default (no extra='allow')",
+    # i.e. unexpected/typo'd fields must be REJECTED, not silently dropped.
+    with pytest.raises(ValidationError):
+        SentimentSource(url="http://x", published_ts=_NOW, bogus=1)
+    with pytest.raises(ValidationError):
+        SentimentReport(symbol="BTC/USDT:USDT", level="neutral", s=0.0,
+                        confidence=0.0, as_of_ts=_NOW, typo_field=1)
+    with pytest.raises(ValidationError):
+        SentimentBatch(reports=[], extra_field=1)
