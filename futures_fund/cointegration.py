@@ -66,6 +66,10 @@ def ou_fit(spread: pd.Series) -> tuple[float, float, float]:
         return 0.0, float(s.mean()) if len(s) else 0.0, 0.0
     lagged = s[:-1]
     nxt = s[1:]
+    if np.ptp(lagged) == 0:
+        # Flat/constant spread (stale or pinned prices): the lagged regressor has no
+        # variation, so OLS would fit a single parameter. Fail soft like the len<3 branch.
+        return 0.0, float(s.mean()), 0.0
     design = sm.add_constant(lagged)
     model = sm.OLS(nxt, design).fit()
     a = float(model.params[0])

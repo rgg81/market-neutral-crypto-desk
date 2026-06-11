@@ -68,6 +68,14 @@ def test_ou_fit_recovers_theta_and_mu():
     assert sigma_eq > 0.0
 
 
+def test_ou_fit_flat_spread_fail_soft():
+    # Constant/flat spread (stale or pinned prices): no IndexError, fail soft.
+    theta, mu, sigma_eq = co.ou_fit(pd.Series([5.0] * 100))
+    assert theta == 0.0
+    assert abs(mu - 5.0) < 1e-9
+    assert sigma_eq == 0.0
+
+
 def test_half_life_formula():
     assert abs(co.half_life(math.log(2)) - 1.0) < 1e-9     # theta = ln2 -> half-life 1 cycle
     assert abs(co.half_life(0.2) - (math.log(2) / 0.2)) < 1e-9
