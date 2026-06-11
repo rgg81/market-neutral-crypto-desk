@@ -134,8 +134,14 @@ class PaperAccount(BaseModel):
                 sym, abs(delta_signed_qty), mark, depth=ci.depth, adv_usd=ci.adv_usd,
                 half_spread_bps=ci.half_spread_bps)
 
-            if existing is not None and (delta_signed_qty * sign) < 0:
-                # delta opposes the leg's direction by magnitude -> reduce/close/flip (Task 4).
+            if existing is not None and (
+                target_signed_qty * current_signed_qty < 0
+                or abs(target_signed_qty) < abs(current_signed_qty)
+            ):
+                # NOT a pure same-side increase -> reduce/close/FLIP (Task 4). A FLIP
+                # (opposite signs) makes the delta overshoot past zero, so the old
+                # `delta_signed_qty * sign < 0` predicate came out POSITIVE and let a
+                # short leg silently grow a long position; route every non-increase here.
                 self._reconcile_opposite(
                     existing, sym, direction, target_signed_qty, mark, fee, slip, ts)
                 continue
