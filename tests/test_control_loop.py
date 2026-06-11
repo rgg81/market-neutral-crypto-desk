@@ -121,6 +121,35 @@ def test_rebalance_deltas_excludes_unchanged_overlap(make_tw):
     assert syms == {"ETH/USDT:USDT"}
 
 
+def test_rebalance_deltas_emits_changed_overlap(make_tw):
+    # Headline branch (§9 "trade only the deltas"): an OVERLAPPING leg (same symbol+direction
+    # present in both books) whose target_notional MOVED beyond the $1 epsilon must be emitted as a
+    # delta carrying the NEW notional, while a co-resident leg that did NOT move stays excluded.
+    prior = make_tw([("BTC/USDT:USDT", "long", 5000.0),
+                     ("ETH/USDT:USDT", "short", 5000.0)])
+    target = make_tw([("BTC/USDT:USDT", "long", 5002.0),   # +$2 > epsilon -> delta
+                      ("ETH/USDT:USDT", "short", 5000.0)])  # unchanged -> excluded
+    deltas = rebalance_deltas(prior, target)
+    by_sym = {leg.symbol: leg for leg in deltas}
+    assert set(by_sym) == {"BTC/USDT:USDT"}
+    assert by_sym["BTC/USDT:USDT"].target_notional == 5002.0  # carries the moved target
+
+
+@pytest.mark.parametrize(
+    "new_notional,expect_emitted",
+    [
+        (5000.5, False),  # +$0.5 <= $1 epsilon -> excluded (no churn)
+        (5002.0, True),   # +$2.0  >  $1 epsilon -> emitted
+    ],
+)
+def test_rebalance_deltas_epsilon_boundary(make_tw, new_notional, expect_emitted):
+    # The $1 no-churn epsilon is the boundary: a move <= $1 is excluded, a move > $1 is emitted.
+    prior = make_tw([("BTC/USDT:USDT", "long", 5000.0)])
+    target = make_tw([("BTC/USDT:USDT", "long", new_notional)])
+    syms = {leg.symbol for leg in rebalance_deltas(prior, target)}
+    assert syms == ({"BTC/USDT:USDT"} if expect_emitted else set())
+
+
 def test_rebalance_deltas_unwinds_removed(make_tw):
     # leg in prior but absent from target -> zero-notional unwind delta
     prior = make_tw([("BTC/USDT:USDT", "long", 5000.0),
