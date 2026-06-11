@@ -24,6 +24,7 @@ import sys
 from futures_fund.config import Settings, load_settings
 from futures_fund.contracts import (
     GeometryBundle,
+    Pair,
     SentimentBatch,
     Spread,
     TargetWeights,
@@ -32,6 +33,7 @@ from futures_fund.cycle_io import load_output, save_output
 from futures_fund.models import Cadence
 from futures_fund.neutrality import NeutralityConfig
 from futures_fund.reviewer import review_cycle
+from futures_fund.trader_io import proposals_from_book
 
 _STATE_DIR = "state"
 
@@ -82,6 +84,24 @@ def main(argv: list[str] | None = None) -> None:
     except FileNotFoundError:
         sentiment = []
 
+    # Pairs (C2): without pairs.json loaded, check_pair_pnl skips every spread and a fabricated
+    # Spread.realized_pnl passes. Load this cycle's pairs so the reviewer re-derives spread-level
+    # PnL + hedge-ratio sizing against ground truth.
+    try:
+        pairs = [
+            Pair.model_validate(p)
+            for p in load_output(args.state_dir, args.cycle, "pairs", cadence=cadence)["pairs"]
+        ]
+    except FileNotFoundError:
+        pairs = []
+
+    # Proposals (C2): without proposals fed, check_rr_after_costs returns vacuously OK (the RR>=2
+    # floor is never enforced on the real book). The persisted proposals.json is the Trader's
+    # target_notional-only hand-off and carries NO entry/stop/TP geometry, so it is intentionally
+    # NOT loaded for RR; instead reconstruct RR-capable TradeProposals from the audited book's legs
+    # + the geometries' marks via trader_io.proposals_from_book.
+    proposals = proposals_from_book(target, geometries)
+
     verdict = review_cycle(
         args.state_dir,
         args.memory_dir,
@@ -93,6 +113,8 @@ def main(argv: list[str] | None = None) -> None:
         sentiment=sentiment,
         cfg=cfg,
         returns=None,
+        pairs=pairs,
+        proposals=proposals,
     )
     # Persist under the SAME cadence root the execute boundary's `reviewer_gate_ok` reads.
     save_output(args.state_dir, args.cycle, "reviewer", verdict, cadence=cadence)
