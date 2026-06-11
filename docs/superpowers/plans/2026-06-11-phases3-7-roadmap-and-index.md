@@ -829,14 +829,14 @@ The hard-veto guard is the trickiest integration: `review_cycle` ANDs all 17 che
 
 ## Phase 6 — Self-improvement loop re-keyed on ALPHA vs BTC-beta
 
-**Depends on:** P5 reviewer verdicts + per-leg neutrality residuals; P0 journal/lessons/flat_journal/shadow substrate + `reflect_cli.py`/`promote_lesson_cli.py` templates. **Reuses:** `lessons.py`, `journal.py`, `flat_journal.py`, `shadow.py`, `hitrate.py`, `improvement.py`, `scorecard.py`, `graduation.py`, `vendor/overfit_detector.py`.
+**Depends on:** P5 reviewer verdicts + per-leg neutrality residuals; the weekly repo's journal/lessons/flat_journal/shadow substrate + `reflect_cli.py`/`promote_lesson_cli.py` templates. **Reuses:** `lessons.py`, `flat_journal.py`, `shadow.py`, `hitrate.py`, `improvement.py`, `scorecard.py`, `graduation.py`, `vendor/overfit_detector.py`. **Ported here (not pre-existing in this repo):** `journal.py` — the two-phase machinery is lifted/adapted faithfully from the weekly `futures_fund/journal.py` (verify+merge, exactly as Phase 3 did for `scheduling.py`) and re-keyed on `(cycle, symbol, direction)`. (The remaining `lessons.py`/`flat_journal.py`/`shadow.py`/`hitrate.py`/`improvement.py`/`scorecard.py` are likewise ported by their respective tasks when first needed.)
 
 **Goal:** Re-key lessons/journal on alpha (return net of BTC-beta) rather than raw return; add the new lesson dimensions; keep the DSR-gated promotion; wire the self-healing code loop; re-point the improvement panel at neutral KPIs (including `reviewer_veto_rate` and `alpha_sharpe_trend`).
 
 ### Task 6.1: Alpha-vs-beta journal outcome accessor
 
 **Files:**
-- Modify: `futures_fund/journal.py`
+- Create: `futures_fund/journal.py` (port/adapt from the weekly `futures_fund/journal.py`, verify+merge — re-keyed on `(cycle, symbol, direction)`; the file does not exist in this repo at the Phase 6 base commit)
 - Test: `tests/test_journal_alpha.py`
 
 `Decision` is `ConfigDict(extra="allow")`, so the new fields round-trip already. To make this a **genuine TDD step with a real behavioral assertion** (not a trivially-true `extra="allow"` echo), the production change is a **typed accessor** `alpha_outcome(decision) -> AlphaOutcome` that reads + validates the six alpha-vs-beta fields and raises on a missing/ill-typed field — the test below fails until that accessor exists.
@@ -855,7 +855,7 @@ The hard-veto guard is the trickiest integration: `review_cycle` ANDs all 17 che
       assert ao.sentiment_helped is False
   ```
 - [ ] **Step 2: Run it (expect FAIL).** `uv run pytest tests/test_journal_alpha.py -x` (expect FAIL: `ImportError: alpha_outcome`).
-- [ ] **Step 3: Minimal implementation.** Add an `AlphaOutcome` pydantic model (the six fields) and `alpha_outcome(decision) -> AlphaOutcome` that validates the decision's outcome dict. `patch_outcome` already merges via `extra="allow"`; the accessor is the new behavior that would fail without code. (DRY — reuse the existing two-phase machinery for storage.)
+- [ ] **Step 3: Minimal implementation.** Port the two-phase storage machinery (`Decision`, `append_decision`, `patch_outcome`, `read_all_decisions`, `journal_file`) from the weekly `futures_fund/journal.py` (verify+merge, re-keyed on `(cycle, symbol, direction)`), then add an `AlphaOutcome` pydantic model (the six fields) and `alpha_outcome(decision) -> AlphaOutcome` that validates the decision's outcome dict. `patch_outcome` merges via `extra="allow"`; the accessor is the new behavior that would fail without code. (DRY — lift the weekly two-phase machinery for storage rather than re-inventing it; keep the public surface minimal — no speculative readers beyond what tests/consumers exercise.)
 - [ ] **Step 4: Run tests (expect PASS).** `uv run pytest tests/test_journal_alpha.py -x` (expect PASS).
 - [ ] **Step 5: Commit.** `git commit -am "Phase 6: typed alpha_outcome accessor over journal outcome fields (alpha vs BTC-beta)"`
 

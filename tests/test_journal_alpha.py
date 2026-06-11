@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
@@ -7,6 +9,7 @@ from futures_fund.journal import (
     AlphaOutcome,
     alpha_outcome,
     append_decision,
+    journal_file,
     patch_outcome,
     read_all_decisions,
 )
@@ -109,3 +112,21 @@ def test_append_decision_idempotent_per_key(tmp_path):
         if r.get("cycle") == 4 and r.get("symbol") == "XRP/USDT:USDT"
     ]
     assert len(recs) == 1
+
+
+def test_journal_file_is_monthly_and_holds_the_append(tmp_path):
+    # journal_file names a monthly jsonl under <memory_dir>/episodic/ keyed by ts year-month,
+    # and append_decision routes the record into exactly that file.
+    ts = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+    path = journal_file(tmp_path, ts)
+    assert path == tmp_path / "episodic" / "journal-2026-06.jsonl"
+    append_decision(
+        tmp_path,
+        cycle=5,
+        symbol="ADA/USDT:USDT",
+        direction="long",
+        payload=_payload(),
+        ts=ts,
+    )
+    assert path.exists()
+    assert '"symbol":"ADA/USDT:USDT"' in path.read_text()

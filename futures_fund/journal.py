@@ -122,11 +122,6 @@ def read_all_decisions(memory_dir) -> list[dict]:
     return out
 
 
-def read_open_decisions(memory_dir) -> list[dict]:
-    """Decisions without a realized outcome yet (no alpha_return patched)."""
-    return [r for r in read_all_decisions(memory_dir) if r.get("alpha_return") is None]
-
-
 def _find(memory_dir, cycle: int, symbol: str, direction: str) -> dict | None:
     for d in read_all_decisions(memory_dir):
         if (
