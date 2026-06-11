@@ -147,7 +147,11 @@ def both_sides_deployment_rate(state_dir, last_n: int = 10) -> float:
     a "deployed" but long-only book is not neutral. (spec §12/§19)
     """
     floor = NeutralityConfig().deployment_floor
-    dirs = [d for d in _cycle_dirs(state_dir) if (d / "target_weights.json").exists()][-last_n:]
+    # Window on ALL cycle dirs first, THEN look for the artifact — so a cycle that ran but emitted
+    # no `target_weights.json` (a halt / all-cash ratchet, the very failure this KPI exists to
+    # catch) stays in the denominator and lands as "not both-sides-deployed" rather than being
+    # silently dropped. (See docstring + roadmap line 884: "denominator: last_n cycles present".)
+    dirs = _cycle_dirs(state_dir)[-last_n:]
     n = len(dirs)
     if n == 0:
         return 0.0

@@ -130,6 +130,19 @@ def test_both_sides_deployment_rate_requires_both_sides(tmp_path):
     assert both_sides_deployment_rate(tmp_path, last_n=4) == 0.5
 
 
+def test_both_sides_deployment_rate_counts_missing_artifact_in_denominator(tmp_path):
+    # A cycle that RAN but emitted no target_weights.json (a halt / all-cash ratchet — the very
+    # failure this KPI exists to catch) must stay in the denominator and land as NOT
+    # both-sides-deployed, never be silently dropped. (docstring + roadmap line 884.)
+    # cycle 1: both deployed -> counts; cycle 2: halt, only a report.json, NO target_weights ->
+    # in denominator, NOT in numerator. 1/2 = 0.5 (NOT 1/1 = 1.0 if cycle 2 were dropped).
+    save_output(tmp_path, 1, "target_weights", _target_weights(long_frac=0.95, short_frac=0.92),
+                cadence="weekly")
+    save_output(tmp_path, 2, "report", _report(cycle=2, executed=[], triggers=[]),
+                cadence="weekly")
+    assert both_sides_deployment_rate(tmp_path, last_n=4) == 0.5
+
+
 # --------------------------------------------------------------------------------------------------
 # pair_survival_rate — cointegrated_at_retest / total_retested (ADF p < 0.05 at re-test)
 # --------------------------------------------------------------------------------------------------
