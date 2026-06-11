@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from futures_fund.account import CostInputs, PaperAccount, Position
+from futures_fund.costs import count_funding_events
 
 
 def _pos(symbol="ETH/USDT:USDT", direction="long", qty=2.0, entry=2000.0):
@@ -161,3 +162,46 @@ def test_apply_fills_opposite_target_flips_side():
     assert pos.direction == "short"
     assert abs(pos.qty - 2.0) < 1e-9               # |−2.0| target
     assert pos.entry_price == 2000.0
+
+
+def test_settle_funding_short_positive_rate_is_a_credit_and_advances_clock():
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)
+    prev = datetime(2026, 6, 10, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 6, 11, 0, 0, tzinfo=UTC)       # 24h -> 3 settlements at 8h
+    assert count_funding_events(prev, now, 8) == 3
+    marks = {"ETH/USDT:USDT": 2000.0}
+    acct.settle_funding(prev, now, {"ETH/USDT:USDT": 0.0005}, {"ETH/USDT:USDT": 8}, marks)
+
+    # short + positive rate RECEIVES: realized_funding = -(-1)*2000*2*0.0005 = +2.0 per event
+    expected = 3 * 2.0
+    assert abs(acct.positions["ETH/USDT:USDT"].accrued_funding - expected) < 1e-9
+    assert abs(acct.cash - (20_000.0 + expected)) < 1e-9
+    assert abs(acct.funding_received - expected) < 1e-9
+    assert acct.funding_paid == 0.0
+    assert acct.last_funding_ts == now             # the funding clock advanced
+
+
+def test_settle_funding_long_positive_rate_is_a_debit():
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="long", qty=2.0, entry=2000.0)
+    prev = datetime(2026, 6, 10, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 6, 10, 8, 1, tzinfo=UTC)       # 1 settlement at hour 8
+    acct.settle_funding(prev, now, {"ETH/USDT:USDT": 0.0005}, {"ETH/USDT:USDT": 8},
+                        {"ETH/USDT:USDT": 2000.0})
+    assert abs(acct.positions["ETH/USDT:USDT"].accrued_funding - (-2.0)) < 1e-9
+    assert abs(acct.cash - (20_000.0 - 2.0)) < 1e-9
+    assert acct.funding_received == 0.0
+    assert abs(acct.funding_paid - 2.0) < 1e-9
+
+
+def test_settle_funding_no_events_still_advances_clock():
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)
+    prev = datetime(2026, 6, 10, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 6, 10, 1, 0, tzinfo=UTC)       # < 8h -> 0 settlements
+    acct.settle_funding(prev, now, {"ETH/USDT:USDT": 0.0005}, {"ETH/USDT:USDT": 8},
+                        {"ETH/USDT:USDT": 2000.0})
+    assert acct.cash == 20_000.0
+    assert acct.positions["ETH/USDT:USDT"].accrued_funding == 0.0
+    assert acct.last_funding_ts == now             # clock advances even with 0 events

@@ -21,7 +21,8 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
-from futures_fund.costs import trade_fee
+from futures_fund.costs import count_funding_events, trade_fee
+from futures_fund.funding_intervals import clamp_funding_rate, realized_funding
 from futures_fund.models import Direction
 from futures_fund.slippage import estimate_slippage
 
@@ -92,6 +93,42 @@ class PaperAccount(BaseModel):
     def equity(self, marks: dict[str, float]) -> float:
         """cash + sum unrealized PnL (skips symbols missing a mark)."""
         return self.cash + sum(self.mark_to_market(marks).values())
+
+    def settle_funding(
+        self,
+        prev_ts: datetime,
+        now: datetime,
+        funding_by_symbol: dict[str, float],
+        intervals: dict[str, int],
+        marks: dict[str, float],
+    ) -> None:
+        """Settle funding for every held position over (prev_ts, now], then ADVANCE the funding
+        clock to `now`.
+
+        Per symbol: n = count_funding_events(prev_ts, now, interval); clamp the rate; credit
+        realized_funding(0, mark, qty, clamped_rate, direction) * n to cash (BALANCE-credit
+        perspective: a SHORT with a positive rate RECEIVES). Accumulate signed per-position
+        accrued_funding and split the total into funding_received (+) / funding_paid (|-|).
+        `last_funding_ts` always moves to `now` (even with 0 events) so the next cycle's window
+        starts here — the account, not the cycle-collided equity series, is the funding clock."""
+        for sym, pos in self.positions.items():
+            mark = marks.get(sym)
+            if mark is None:
+                continue
+            interval = int(intervals.get(sym, 8))
+            n = count_funding_events(prev_ts, now, interval)
+            if n <= 0:
+                continue
+            rate = clamp_funding_rate(sym, funding_by_symbol.get(sym, 0.0))
+            per_event = realized_funding(0.0, mark, pos.qty, rate, pos.direction)
+            settled = per_event * n
+            pos.accrued_funding += settled
+            self.cash += settled
+            if settled >= 0.0:
+                self.funding_received += settled
+            else:
+                self.funding_paid += -settled
+        self.last_funding_ts = now
 
     def apply_fills(
         self,
