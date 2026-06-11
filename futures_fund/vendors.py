@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import html
-import json
 import re
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
-from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -258,37 +256,3 @@ def fetch_fear_greed(client, limit: int = 1) -> FearGreed:
     r = client.get(FNG_URL, params={"limit": limit, "format": "json"})
     r.raise_for_status()
     return parse_fear_greed(r.json())
-
-
-def fetch_fred_series(client, series_id: str, api_key: str, observation_start: str | None = None
-                      ) -> list[tuple[str, float]]:
-    params = {"series_id": series_id, "api_key": api_key, "file_type": "json", "sort_order": "asc"}
-    if observation_start:
-        params["observation_start"] = observation_start
-    r = client.get(FRED_URL, params=params)
-    r.raise_for_status()
-    return parse_fred(r.json())
-
-
-def archive_jsonl(path, records: list[dict], key: str = "timestamp") -> int:
-    """Append `records` to a JSONL file, deduping by `key` against existing rows.
-    Returns the number of new rows written. Used to self-archive the 30-day-limited
-    OI / long-short endpoints into durable history (spec §10)."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    seen: set = set()
-    if p.exists():
-        for line in p.read_text().splitlines():
-            if line.strip():
-                seen.add(json.loads(line).get(key))
-    written = 0
-    with p.open("a") as f:
-        for rec in records:
-            k = rec.get(key)
-            if k is not None and k in seen:
-                continue
-            f.write(json.dumps(rec, default=str) + "\n")
-            if k is not None:
-                seen.add(k)
-            written += 1
-    return written
