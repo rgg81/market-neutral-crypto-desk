@@ -8,6 +8,8 @@ from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt, Targe
 from futures_fund.control_loop import (
     cadence_cycle_root,
     cadence_due,
+    drift_exceeded,
+    neutrality_breached,
     rebalance_deltas,
     weekly_selection,
 )
@@ -162,6 +164,49 @@ def test_rebalance_deltas_unwinds_removed(make_tw):
     assert unwind.direction == "short"
     assert unwind.target_notional == 0.0
     assert unwind.weight == 0.0
+
+
+def _tw_with_residuals(*, dollar_residual_frac: float, beta_residual: float) -> TargetWeights:
+    """A minimal `TargetWeights` whose neutrality residual fields carry the supplied values; the
+    deployment/leg scaffolding is inert for `neutrality_breached` (it keys only on residuals)."""
+    return TargetWeights(
+        legs=[],
+        dollar_residual=0.0,
+        dollar_residual_frac=dollar_residual_frac,
+        beta_residual=beta_residual,
+        gross_long=0.0,
+        gross_short=0.0,
+        deploy_long_frac=0.0,
+        deploy_short_frac=0.0,
+        gross_notional=0.0,
+        as_of_ts=NOW,
+    )
+
+
+def test_drift_exceeded():
+    # 0.5 vs 0.4 -> 25% drift > 20% band -> True
+    assert drift_exceeded(0.5, 0.4, drift_band=0.20) is True
+    # 0.45 vs 0.4 -> 12.5% drift <= 20% band -> False
+    assert drift_exceeded(0.45, 0.4, drift_band=0.20) is False
+    # target==0 -> any nonzero current is a breach; zero current is in-band
+    assert drift_exceeded(0.1, 0.0, drift_band=0.20) is True
+    assert drift_exceeded(0.0, 0.0, drift_band=0.20) is False
+
+
+def test_neutrality_breached():
+    cfg = NeutralityConfig()  # dollar_band=0.03, beta_band=0.05
+    # in-band on both axes -> not breached
+    assert neutrality_breached(
+        _tw_with_residuals(dollar_residual_frac=0.02, beta_residual=0.04), cfg
+    ) is False
+    # dollar residual frac over the dollar band -> breached
+    assert neutrality_breached(
+        _tw_with_residuals(dollar_residual_frac=0.04, beta_residual=0.0), cfg
+    ) is True
+    # |beta residual| over the beta band (negative side) -> breached
+    assert neutrality_breached(
+        _tw_with_residuals(dollar_residual_frac=0.0, beta_residual=-0.06), cfg
+    ) is True
 
 
 @pytest.mark.parametrize("cadence,tf", [("weekly", 10080), ("daily", 1440)])

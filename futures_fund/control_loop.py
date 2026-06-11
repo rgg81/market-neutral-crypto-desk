@@ -93,3 +93,28 @@ def rebalance_deltas(prior: TargetWeights, target: TargetWeights) -> list[Weight
         if (sym, d) not in tgt_keys:
             out.append(p.model_copy(update={"target_notional": 0.0, "weight": 0.0}))
     return out
+
+
+def drift_exceeded(
+    current_weight: float, target_weight: float, *, drift_band: float = 0.20
+) -> bool:
+    """Daily no-trade-band gate (§9): is a leg's weight far enough from target to warrant a trade?
+
+    Returns True when the relative drift `|current - target| / |target|` exceeds `drift_band`. When
+    the target weight is exactly 0.0 (the leg should be flat) any nonzero current weight is itself a
+    breach, so the residual exposure gets traded out."""
+    if target_weight == 0.0:
+        return current_weight != 0.0
+    return abs(current_weight - target_weight) / abs(target_weight) > drift_band
+
+
+def neutrality_breached(target: TargetWeights, cfg: NeutralityConfig) -> bool:
+    """Neutrality-breach trigger (§9): does the book violate either neutrality band?
+
+    True when the dollar residual fraction exceeds `cfg.dollar_band` OR the absolute beta residual
+    exceeds `cfg.beta_band` — either condition forces a daily rebalance trade even if every leg is
+    individually inside its drift band, so the book never drifts off dollar/beta neutral."""
+    return (
+        target.dollar_residual_frac > cfg.dollar_band
+        or abs(target.beta_residual) > cfg.beta_band
+    )
