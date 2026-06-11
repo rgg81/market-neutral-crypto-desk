@@ -739,6 +739,34 @@ def test_sentiment_cap_respected(make_tw):
     assert cap_bad.ok is False
 
 
+def test_sentiment_cap_production_path_rederives_from_ground_truth(make_tw):
+    # PRODUCTION path (the live ladder): only the FINAL book is available (no before/after delta),
+    # so the cap is re-derived from ground-truth sentiment carried on the geometries via
+    # conviction_tilt — the guardian must be able to FIRE on a single live book, not be trivially
+    # satisfied by a zero before==after delta.
+    target = make_tw([("ETH/USDT:USDT", "long", 5000.0)])
+
+    # A within-cap geometry (κ·s·conf = 0.5·0.5·0.5 = 0.125 <= 0.25) passes.
+    geo_ok = [CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.0, adv_usd=1e9,
+                           sentiment_score=0.5, sentiment_conf=0.5)]
+    cap_ok = next(
+        c for c in check_sentiment([], target, target, geo_ok)
+        if c.name == "sentiment_cap_respected"
+    )
+    assert cap_ok.ok is True
+
+    # A geometry whose conviction tilt would exceed the cap is caught even on a single book when
+    # the cap is loosened ABOVE the conviction_tilt clamp (so the prescribed tilt can breach it).
+    geo_big = [CoinGeometry(symbol="ETH/USDT:USDT", mark=3000.0, beta_btc=1.0, adv_usd=1e9,
+                            sentiment_score=1.0, sentiment_conf=1.0)]
+    cap_bad = next(
+        c for c in check_sentiment([], target, target, geo_big, cap=0.10, kappa=0.5)
+        if c.name == "sentiment_cap_respected"
+    )
+    # κ·s·conf = 0.5·1·1 = 0.5 prescribed-tilt fraction > 0.10 cap => fires on the live book.
+    assert cap_bad.ok is False
+
+
 # --- name 16: sentiment_point_in_time -----------------------------------------------------
 
 def test_sentiment_sources_pit(make_tw):

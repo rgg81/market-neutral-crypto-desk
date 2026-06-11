@@ -29,6 +29,7 @@ from futures_fund.neutrality import (
 )
 from futures_fund.risk_gate import MIN_RR, _reward_risk
 from futures_fund.sentiment_ingest import level_to_s, s_to_level, validate_point_in_time
+from futures_fund.sleeves.sentiment import conviction_tilt
 
 # The every-cycle Adversarial Code & Calc Reviewer (§10 Guardian, §12). These checks (canonical
 # names 1-6) re-derive the §5/§8 neutrality/hedge/deployment/cap numbers from GROUND TRUTH — the
@@ -577,7 +578,8 @@ def check_exchange_filters(
 # market metadata) — the same NEVER-trust-the-artifact discipline as names 1-13. `check_sentiment`
 # emits THREE checks (range + cap + point-in-time).
 
-SENTIMENT_CAP = 0.25  # §7.2 conviction-tilt cap: |Δw| <= cap*|w| between target_before/after
+SENTIMENT_CAP = 0.25    # §7.2 conviction-tilt cap: |Δw| <= cap*|w|
+SENTIMENT_KAPPA = 0.5   # §7.2 conviction-tilt strength κ (matches config `sentiment.kappa`)
 
 
 def _leg_weights(target: TargetWeights) -> dict[str, float]:
@@ -590,29 +592,61 @@ def _leg_weights(target: TargetWeights) -> dict[str, float]:
     return out
 
 
+def _sentiment_by_symbol(
+    geometries: list[CoinGeometry], sentiment: list[SentimentReport]
+) -> dict[str, tuple[float, float]]:
+    """Ground-truth (score, conf) per symbol for the conviction-tilt re-derivation.
+
+    Geometry is the constructor's first-class sentiment carrier (§7.2: `sentiment_score`/
+    `sentiment_conf` are the decayed, fail-soft figures the optimizer actually tilted on), so it
+    takes precedence. A `SentimentReport` (`s`*`confidence`) backfills any symbol with no geometry
+    so the reviewer still has a ground-truth read. Symbols absent from both map to neutral (0, 0).
+    """
+    out: dict[str, tuple[float, float]] = {}
+    for r in sentiment:
+        out[r.symbol] = (r.s, r.confidence)
+    for g in geometries:
+        out[g.symbol] = (g.sentiment_score, g.sentiment_conf)
+    return out
+
+
 def check_sentiment(
     sentiment: list[SentimentReport],
     target_before: TargetWeights,
     target_after: TargetWeights,
+    geometries: list[CoinGeometry] | None = None,
     *,
     cap: float = SENTIMENT_CAP,
+    kappa: float = SENTIMENT_KAPPA,
 ) -> list[ReviewerCheck]:
     """Re-derive the §7 sentiment discipline from ground truth and emit THREE checks (canonical
     names 14 + 15 + 16). The reviewer NEVER trusts a report's stated figure — it round-trips the
-    `level<->s` mapping itself, recomputes the tilt magnitude from the before/after books, and
+    `level<->s` mapping itself, re-applies the conviction-tilt math from ground-truth sentiment, and
     re-reads every source timestamp.
 
     - `sentiment_range`: every report's stated `s` must round-trip its `level` via the §7.1 ordinal
       mapping (`s_to_level(s) == level` AND `s == level_to_s(level)` within tolerance). A report
       whose numeric score contradicts its ordinal level (e.g. level "positive" but s -1.0) is
       caught.
-    - `sentiment_cap_respected`: the per-symbol tilt the optimizer applied is `|w_after - w_before|`
-      (signed equity-notional weights re-derived from the legs); it must be `<= cap*|w_before|` for
-      every symbol. A tilt that grows a leg beyond the §7.2 cap (default 25%) is caught — this is
-      the hard-veto the gate keys off when a sentiment tilt over-sizes a leg.
+    - `sentiment_cap_respected`: the §7.2 invariant `|dw| <= cap*|w|` is RE-DERIVED from ground
+      truth, not read off an empirical book delta that is zero in production. For every leg the
+      reviewer recomputes the conviction tilt the symbol's ground-truth sentiment (score, conf, from
+      `geometries`, the first-class sentiment carrier the optimizer tilts on, §7.2) WOULD prescribe.
+      In production (only the final book is available) it checks the UN-clamped tilt fraction
+      `|kappa*s*conf|` against `cap`: `conviction_tilt` already clamps `|dw|` to `cap*|w|`, so
+      comparing the clamped delta to the cap is tautological. Checking the raw fraction instead
+      fires when the ground-truth read over-sizes a leg and only the optimizer's silent clamp kept
+      it legal. When the actual pre-tilt book (`target_before`) IS supplied it ALSO requires the
+      EMPIRICAL per-symbol delta `|w_after - w_before|` to (a) stay within `cap*|w_before|` AND
+      (b) match the conviction-tilt re-derivation within tolerance, so a tilt the artifact's own
+      book shows but that contradicts the ground-truth sentiment math is caught, not just one that
+      over-sizes a leg. This is the hard-veto the gate keys off; because it keys off ground-truth
+      sentiment it can fire on the live single-book ladder, not only on an explicit before/after
+      audit.
     - `sentiment_point_in_time`: every `SentimentSource.published_ts` must be strictly BEFORE its
       report's `as_of_ts` (`sentiment_ingest.validate_point_in_time`). A source published at/after
       the decision anchor (post-decision leakage) is caught."""
+    geometries = geometries or []
     # --- name 14: range (level <-> s round-trip) ---
     range_ok = True
     worst_sym = ""
@@ -634,22 +668,54 @@ def check_sentiment(
         ),
     )
 
-    # --- name 15: cap (|Δw| <= cap*|w_before|) ---
+    # --- name 15: cap (§7.2 |Δw| <= cap·|w|, re-derived from ground-truth sentiment) ---
+    senti = _sentiment_by_symbol(geometries, sentiment)
     before_w = _leg_weights(target_before)
     after_w = _leg_weights(target_after)
+    have_before = target_before is not target_after  # an actual pre-tilt book was supplied
     cap_ok = True
     worst_delta = 0.0
     worst_cap_sym = ""
     for sym in set(before_w) | set(after_w):
-        wb = before_w.get(sym, 0.0)
-        wa = after_w.get(sym, 0.0)
-        delta = abs(wa - wb)
-        allowed = cap * abs(wb)
-        if delta > allowed + 1e-9:
-            cap_ok = False
-        if delta > worst_delta:
-            worst_delta = delta
-            worst_cap_sym = sym
+        s_score, s_conf = senti.get(sym, (0.0, 0.0))
+        has_ground_truth = sym in senti
+        if have_before:
+            # An actual pre-tilt book was supplied: the EMPIRICAL per-symbol delta must respect the
+            # §7.2 cap (the load-bearing veto). When ground-truth sentiment for this symbol is also
+            # available, additionally require that empirical delta to MATCH the conviction-tilt
+            # re-derivation — so a tilt the artifact's own book shows but that contradicts the
+            # ground-truth sentiment math is caught, not just one that over-sizes a leg.
+            wb = before_w.get(sym, 0.0)
+            wa = after_w.get(sym, 0.0)
+            empirical_delta = abs(wa - wb)
+            allowed = cap * abs(wb)
+            cap_breach = empirical_delta > allowed + 1e-9
+            mismatch = False
+            if has_ground_truth:
+                expected_after = conviction_tilt(wb, s_score, s_conf, kappa=kappa, cap=cap)
+                prescribed_delta = abs(expected_after - wb)
+                mismatch = abs(empirical_delta - prescribed_delta) > 1e-6 + 1e-6 * abs(wb)
+            if cap_breach or mismatch:
+                cap_ok = False
+            if empirical_delta > worst_delta:
+                worst_delta = empirical_delta
+                worst_cap_sym = sym
+        else:
+            # Production path: only the final book is available, so re-derive the §7.2 tilt the
+            # ground-truth sentiment WOULD prescribe and verify its RAW (un-clamped) magnitude does
+            # not exceed the cap. `conviction_tilt` itself clamps |Δw| to cap·|w|, so checking the
+            # clamped delta against the cap is tautological (the bug this fix closes) — instead we
+            # compute the UNCLAMPED tilt fraction κ·s·conf and require |κ·s·conf| <= cap. A
+            # ground-truth read whose prescribed tilt over-sizes a leg (relying on the optimizer's
+            # silent clamp) FIRES on the live book, exactly the hard-veto the gate keys off.
+            w = after_w.get(sym, 0.0)
+            raw_frac = abs(kappa * s_score * s_conf)   # un-clamped |Δw|/|w| (sign drops out of |.|)
+            delta = raw_frac * abs(w)
+            if raw_frac > cap + 1e-9:
+                cap_ok = False
+            if delta > worst_delta:
+                worst_delta = delta
+                worst_cap_sym = sym
     cap_check = ReviewerCheck(
         name="sentiment_cap_respected",
         ok=cap_ok,
@@ -657,8 +723,8 @@ def check_sentiment(
         actual=worst_delta,
         tolerance=1e-9,
         detail=(
-            f"worst |w_after - w_before| = {worst_delta:.2f} ({worst_cap_sym}) "
-            f"vs cap {cap}·|w_before|"
+            f"worst sentiment |Δw| = {worst_delta:.4f} ({worst_cap_sym}) vs cap {cap}·|w| "
+            f"(re-derived via conviction_tilt from ground-truth sentiment)"
         ),
     )
 
@@ -734,9 +800,11 @@ def review_cycle(
     the failed checks (`[c.name for c in checks if not c.ok]`). This is the hard-veto verdict the
     execute step keys off via `reviewer_gate_ok`.
 
-    The sentiment cap compares `target_before` vs `target_after` (the conviction-tilt before/after
-    books, §7.3 ordering invariant); if not supplied they default to `target` (no tilt => cap
-    trivially respected)."""
+    The sentiment cap re-derives the §7.2 invariant from ground-truth sentiment (carried on
+    `geometries`) via `conviction_tilt`. When the actual pre-tilt book (`target_before`) /
+    post-tilt book (`target_after`) are supplied it additionally audits the empirical before/after
+    delta (§7.3 ordering invariant); if not supplied they default to `target` and the check still
+    fires on the live single book by re-deriving the prescribed tilt from ground truth."""
     before = target_before if target_before is not None else target
     after = target_after if target_after is not None else target
     checks: list[ReviewerCheck] = [
@@ -750,7 +818,7 @@ def review_cycle(
         check_rr_after_costs(proposals or []),                   # 11
         check_sharpe_annualization(cadence),                     # 12
         *check_exchange_filters(target, geometries),             # 13
-        *check_sentiment(sentiment, before, after),              # 14 + 15 + 16
+        *check_sentiment(sentiment, before, after, geometries),  # 14 + 15 + 16
         check_crypto_only(geometries),                           # 17
     ]
     mismatches = [c.name for c in checks if not c.ok]
