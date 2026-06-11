@@ -82,7 +82,7 @@ def test_all_new_dimensions_are_honored_under_polarity_quota(tmp_path):
     for dim in NEW_DIMENSIONS:
         got = retrieve_lessons(tmp_path, now=now, regime="x", query_tags=[dim], k=5)
         # the matching dimension lesson surfaces to the top
-        assert got[0].dimension == dim or got[0].polarity == "validated"
+        assert got[0].dimension == dim or got[0].state == "validated"
         assert any(lz.dimension == dim for lz in got), (dim, [lz.text for lz in got])
         # quota stays two-sided
         assert any(lz.polarity == "enabling" for lz in got)
