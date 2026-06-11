@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import numpy as np
 import pytest
 
-from futures_fund.walk_forward import validate_sleeve_param, walk_forward_splits
+from futures_fund.walk_forward import (
+    load_pit_returns,
+    validate,
+    validate_sleeve_param,
+    walk_forward_splits,
+)
 
 
 def test_walk_forward_splits_anchored_expanding():
@@ -99,3 +106,95 @@ def test_validate_sleeve_param_empty_fails():
     res = validate_sleeve_param([], num_trials=4, periods_per_year=365.0)
     assert res["passed"] is False
     assert res["oos_sharpe"] == 0.0
+
+
+# --- Task 7.2: point-in-time walk-forward harness -------------------------------------------
+
+def _binance_vision_klines_path(root, symbol: str, day: str, interval: str = "1d"):
+    """data.binance.vision USDM-futures daily-klines archive layout for `symbol` on `day`."""
+    sym = symbol.split("/")[0] + "USDT"  # "NEWCOIN/USDT:USDT" -> "NEWCOINUSDT"
+    d = root / "data" / "futures" / "um" / "daily" / "klines" / sym / interval
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{sym}-{interval}-{day}.csv"
+
+
+def _write_kline_row(path, open_time_ms: int, close_price: float) -> None:
+    # Binance kline CSV columns: open_time,open,high,low,close,volume,close_time,...
+    o = close_price
+    row = f"{open_time_ms},{o},{o},{o},{close_price},1.0,{open_time_ms + 86_400_000},0,0,0,0,0\n"
+    with open(path, "a") as fh:
+        fh.write(row)
+
+
+@pytest.fixture
+def archive_fixture(tmp_path):
+    """A data.binance.vision-shaped offline archive (no network).
+
+    BTCUSDT is listed from 2024-12-01 (BEFORE the IS window start 2025-01-01) -> usable.
+    NEWCOINUSDT's FIRST archive day is 2025-02-01 (AFTER start) -> survivorship-excluded.
+    """
+    root = tmp_path / "binance-vision"
+    base_ms = int(datetime(2024, 12, 1, tzinfo=UTC).timestamp() * 1000)
+    # BTC: 92 daily candles from 2024-12-01 (well before the window) with a gentle drift.
+    for i in range(92):
+        day = (datetime(2024, 12, 1, tzinfo=UTC) + timedelta(days=i)).strftime("%Y-%m-%d")
+        p = _binance_vision_klines_path(root, "BTC/USDT:USDT", day)
+        _write_kline_row(p, base_ms + i * 86_400_000, 100.0 * (1.001 ** i))
+    # NEWCOIN: first archive day 2025-02-01 (AFTER the IS window start 2025-01-01).
+    nb_ms = int(datetime(2025, 2, 1, tzinfo=UTC).timestamp() * 1000)
+    for i in range(28):
+        day = (datetime(2025, 2, 1, tzinfo=UTC) + timedelta(days=i)).strftime("%Y-%m-%d")
+        p = _binance_vision_klines_path(root, "NEWCOIN/USDT:USDT", day)
+        _write_kline_row(p, nb_ms + i * 86_400_000, 50.0 * (1.001 ** i))
+    return root
+
+
+def test_walk_forward_inputs_are_point_in_time(archive_fixture):
+    # symbol "NEWCOIN" first archive date is AFTER the IS window start -> excluded (no look-ahead)
+    rets = load_pit_returns("NEWCOIN/USDT:USDT", start="2025-01-01", end="2025-03-01",
+                            archive_root=archive_fixture)
+    assert rets is None  # survivorship caveat: later-listed name excluded from the window
+
+
+def test_load_pit_returns_listed_before_start_is_usable(archive_fixture):
+    pit = load_pit_returns("BTC/USDT:USDT", start="2025-01-01", end="2025-03-01",
+                           archive_root=archive_fixture)
+    assert pit is not None
+    # PIT provenance tag: the returns carry their archive source date so the test can assert it.
+    assert pit["archive_source"] == "data.binance.vision"
+    assert pit["first_archive_date"] == "2024-12-01"  # listed before the window start
+    assert pit["first_archive_date"] < "2025-01-01"
+    # returns are confined to the [start, end) window and are non-empty
+    rets = pit["returns"]
+    assert isinstance(rets, list) and len(rets) > 10
+    assert all(isinstance(r, float) for r in rets)
+
+
+def test_validate_rejects_in_sample_only_winner():
+    # Two params. "lucky" wins IN-SAMPLE on a single seed-specific spike but has NO OOS edge;
+    # "robust" has a genuine positive drift that persists out-of-sample.
+    rng = np.random.default_rng(7)
+    n = 240
+    robust = list(rng.normal(0.02, 0.01, n))            # persistent edge -> survives OOS
+    # "lucky" = pure noise except a huge in-sample-only spike near the front (train region).
+    lucky = list(rng.normal(0.0, 0.01, n))
+    for j in range(5):
+        lucky[j] += 0.5                                  # giant IS spike, nothing OOS
+
+    grid = ["robust", "lucky"]
+    returns_by_param = {"robust": robust, "lucky": lucky}
+    res = validate(grid, returns_by_param, periods_per_year=365.0)
+
+    # ranks by OOS, not IS: the in-sample-only winner is never promoted
+    assert res["winner"] == "robust"
+    assert res["verdict"] == "promote"
+    assert res["num_trials"] == len(grid)               # DSR deflates for the whole grid
+
+
+def test_validate_rejects_when_no_param_has_oos_edge():
+    rng = np.random.default_rng(11)
+    grid = ["a", "b", "c"]
+    returns_by_param = {p: list(rng.normal(0.0, 0.02, 240)) for p in grid}  # all noise
+    res = validate(grid, returns_by_param, periods_per_year=365.0)
+    assert res["verdict"] == "reject"
+    assert res["num_trials"] == 3
