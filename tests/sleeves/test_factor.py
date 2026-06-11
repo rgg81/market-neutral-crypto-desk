@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from futures_fund.contracts import CoinGeometry
-from futures_fund.sleeves.factor import rank_factor
+from futures_fund.sleeves.factor import factor_signal, rank_factor
 
 _NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
@@ -32,3 +32,42 @@ def test_rank_factor_low_vol_prefers_low_realized_vol():
     geos = [_geo("A/USDT:USDT", vol=0.5), _geo("B/USDT:USDT", vol=0.1)]
     ranked = rank_factor(geos, factor="low_vol")
     assert ranked[0][0] == "B/USDT:USDT"          # lower vol ranks best
+
+
+def test_factor_signal_tercile_long_short_combined():
+    # 6 names with monotone momentum; tercile (1/3 of 6 = 2) -> 2 longs (top) + 2 shorts (bottom)
+    geos = [_geo(f"{c}/USDT:USDT", mom=m, vol=0.1)
+            for c, m in zip("ABCDEF", [0.5, 0.4, 0.1, -0.1, -0.4, -0.5], strict=True)]
+    sig = factor_signal(geos, risk_budget_frac=0.25, now=_NOW,
+                        factors=["momentum"], tercile=1 / 3, weighting="equal")
+    assert sig.sleeve == "factor"
+    longs = {t.symbol for t in sig.tilts if t.direction == "long"}
+    shorts = {t.symbol for t in sig.tilts if t.direction == "short"}
+    assert longs == {"A/USDT:USDT", "B/USDT:USDT"}
+    assert shorts == {"E/USDT:USDT", "F/USDT:USDT"}
+
+
+def test_factor_signal_inverse_vol_weights_lower_vol_heavier():
+    geos = [_geo("A/USDT:USDT", mom=0.5, vol=0.1),   # low vol -> heavier
+            _geo("B/USDT:USDT", mom=0.4, vol=0.4),   # high vol -> lighter
+            _geo("C/USDT:USDT", mom=-0.4, vol=0.2),
+            _geo("D/USDT:USDT", mom=-0.5, vol=0.2)]
+    sig = factor_signal(geos, risk_budget_frac=0.25, now=_NOW,
+                        factors=["momentum"], tercile=0.5, weighting="inverse_vol")
+    by_sym = {t.symbol: t for t in sig.tilts}
+    assert by_sym["A/USDT:USDT"].target_weight > by_sym["B/USDT:USDT"].target_weight
+    # weights within the long side sum to ~1.0
+    long_sum = sum(t.target_weight for t in sig.tilts if t.direction == "long")
+    assert abs(long_sum - 1.0) < 1e-9
+
+
+def test_factor_signal_combines_multiple_factors_by_rank():
+    geos = [_geo("A/USDT:USDT", mom=0.9, apr=-0.3),   # best on both momentum & carry
+            _geo("B/USDT:USDT", mom=0.1, apr=0.0),
+            _geo("C/USDT:USDT", mom=-0.9, apr=0.3)]   # worst on both
+    sig = factor_signal(geos, risk_budget_frac=0.25, now=_NOW,
+                        factors=["momentum", "carry"], tercile=1 / 3, weighting="equal")
+    longs = {t.symbol for t in sig.tilts if t.direction == "long"}
+    shorts = {t.symbol for t in sig.tilts if t.direction == "short"}
+    assert "A/USDT:USDT" in longs
+    assert "C/USDT:USDT" in shorts
