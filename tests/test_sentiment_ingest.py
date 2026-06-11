@@ -2,9 +2,11 @@ from datetime import UTC, datetime
 
 import pytest
 
+import futures_fund.sentiment_ingest as si
 from futures_fund.contracts import SentimentReport, SentimentSource
 from futures_fund.sentiment_ingest import (
     LEVEL_TO_S,
+    _is_future,
     decay_report,
     decay_score,
     fail_soft_neutral,
@@ -71,13 +73,61 @@ def test_fail_soft_neutral_is_zeroed():
     assert r.symbol == "SOL/USDT:USDT" and r.as_of_ts == _utc(12, d=1)
 
 
-def test_gather_sentiment_context_drops_future_sources():
+@pytest.mark.parametrize(
+    "published_at, expect_future",
+    [
+        # RFC-822 <pubDate> (real CoinDesk/Cointelegraph/etc. format) before the 01-Jun cutoff
+        ("Fri, 29 May 2026 14:20:32 +0000", False),
+        ("Fri, 29 May 2026 14:20:32 GMT", False),
+        # RFC-822 after the cutoff -> future, must be dropped
+        ("Wed, 03 Jun 2026 09:00:00 +0000", True),
+        # ISO-8601 before / after the cutoff
+        ("2026-05-29T14:20:32+00:00", False),
+        ("2026-06-03T09:00:00+00:00", True),
+        # naive ISO (no tz) is assumed UTC
+        ("2026-05-29T14:20:32", False),
+        # the cutoff instant itself counts as future (drops published_ts >= as_of, §7.1)
+        ("Mon, 01 Jun 2026 00:00:00 +0000", True),
+        # missing / unparseable -> treated as future so undated sources never leak
+        ("", True),
+        ("not a date", True),
+        (None, True),
+    ],
+)
+def test_is_future_parses_rfc822_and_iso(published_at, expect_future):
+    cutoff = _utc(0, d=1)  # 2026-06-01T00:00:00+00:00
+    assert _is_future(published_at, cutoff) is expect_future
+
+
+def test_gather_sentiment_context_keeps_past_drops_future(monkeypatch):
+    """The point-in-time filter keeps past-dated news and drops at/after-as_of leakage, across
+    both RFC-822 <pubDate> and ISO timestamps — exercising the real filter, not a degraded feed."""
+    news = [
+        {"title": "past rfc822", "published_at": "Fri, 29 May 2026 14:20:32 +0000"},
+        {"title": "past iso", "published_at": "2026-05-30T08:00:00+00:00"},
+        {"title": "future rfc822", "published_at": "Wed, 03 Jun 2026 09:00:00 +0000"},
+        {"title": "future iso", "published_at": "2026-06-03T09:00:00+00:00"},
+        {"title": "undated", "published_at": ""},
+    ]
+    monkeypatch.setattr(si, "build_market_context",
+                        lambda *a, **k: {"news": [dict(n) for n in news]})
+
+    from futures_fund.config import Settings
+    ctx = gather_sentiment_context(object(), Settings(), fred_key=None, as_of=_utc(0, d=1))
+
+    assert ctx["as_of"] == _utc(0, d=1).isoformat()  # anchor recorded for downstream PIT checks
+    kept = {n["title"] for n in ctx["news"]}
+    assert kept == {"past rfc822", "past iso"}  # only past-dated sources survive the gate
+
+
+def test_gather_sentiment_context_degrades_safely(monkeypatch):
+    """When every feed errors, build_market_context yields no news; the gather still records the
+    as_of anchor and returns an empty news list (fail-soft)."""
     class _Http:
         def get(self, *a, **k):
             raise RuntimeError("network disabled")
 
     from futures_fund.config import Settings
     ctx = gather_sentiment_context(_Http(), Settings(), fred_key=None, as_of=_utc(12, d=1))
-    # context degrades to safe defaults; the as_of anchor is recorded for downstream PIT checks
     assert ctx["as_of"] == _utc(12, d=1).isoformat()
-    assert ctx["news"] == []  # no future/leaking sources slipped in
+    assert ctx["news"] == []

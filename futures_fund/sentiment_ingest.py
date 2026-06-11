@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 from futures_fund.config import Settings
 from futures_fund.contracts import SentimentReport
@@ -69,19 +70,45 @@ def gather_sentiment_context(http_client, settings: Settings, fred_key: str | No
     gather. The real NewsItem.model_dump() carries `published_at`, which is the field checked.
     """
     ctx = build_market_context(http_client, settings, fred_key)
-    cutoff_iso = as_of.isoformat()
     ctx["news"] = [n for n in ctx.get("news", [])
-                   if not _is_future(n.get("published_at"), cutoff_iso)]
-    ctx["as_of"] = cutoff_iso
+                   if not _is_future(n.get("published_at"), as_of)]
+    ctx["as_of"] = as_of.isoformat()
     return ctx
 
 
-def _is_future(published_at, cutoff_iso: str) -> bool:
-    """True if a source's ISO timestamp is at/after the decision-time cutoff. Unparseable -> drop
-    (treated as future) so an undated source never leaks past the point-in-time boundary."""
+def _parse_published(published_at) -> datetime | None:
+    """Parse a source's published timestamp into a tz-aware datetime.
+
+    Real RSS `<pubDate>` is RFC-822 (e.g. 'Fri, 29 May 2026 14:20:32 +0000'); Atom and some feeds
+    emit ISO-8601. Try ISO first, then RFC-822. A naive result is assumed UTC. Returns None when the
+    value is empty or unparseable.
+    """
     if not published_at:
+        return None
+    s = str(published_at).strip()
+    if not s:
+        return None
+    for parse in (datetime.fromisoformat, parsedate_to_datetime):
+        try:
+            dt = parse(s)
+        except (TypeError, ValueError):
+            continue
+        if dt is None:
+            continue
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+    return None
+
+
+def _is_future(published_at, cutoff: datetime) -> bool:
+    """True if a source's published timestamp is at/after the decision-time cutoff.
+
+    `published_at` is the raw feed value (RFC-822 `<pubDate>` or ISO); it is parsed to a tz-aware
+    datetime and compared against `cutoff` as datetimes. Unparseable/missing -> drop (treated as
+    future) so an undated source never leaks past the point-in-time boundary.
+    """
+    dt = _parse_published(published_at)
+    if dt is None:
         return True
-    try:
-        return str(published_at) >= cutoff_iso
-    except TypeError:
-        return True
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+    return dt >= cutoff
