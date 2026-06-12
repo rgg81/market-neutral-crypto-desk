@@ -22,7 +22,11 @@ artifact re-derivation*. They are two independent guards on overlapping properti
 """
 from __future__ import annotations
 
-from futures_fund.funding_intervals import realized_funding
+from datetime import UTC, datetime
+
+from futures_fund.account import PaperAccount, Position
+from futures_fund.costs import count_funding_events
+from futures_fund.funding_intervals import clamp_funding_rate, realized_funding
 from futures_fund.market_data import is_crypto_perp
 from futures_fund.neutrality import beta_residual, dollar_residual
 from futures_fund.sleeves.sentiment import conviction_tilt
@@ -73,6 +77,30 @@ def invariant_funding_sign_correct(*, flip: bool = False) -> bool:
         # the broken convention claims a short PAYS and a long RECEIVES — must NOT validate.
         return short_credit < 0.0 and long_debit > 0.0
     return short_credit > 0.0 and long_debit < 0.0
+
+
+def invariant_account_equity_reconciles(
+    account: PaperAccount, marks: dict, recorded_equity: float, *, tol: float = 1e-6
+) -> bool:
+    """Recorded equity must equal cash + unrealized PnL within tolerance (no phantom equity)."""
+    return abs(account.equity(marks) - recorded_equity) <= tol
+
+
+def invariant_cycle_funding_reconciles(
+    account: PaperAccount, prev_ts, now, funding_by_symbol: dict, intervals: dict,
+    marks: dict, recorded_funding: float, *, tol: float = 1e-6
+) -> bool:
+    """Recorded per-cycle funding must equal a recompute via realized_funding x events (extends the
+    funding-sign check to the account level — the reviewer's settlement-window re-derivation)."""
+    total = 0.0
+    for sym, pos in account.positions.items():
+        mark = marks.get(sym)
+        if mark is None:
+            continue
+        n = count_funding_events(prev_ts, now, int(intervals.get(sym, 8)))
+        rate = clamp_funding_rate(sym, funding_by_symbol.get(sym, 0.0))
+        total += realized_funding(0.0, mark, pos.qty, rate, pos.direction) * n
+    return abs(total - recorded_funding) <= tol
 
 
 def invariant_pair_legs_hedge_ratio_sized(
@@ -144,6 +172,16 @@ def _checks() -> list[tuple[str, bool, str]]:
     # 4. FUNDING SIGN: a short with a positive rate RECEIVES; a long PAYS (signed carry convention).
     add("funding_sign_correct", invariant_funding_sign_correct(),
         "short+positive-rate must be a credit; long a debit")
+
+    # 4b. ACCOUNT EQUITY RECONCILE: recorded equity == cash + unrealized (no phantom equity).
+    _acct = PaperAccount(cash=20_000.0)
+    _acct.positions["ETH/USDT:USDT"] = Position(
+        symbol="ETH/USDT:USDT", direction="short", qty=2.0, entry_price=2000.0,
+        opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
+    _marks = {"ETH/USDT:USDT": 1950.0}
+    add("account_equity_reconciles",
+        invariant_account_equity_reconciles(_acct, _marks, _acct.equity(_marks)),
+        "recorded equity must equal cash + unrealized PnL")
 
     # 5. PAIR LEGS sized by the cointegration hedge ratio (no residual single-name exposure).
     add("pair_legs_hedge_ratio_sized",

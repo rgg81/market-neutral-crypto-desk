@@ -12,6 +12,10 @@ from futures_fund.account import (
 )
 from futures_fund.costs import count_funding_events
 from futures_fund.journal import append_decision, patch_outcome, read_all_decisions
+from futures_fund.self_audit import (
+    invariant_account_equity_reconciles,
+    invariant_cycle_funding_reconciles,
+)
 from scripts.run_paper_cli import _geometry_cost_maps, _leg_cost_patches
 
 
@@ -372,3 +376,26 @@ def test_patch_outcome_no_journaled_leg_is_a_fail_soft_noop(tmp_path):
                            outcome={"realized_funding": 1.0}, cadence="daily")
     assert landed is False
     assert read_all_decisions(memory) == []
+
+
+def test_invariant_account_equity_reconciles():
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)
+    marks = {"ETH/USDT:USDT": 1950.0}              # upnl = 100
+    recorded = acct.equity(marks)                  # 20100
+    assert invariant_account_equity_reconciles(acct, marks, recorded)
+    assert not invariant_account_equity_reconciles(acct, marks, recorded + 5.0)
+
+
+def test_invariant_cycle_funding_reconciles():
+    prev = datetime(2026, 6, 10, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 6, 11, 0, 0, tzinfo=UTC)
+    acct = PaperAccount(cash=20_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)
+    marks = {"ETH/USDT:USDT": 2000.0}
+    acct.settle_funding(prev, now, {"ETH/USDT:USDT": 0.0005}, {"ETH/USDT:USDT": 8}, marks)
+    recorded = acct.positions["ETH/USDT:USDT"].accrued_funding   # +6.0
+    assert invariant_cycle_funding_reconciles(
+        acct, prev, now, {"ETH/USDT:USDT": 0.0005}, {"ETH/USDT:USDT": 8}, marks, recorded)
+    assert not invariant_cycle_funding_reconciles(
+        acct, prev, now, {"ETH/USDT:USDT": 0.0005}, {"ETH/USDT:USDT": 8}, marks, recorded + 1.0)
