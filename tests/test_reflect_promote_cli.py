@@ -147,3 +147,23 @@ def test_promote_cli_confirm_stays_candidate_when_alpha_dsr_below_gate(tmp_path,
     # Confirmation still counts (now 5) but the lesson stays CANDIDATE — the DSR gate held.
     assert lz.state == "candidate"
     assert lz.confirmations == 5
+
+
+def test_reflection_entries_carry_realized_costs():
+    from scripts.reflect_cli import _cost_fields
+
+    decision = {
+        "fees": 3.0, "slippage": 1.5, "funding_paid": -2.0,
+        "realized_funding": 2.0, "realized_pnl": 12.0,
+    }
+    costs = _cost_fields(decision)
+    assert costs["fees"] == 3.0
+    assert costs["slippage"] == 1.5
+    assert costs["realized_funding"] == 2.0
+    assert costs["net_pnl"] == 12.0 - 3.0 - 1.5    # realized_pnl net of fees+slippage
+
+
+def test_cost_fields_default_zero_on_missing():
+    from scripts.reflect_cli import _cost_fields
+    costs = _cost_fields({})
+    assert costs == {"fees": 0.0, "slippage": 0.0, "realized_funding": 0.0, "net_pnl": 0.0}

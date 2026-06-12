@@ -23,6 +23,24 @@ from futures_fund.journal import alpha_outcome, read_all_decisions
 from futures_fund.models import Cadence
 
 
+def _cost_fields(decision: dict) -> dict:
+    """Per-closed-leg realized costs for the Reflector (net-of-cost alpha keying).
+
+    fees/slippage are >= 0; realized_funding is signed (+ = received). net_pnl = realized_pnl minus
+    fees + slippage. All default to 0.0 on a journal record that predates the cost engine. These
+    fields are populated by run_paper_cli's journal cost-patch (Task 8b)."""
+    fees = float(decision.get("fees") or 0.0)
+    slippage = float(decision.get("slippage") or 0.0)
+    realized_funding = float(decision.get("realized_funding") or 0.0)
+    realized_pnl = float(decision.get("realized_pnl") or 0.0)
+    return {
+        "fees": fees,
+        "slippage": slippage,
+        "realized_funding": realized_funding,
+        "net_pnl": realized_pnl - fees - slippage,
+    }
+
+
 def build_reflection_input(memory_dir) -> dict:
     """Split closed decisions into winners/losers by realized ALPHA (return net of BTC-beta).
 
@@ -53,6 +71,7 @@ def build_reflection_input(memory_dir) -> dict:
             "neutrality_in_band": ao.neutrality_in_band,
             "sentiment_helped": ao.sentiment_helped,
         }
+        entry.update(_cost_fields(d))           # `d` is the journal decision dict (line 35)
         (winners if ao.alpha_return > 0 else losers).append(entry)
     return {"winners": winners, "losers": losers,
             "n_closed": len(winners) + len(losers)}
