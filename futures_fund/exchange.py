@@ -114,3 +114,14 @@ class FuturesExchange:
         bids = [(float(p), float(q)) for p, q in (book.get("bids") or [])]
         asks = [(float(p), float(q)) for p, q in (book.get("asks") or [])]
         return {"bids": bids, "asks": asks}
+
+    def onboard_date_ms(self, symbol: str) -> int | None:
+        """Binance listing timestamp (ms-epoch) from the ccxt-cached market info, or None.
+
+        ccxt exposes onboardDate only via market(sym)["info"]["onboardDate"] (a string) after
+        load_markets(); fail-soft to None so cycle_prep can fall back to the earliest-kline age."""
+        try:
+            raw = (self.client.market(symbol).get("info") or {}).get("onboardDate")
+            return int(raw) if raw is not None else None
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
