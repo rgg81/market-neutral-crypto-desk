@@ -62,6 +62,31 @@ def test_carry_signal_empty_geometries():
     assert sig.tilts == []
 
 
+def test_carry_signal_clamps_extreme_apr_for_ranking_and_score():
+    geos = [
+        _geo("BLOWOFF/USDT:USDT", 20.0),   # extreme funding APR (reversal trap)
+        _geo("HIGH/USDT:USDT", 1.5),
+        _geo("MID/USDT:USDT", 0.0),
+        _geo("LOW/USDT:USDT", -1.5),
+        _geo("NEG/USDT:USDT", -20.0),      # extreme negative
+    ]
+    sig = carry_signal(geos, risk_budget_frac=0.25, now=_NOW, top_frac=1 / 3, max_abs_apr=2.0)
+    by_sym = {t.symbol: t for t in sig.tilts}
+    # the blow-off is still shorted (positive carry) but its raw_score is CAPPED at +2.0, not 20.0
+    assert by_sym["BLOWOFF/USDT:USDT"].direction == "short"
+    assert by_sym["BLOWOFF/USDT:USDT"].raw_score == 2.0
+    assert by_sym["NEG/USDT:USDT"].raw_score == -2.0
+    assert sig.diagnostics["max_abs_apr"] == 2.0
+
+
+def test_carry_signal_default_no_cap_preserves_raw_apr():
+    geos = [_geo("A/USDT:USDT", 20.0), _geo("B/USDT:USDT", -20.0)]
+    sig = carry_signal(geos, risk_budget_frac=0.25, now=_NOW)  # max_abs_apr defaults None
+    by_sym = {t.symbol: t for t in sig.tilts}
+    assert by_sym["A/USDT:USDT"].raw_score == 20.0   # unbounded baseline unchanged
+    assert by_sym["B/USDT:USDT"].raw_score == -20.0
+
+
 def test_package_reexports_all_four_builders():
     from futures_fund.sleeves import (
         carry_signal,

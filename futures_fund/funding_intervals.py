@@ -35,6 +35,23 @@ def clamp_funding_rate(symbol: str, rate: float) -> float:
     return rate
 
 
+def bounded_apr(apr: float, cap: float | None) -> float:
+    """Sign-preserving clamp of an annualized funding_apr to +-cap. cap=None -> unbounded.
+
+    EXTREME FUNDING IS A REVERSAL TRAP, NOT FREE ALPHA: a blow-off rate that annualizes to a huge
+    APR should be treated as CAPPED, ranking alongside other at-cap names — never as more
+    attractive than them. The per-symbol realized RATE is already clamped upstream
+    (clamp_funding_rate, majors +-0.003 / alts +-0.02); this is a STRATEGY-level signal cap on top.
+    Lives here (not in a sleeve) so carry and factor both import it from a neutral module."""
+    if cap is None:
+        return apr
+    if apr > cap:
+        return cap
+    if apr < -cap:
+        return -cap
+    return apr
+
+
 def intervals_per_year(interval_hours: float) -> float:
     """24/interval_hours * 365 — annualization factor for funding_apr."""
     if interval_hours <= 0:

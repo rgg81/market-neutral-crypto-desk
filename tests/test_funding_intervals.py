@@ -6,6 +6,7 @@ from futures_fund.funding_intervals import (
     _MAJORS,
     MAJOR_CAP,
     PER_SYMBOL_CAP_DEFAULT,
+    bounded_apr,
     clamp_funding_rate,
     funding_apr,
     funding_cap,
@@ -129,3 +130,15 @@ def test_clamp_then_realized_composition_for_an_alt():
     assert bal == pytest.approx(+150.0 * 100.0 * 0.02)   # +300.0 credit, signed, on clamped rate
     # and the realized contribution is NOT the raw (unclamped) rate's value:
     assert bal != pytest.approx(150.0 * 100.0 * raw_rate)
+
+
+def test_bounded_apr_sign_preserving_clamp():
+    assert bounded_apr(20.0, 2.0) == 2.0
+    assert bounded_apr(-20.0, 2.0) == -2.0
+    assert bounded_apr(1.5, 2.0) == 1.5     # inside the band: unchanged
+    assert bounded_apr(-1.5, 2.0) == -1.5
+
+
+def test_bounded_apr_none_cap_is_unbounded():
+    assert bounded_apr(20.0, None) == 20.0
+    assert bounded_apr(-20.0, None) == -20.0
