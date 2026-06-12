@@ -49,6 +49,39 @@ def build_briefs(universe: list[dict], held: list[str]) -> list[dict]:
     return [{"symbol": s, "held": s in held_set} for s in syms]
 
 
+def _prior_marks(state_dir, cadence: Cadence) -> dict[str, float]:
+    """Mark prices from the most recently completed cycle's `geometries.json`.
+
+    preflight.py (W3 step 2) runs BEFORE `cycle_prep_cli.py` (W3 step 3) writes THIS cycle's
+    geometries, so the current cycle has no geometries yet. Resolve the latest cadence cycle that
+    actually persisted `geometries` (same prior-state lookup `_held_symbols` uses for `report`) so
+    open positions mark-to-market instead of collapsing equity to cash-only. Empty on a miss."""
+    n = latest_cadence_cycle(state_dir, cadence, "geometries")
+    if n is None:
+        return {}
+    try:
+        bundle = load_output(state_dir, n, "geometries", cadence=cadence)
+    except FileNotFoundError:
+        return {}
+    return {g["symbol"]: float(g["mark"]) for g in bundle.get("geometries", [])
+            if g.get("symbol") and g.get("mark") is not None}
+
+
+def _prior_pnl(state_dir, cadence: Cadence) -> dict:
+    """The latest persisted `pnl.json` (last rebalance's realized cost/turnover).
+
+    `pnl.json` is written at execute/P&L (W10/D7), long after preflight runs, so the current cycle
+    has none yet. Resolve the most recently completed cycle's `pnl` so `last_rebalance_cost` /
+    `last_rebalance_turnover_usd` reflect the last round-trip the trader paid. Empty on a miss."""
+    n = latest_cadence_cycle(state_dir, cadence, "pnl")
+    if n is None:
+        return {}
+    try:
+        return load_output(state_dir, n, "pnl", cadence=cadence)
+    except FileNotFoundError:
+        return {}
+
+
 def build_pnl_block(state_dir, *, marks: dict[str, float], last_pnl: dict,
                     default_cash: float) -> dict:
     """The realized cost/carry/PnL block folded into context.json (an ARTIFACT the external SKILL.md
@@ -96,17 +129,11 @@ def main(argv: list[str] | None = None) -> None:
     # Fold the realized cost/carry/PnL block (Phase 9) so the artifact context.json carries cost
     # data for the external orchestrator. load_settings() is safe with no config.yaml in cwd
     # (account_size_usdt defaults to 20000); default_cash is passed explicitly regardless.
-    marks: dict[str, float] = {}
-    try:
-        bundle = load_output(args.state_dir, args.cycle, "geometries", cadence=cadence)
-        marks = {g["symbol"]: float(g["mark"]) for g in bundle.get("geometries", [])
-                 if g.get("symbol") and g.get("mark") is not None}
-    except FileNotFoundError:
-        marks = {}
-    try:
-        last_pnl = load_output(args.state_dir, args.cycle, "pnl", cadence=cadence)
-    except FileNotFoundError:
-        last_pnl = {}
+    # marks/last_pnl come from the most recently COMPLETED cycle: preflight (W3 step 2) runs before
+    # this cycle's geometries (W3 step 3) and pnl (W10/D7) exist, so sourcing from args.cycle would
+    # always miss and zero out mark-to-market equity + last-rebalance cost.
+    marks = _prior_marks(args.state_dir, cadence)
+    last_pnl = _prior_pnl(args.state_dir, cadence)
     settings = load_settings()
     pnl_block = build_pnl_block(
         args.state_dir, marks=marks, last_pnl=last_pnl,
