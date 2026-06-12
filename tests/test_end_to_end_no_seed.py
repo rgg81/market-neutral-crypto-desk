@@ -53,9 +53,18 @@ class _FakeCyclePrepExchange:
     def mark_price(self, symbol):
         return _MARKS[symbol]
 
+    def depth(self, symbol, limit=20):
+        # deep, symmetric book around the mark so every name clears the min_depth_usd floor
+        mark = _MARKS[symbol]
+        qty = 5_000_000.0 / mark  # ~$5M per level -> full top-of-book notional >> min_depth_usd
+        return {"bids": [(mark * 0.999, qty)], "asks": [(mark * 1.001, qty)]}
+
 
 class _FakeScoutClient:
-    markets = {s: {"info": {"underlyingType": "COIN"}} for s in _UNIVERSE}
+    # old listing (2019 epoch) so the min_age_days gate keeps every name via onboard_date (NOT the
+    # kline fallback) — exercises the Task 2 row -> Task 3 gate path end to end.
+    markets = {s: {"info": {"underlyingType": "COIN", "onboardDate": "1567965300000"}}
+               for s in _UNIVERSE}
 
     def load_markets(self):
         return self.markets
