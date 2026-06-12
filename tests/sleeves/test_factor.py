@@ -88,3 +88,21 @@ def test_factor_signal_n3_default_tercile_one_long_one_short_no_overlap():
     assert shorts == ["C/USDT:USDT"]
     assert len(longs) == 1 and len(shorts) == 1
     assert set(longs) & set(shorts) == set()           # disjoint sides on a tiny universe
+
+
+def _g(sym, apr):
+    return CoinGeometry(symbol=sym, mark=100.0, funding_apr=apr)
+
+
+def test_rank_factor_carry_respects_max_abs_apr():
+    geos = [_g("BLOWOFF/USDT:USDT", 20.0), _g("CALM/USDT:USDT", 1.0)]
+    # carry score = -bounded_apr; with cap 2.0 the blow-off score is -2.0, not -20.0
+    ranked = dict(rank_factor(geos, factor="carry", max_abs_apr=2.0))
+    assert ranked["BLOWOFF/USDT:USDT"] == -2.0
+    assert ranked["CALM/USDT:USDT"] == -1.0
+
+
+def test_rank_factor_carry_default_unbounded():
+    geos = [_g("BLOWOFF/USDT:USDT", 20.0)]
+    ranked = dict(rank_factor(geos, factor="carry"))
+    assert ranked["BLOWOFF/USDT:USDT"] == -20.0

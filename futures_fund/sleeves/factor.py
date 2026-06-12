@@ -8,31 +8,35 @@ from datetime import datetime
 from typing import Literal
 
 from futures_fund.contracts import CoinGeometry, SleeveSignal, SleeveTilt
+from futures_fund.funding_intervals import bounded_apr
 
 
-def _factor_score(g: CoinGeometry, factor: str) -> float:
+def _factor_score(g: CoinGeometry, factor: str, *, max_abs_apr: float | None = None) -> float:
     if factor == "momentum":
         return g.momentum_20
     if factor == "carry":
-        return -g.funding_apr               # low/negative funding is attractive
+        return -bounded_apr(g.funding_apr, max_abs_apr)    # low/negative funding is attractive
     if factor == "low_vol":
-        return -g.realized_vol              # lower vol is attractive
+        return -g.realized_vol                             # lower vol is attractive
     raise ValueError(f"unknown factor {factor!r}")
 
 
 def rank_factor(geometries: list[CoinGeometry], *,
-                factor: Literal["momentum", "carry", "low_vol"]) -> list[tuple[str, float]]:
+                factor: Literal["momentum", "carry", "low_vol"],
+                max_abs_apr: float | None = None) -> list[tuple[str, float]]:
     """Cross-sectional ranking score per symbol for the factor, best (highest score) first."""
-    scored = [(g.symbol, _factor_score(g, factor)) for g in geometries]
+    scored = [(g.symbol, _factor_score(g, factor, max_abs_apr=max_abs_apr)) for g in geometries]
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored
 
 
-def _combined_rank(geometries: list[CoinGeometry], factors: list[str]) -> list[tuple[str, float]]:
+def _combined_rank(geometries: list[CoinGeometry], factors: list[str],
+                   *, max_abs_apr: float | None = None) -> list[tuple[str, float]]:
     """Average rank-position across factors (0 = best). Lower combined value = stronger long."""
     agg: dict[str, float] = {g.symbol: 0.0 for g in geometries}
     for factor in factors:
-        for pos, (sym, _score) in enumerate(rank_factor(geometries, factor=factor)):
+        for pos, (sym, _score) in enumerate(
+                rank_factor(geometries, factor=factor, max_abs_apr=max_abs_apr)):
             agg[sym] += pos
     combined = [(sym, agg[sym] / max(1, len(factors))) for sym in agg]
     combined.sort(key=lambda t: t[1])               # best (lowest avg rank) first
@@ -52,7 +56,8 @@ def _inverse_vol_weights(syms: list[str], geo_by_sym: dict[str, CoinGeometry],
 def factor_signal(geometries: list[CoinGeometry], *, risk_budget_frac: float, now: datetime,
                   factors: list[str] = ["momentum", "carry", "low_vol"],  # noqa: B006
                   tercile: float = 1 / 3,
-                  weighting: Literal["inverse_vol", "equal"] = "inverse_vol") -> SleeveSignal:
+                  weighting: Literal["inverse_vol", "equal"] = "inverse_vol",
+                  max_abs_apr: float | None = None) -> SleeveSignal:
     """Long top tercile / short bottom tercile of the combined factor rank; inverse-vol (or equal)
     within each leg. target_weight is the signed within-side share (long > 0, short < 0)."""
     n = len(geometries)
@@ -60,7 +65,7 @@ def factor_signal(geometries: list[CoinGeometry], *, risk_budget_frac: float, no
         return SleeveSignal(sleeve="factor", tilts=[], risk_budget_frac=risk_budget_frac,
                             as_of_ts=now)
     geo_by_sym = {g.symbol: g for g in geometries}
-    ranked = _combined_rank(geometries, factors)
+    ranked = _combined_rank(geometries, factors, max_abs_apr=max_abs_apr)
     k = max(1, math.floor(n * tercile))
     long_syms = [s for s, _ in ranked[:k]]
     short_syms = [s for s, _ in ranked[-k:]]
