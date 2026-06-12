@@ -38,6 +38,7 @@ from futures_fund.config import load_settings
 from futures_fund.contracts import TargetWeights, WeightLeg
 from futures_fund.control_loop import cadence_due
 from futures_fund.cycle_io import cycle_dir, load_output, save_output
+from futures_fund.journal import patch_outcome
 from futures_fund.models import Cadence
 from futures_fund.pnl_attribution import append_ledger, build_cycle_pnl
 from scripts.cycle_prep_cli import main as cycle_prep_main
@@ -228,6 +229,15 @@ def _run_cadence(
     save_output(state_dir, cycle, "pnl", rec, cadence=cadence)
     append_ledger(state_dir, rec)
     save_account(state_dir, account)
+    # Patch each held leg's realized fees/slippage/funding/price-pnl onto the journal Decision so
+    # the Reflector keys lessons on NET (after-cost) alpha. Decision is extra="allow", so
+    # realized_funding round-trips. patch_outcome returns False (fail-soft) for an unrecorded leg.
+    for sym, direction, outcome in _leg_cost_patches(account, cycle):
+        try:
+            patch_outcome(memory_dir, cycle=cycle, symbol=sym, direction=direction, outcome=outcome)
+        except Exception as exc:  # noqa: BLE001 — cost bookkeeping must not unwind an executed cycle
+            print(f"WARNING: journal cost-patch failed for {sym} {direction}: {exc!r}",
+                  file=sys.stderr)
     _run_reflect(state_dir, cadence, cycle, memory_dir)
     return True
 
@@ -239,6 +249,26 @@ def _read_executed(state_dir, cadence: Cadence, cycle: int) -> list:
         return json.loads(path.read_text()).get("executed", [])
     except (OSError, json.JSONDecodeError):
         return []
+
+
+def _leg_cost_patches(account, cycle: int) -> list[tuple[str, str, dict]]:
+    """Per-held-leg realized cost patches for the journal (Reflector net-alpha keying source).
+
+    Returns (symbol, direction, outcome_dict) tuples carrying the leg's realized fees/slippage/
+    funding/price-pnl. `cycle` is accepted for symmetry with the journal key (the caller pairs it
+    with the cycle the leg was opened in); patches are matched on (cycle, symbol, direction)."""
+    out: list[tuple[str, str, dict]] = []
+    for pos in account.positions.values():
+        out.append((
+            pos.symbol, pos.direction,
+            {
+                "fees": pos.accrued_fees,
+                "slippage": pos.accrued_slippage,
+                "realized_funding": pos.accrued_funding,
+                "realized_pnl": pos.realized_pnl,
+            },
+        ))
+    return out
 
 
 def _geometry_cost_maps(bundle: dict) -> tuple[dict, dict, dict, dict]:

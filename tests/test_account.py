@@ -10,7 +10,7 @@ from futures_fund.account import (
     save_account,
 )
 from futures_fund.costs import count_funding_events
-from scripts.run_paper_cli import _geometry_cost_maps
+from scripts.run_paper_cli import _geometry_cost_maps, _leg_cost_patches
 
 
 def _pos(symbol="ETH/USDT:USDT", direction="long", qty=2.0, entry=2000.0):
@@ -249,3 +249,18 @@ def test_geometry_cost_maps_from_bundle():
     assert funding["ETH/USDT:USDT"] == 0.0005
     assert intervals["ETH/USDT:USDT"] == 8
     assert costs["ETH/USDT:USDT"].adv_usd == 5_000_000.0
+
+
+def test_leg_cost_patches_from_account():
+    acct = PaperAccount(cash=20_000.0)
+    p = _pos(symbol="ETH/USDT:USDT", direction="short", qty=2.0, entry=2000.0)
+    p.accrued_fees = 4.0
+    p.accrued_slippage = 2.0
+    p.accrued_funding = 6.0
+    p.realized_pnl = 12.0
+    acct.positions["ETH/USDT:USDT"] = p
+    patches = _leg_cost_patches(acct, cycle=1)
+    assert patches == [
+        ("ETH/USDT:USDT", "short",
+         {"fees": 4.0, "slippage": 2.0, "realized_funding": 6.0, "realized_pnl": 12.0}),
+    ]
