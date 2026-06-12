@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime
 
 from futures_fund.account import PaperAccount, Position, save_account
+from futures_fund.cycle_io import save_output
+from futures_fund.scorecard import _latest_pnl, build_scorecard
 from scripts.preflight import build_pnl_block
 
 
@@ -48,3 +50,28 @@ def test_pnl_block_fixture_contract_matches():
         assert key in fixture
     for key in ("unrealized", "realized_funding", "accrued_fees"):
         assert key in next(iter(fixture["by_symbol"].values()))
+
+
+def test_latest_pnl_reads_the_newest_cycle(tmp_path):
+    state = tmp_path / "state"
+    save_output(state, 1, "pnl", {"net_pnl": 1.0, "cycle": 1,
+                                  "ts": "2026-06-10T00:00:00+00:00"}, cadence="weekly")
+    save_output(state, 2, "pnl", {"net_pnl": 5.0, "cycle": 2,
+                                  "ts": "2026-06-11T00:00:00+00:00"}, cadence="daily")
+    rec = _latest_pnl(state)
+    assert rec["net_pnl"] == 5.0                    # newest ts wins
+
+
+def test_scorecard_carries_cost_transparency_keys(tmp_path):
+    state = tmp_path / "state"
+    memory = tmp_path / "memory"
+    save_output(state, 1, "pnl", {
+        "net_pnl": 8.0, "gross_pnl": 14.0, "fees_paid": 4.0, "slippage_paid": 2.0,
+        "funding_net": 6.0, "cycle": 1, "ts": "2026-06-10T00:00:00+00:00"}, cadence="weekly")
+    sc = build_scorecard(state, memory)
+    assert sc["net_pnl"] == 8.0
+    assert sc["gross_pnl"] == 14.0
+    assert sc["total_fees"] == 4.0
+    assert sc["total_slippage"] == 2.0
+    assert sc["funding_net"] == 6.0
+    assert abs(sc["cost_drag_bps"] - (6.0 / 14.0 * 1e4)) < 1e-6

@@ -20,8 +20,11 @@ weekly raw-return equity panel.
 
 from __future__ import annotations
 
+import json
 import math
 
+from futures_fund.control_loop import latest_cadence_cycle
+from futures_fund.cycle_io import cycle_dir
 from futures_fund.graduation import deflated_sharpe_pvalue, graduation_verdict
 from futures_fund.improvement import (
     alpha_sharpe_trend,
@@ -59,6 +62,25 @@ def _alpha_drawdown(alpha_rets: list[float]) -> float:
     for r in alpha_rets:
         equity.append(equity[-1] * (1.0 + r))
     return max_drawdown(equity)
+
+
+def _latest_pnl(state_dir) -> dict:
+    """The newest pnl.json across both cadences (by recorded ts, else by cycle number)."""
+    best: dict = {}
+    best_key: tuple = ("", -1)
+    for cadence in ("weekly", "daily"):
+        n = latest_cadence_cycle(state_dir, cadence, "pnl")
+        if n is None:
+            continue
+        path = cycle_dir(state_dir, n, cadence=cadence) / "pnl.json"
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        key = (str(rec.get("ts") or ""), int(rec.get("cycle") or 0))
+        if key > best_key:
+            best, best_key = rec, key
+    return best
 
 
 def build_scorecard(state_dir, memory_dir, *, last_n: int = 10, weekly_target: float = 0.05,
@@ -115,6 +137,12 @@ def build_scorecard(state_dir, memory_dir, *, last_n: int = 10, weekly_target: f
             f"reviewer vetoed {veto:.0%} of recent cycles — the guardian is repeatedly HALTing the "
             "book; fix the upstream neutrality/funding breach, do not re-propose a vetoed book")
 
+    pnl = _latest_pnl(state_dir)
+    gross = float(pnl.get("gross_pnl", 0.0))
+    fees = float(pnl.get("fees_paid", 0.0))
+    slip = float(pnl.get("slippage_paid", 0.0))
+    cost_drag_bps = (fees + slip) / max(abs(gross), 1.0) * 1e4 if pnl else float("nan")
+
     return {
         "n_cycles": n_cycles,
         "period_alpha": period_alpha,
@@ -130,6 +158,12 @@ def build_scorecard(state_dir, memory_dir, *, last_n: int = 10, weekly_target: f
         "sentiment_hit_rate": sentiment_hit_rate(memory_dir, last_n=last_n),
         "reviewer_veto_rate": veto,
         "corpus": corpus_health(memory_dir),
+        "net_pnl": float(pnl.get("net_pnl", 0.0)) if pnl else float("nan"),
+        "gross_pnl": gross if pnl else float("nan"),
+        "total_fees": fees,
+        "total_slippage": slip,
+        "funding_net": float(pnl.get("funding_net", 0.0)) if pnl else float("nan"),
+        "cost_drag_bps": cost_drag_bps,
         "graduation": grad,
         "warnings": warnings,
     }
