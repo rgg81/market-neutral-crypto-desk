@@ -10,6 +10,7 @@ from futures_fund.account import (
     save_account,
 )
 from futures_fund.costs import count_funding_events
+from scripts.run_paper_cli import _geometry_cost_maps
 
 
 def _pos(symbol="ETH/USDT:USDT", direction="long", qty=2.0, entry=2000.0):
@@ -234,3 +235,17 @@ def test_save_then_load_round_trips_at_state_root(tmp_path):
     assert restored.fees_paid == 7.0
     assert restored.last_funding_ts == datetime(2026, 6, 10, 8, tzinfo=UTC)
     assert restored.positions["ETH/USDT:USDT"].qty == 2.0
+
+
+def test_geometry_cost_maps_from_bundle():
+    bundle = {"geometries": [
+        {"symbol": "ETH/USDT:USDT", "mark": 2000.0, "funding_rate": 0.0005,
+         "funding_interval_hours": 8.0, "adv_usd": 5_000_000.0, "beta_btc": 1.0,
+         "momentum_20": 0.0, "realized_vol": 0.0, "sentiment_score": 0.0,
+         "sentiment_conf": 0.0},
+    ]}
+    marks, funding, intervals, costs = _geometry_cost_maps(bundle)
+    assert marks["ETH/USDT:USDT"] == 2000.0
+    assert funding["ETH/USDT:USDT"] == 0.0005
+    assert intervals["ETH/USDT:USDT"] == 8
+    assert costs["ETH/USDT:USDT"].adv_usd == 5_000_000.0

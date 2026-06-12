@@ -33,11 +33,13 @@ import sys
 from datetime import UTC, datetime
 
 from futures_fund import equity_log, runlock
+from futures_fund.account import CostInputs, load_account, save_account
 from futures_fund.config import load_settings
 from futures_fund.contracts import TargetWeights, WeightLeg
 from futures_fund.control_loop import cadence_due
 from futures_fund.cycle_io import cycle_dir, load_output, save_output
 from futures_fund.models import Cadence
+from futures_fund.pnl_attribution import append_ledger, build_cycle_pnl
 from scripts.cycle_prep_cli import main as cycle_prep_main
 from scripts.scout_cli import main as scout_main
 
@@ -202,8 +204,30 @@ def _run_cadence(
     _run_reviewer(state_dir, cadence, cycle, memory_dir)
     # Step 6a — execute boundary (re-checks reviewer_gate_ok) -> report.json.
     _run_execute(state_dir, cadence, cycle)
-    # Step 7a — equity point (the dashboard's return-series source) + reflect.
-    equity_log.record_equity(state_dir, now, equity, cycle)
+    # Step 7a — REALISTIC P&L: load the account, settle funding since the account's OWN funding
+    # clock (NOT the cycle-collided equity series), reconcile THIS cycle's executed book to target
+    # (weekly re-emits the full book -> delta 0 on unchanged legs; daily nudges the changed legs —
+    # no double-count, convergent across weeks), mark-to-market, record the REAL equity (replaces
+    # the old flat settings.account_size_usdt), write pnl.json + ledger, save the account.
+    # settle_funding runs BEFORE apply_fills so a position opened this cycle earns no funding for a
+    # pre-existence window (Task 8a pins this).
+    account = load_account(state_dir, equity)  # `equity` is the default cash on a cold dir
+    bundle = _load_geometries(state_dir, cadence, cycle)
+    marks, funding_by_symbol, intervals, costs = _geometry_cost_maps(bundle)
+    prev_ts = account.last_funding_ts or now             # the per-account funding clock
+    opening_equity = account.equity(marks)
+    account.settle_funding(prev_ts, now, funding_by_symbol, intervals, marks)
+    executed = _read_executed(state_dir, cadence, cycle)
+    account.apply_fills(executed, marks, costs, opened_ts=now)
+    turnover = sum(abs(float(t.get("target_notional", 0.0))) for t in executed)
+    equity_now = account.equity(marks)
+    equity_log.record_equity(state_dir, now, equity_now, cycle)
+    rec = build_cycle_pnl(
+        account, opening_equity=opening_equity, marks=marks, turnover_usd=turnover,
+        cycle=cycle, cadence=cadence, now=now)
+    save_output(state_dir, cycle, "pnl", rec, cadence=cadence)
+    append_ledger(state_dir, rec)
+    save_account(state_dir, account)
     _run_reflect(state_dir, cadence, cycle, memory_dir)
     return True
 
@@ -215,6 +239,35 @@ def _read_executed(state_dir, cadence: Cadence, cycle: int) -> list:
         return json.loads(path.read_text()).get("executed", [])
     except (OSError, json.JSONDecodeError):
         return []
+
+
+def _geometry_cost_maps(bundle: dict) -> tuple[dict, dict, dict, dict]:
+    """From a geometries.json bundle build (marks, funding_by_symbol, intervals, costs).
+
+    marks/funding/interval come straight off each CoinGeometry; costs is a CostInputs carrier (ADV
+    + a 1bps half-spread default) so the paper fill uses the slippage fallback (never flat)."""
+    marks: dict[str, float] = {}
+    funding: dict[str, float] = {}
+    intervals: dict[str, int] = {}
+    costs: dict[str, CostInputs] = {}
+    for g in bundle.get("geometries", []):
+        sym = g.get("symbol")
+        mark = g.get("mark")
+        if not sym or mark is None:
+            continue
+        marks[sym] = float(mark)
+        funding[sym] = float(g.get("funding_rate", 0.0))
+        intervals[sym] = int(g.get("funding_interval_hours", 8) or 8)
+        costs[sym] = CostInputs(adv_usd=float(g.get("adv_usd", 0.0)))
+    return marks, funding, intervals, costs
+
+
+def _load_geometries(state_dir, cadence: Cadence, cycle: int) -> dict:
+    """Best-effort read of this cycle's geometries.json (marks + funding + ADV)."""
+    try:
+        return load_output(state_dir, cycle, "geometries", cadence=cadence)
+    except FileNotFoundError:
+        return {"geometries": []}
 
 
 def main(argv: list[str] | None = None) -> None:
