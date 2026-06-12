@@ -400,3 +400,98 @@ def test_two_runs_one_day_apart_prove_nonzero_funding_in_pnl(no_seed_env):
     acct2 = _json.loads((state / "account.json").read_text())
     assert acct2["last_funding_ts"] is not None
     assert acct2["last_funding_ts"] != acct1["last_funding_ts"]
+
+
+# An all-ALTS tradable universe that EXCLUDES BTC — the live case the seed-free fakes above missed
+# (they put BTC in the universe, so the optimizer's BTC hedge always had a mark). The optimizer
+# STILL appends a BTC hedge leg (the beta-neutralizing instrument), so the desk must price BTC as
+# hedge-only infrastructure even though it is not a tradable-alpha name.
+_BTC = "BTC/USDT:USDT"
+_ALTS_UNIVERSE = ["ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT",
+                  "ADA/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT"]
+# the exchange CAN price BTC (infrastructure read) — it just isn't in the scout's selected universe.
+_HEDGE_ONLY_PRICED = [*_ALTS_UNIVERSE, _BTC]
+_HEDGE_ORDER = list(_HEDGE_ONLY_PRICED)  # stable RNG-seed index
+
+
+class _AltsOnlyScout:
+    """Scout sees an all-ALTS universe (NO BTC): tradable selection excludes the hedge symbol."""
+
+    def load_markets(self):
+        return {s: {"info": {"underlyingType": "COIN", "onboardDate": "1567965300000"}}
+                for s in _ALTS_UNIVERSE}
+
+    def fetch_tickers(self):
+        return {s: {"last": _ALL_MARKS[s], "quoteVolume": 1e9, "percentage": 0.0}
+                for s in _ALTS_UNIVERSE}
+
+
+class _HedgeOnlyBtcExchange:
+    """Duck-typed FuturesExchange that CAN price BTC (the hedge/beta reference) even though BTC is
+    NOT in the scout universe — BTC is infrastructure the desk always reads, not tradable alpha."""
+
+    def ohlcv(self, symbol, timeframe="4h", limit=500):
+        rng = np.random.default_rng(_HEDGE_ORDER.index(symbol) + 1)
+        factor = np.cumsum(np.random.default_rng(0).normal(0, 0.02, 120))
+        idio = rng.normal(0, 0.0003, 120)
+        closes = _ALL_MARKS[symbol] * np.exp(factor + idio)
+        ts = pd.date_range("2026-01-01", periods=120, freq="4h", tz="UTC")
+        return pd.DataFrame({"timestamp": ts, "open": closes, "high": closes,
+                             "low": closes, "close": closes, "volume": 1.0})
+
+    def funding(self, symbol):
+        return FundingInfo(symbol=symbol, current_rate=_ALL_FUNDING[symbol],
+                           next_funding_ts=pd.Timestamp(NOW_ISO).to_pydatetime(),
+                           interval_hours=8.0, mark_price=_ALL_MARKS[symbol],
+                           index_price=_ALL_MARKS[symbol])
+
+    def mark_price(self, symbol):
+        return _ALL_MARKS[symbol]
+
+    def depth(self, symbol, limit=20):
+        mark = _ALL_MARKS[symbol]
+        qty = 5_000_000.0 / mark
+        return {"bids": [(mark * 0.999, qty)], "asks": [(mark * 1.001, qty)]}
+
+
+def test_wired_loop_held_book_contains_btc_hedge_when_universe_excludes_btc(tmp_path, monkeypatch):
+    """KILLER REGRESSION for the live market-neutrality bug. The scout universe is all-ALTS and
+    EXCLUDES BTC, but `optimize_book` STILL appends a BTC hedge leg. Through the REAL wired loop the
+    HELD account book must, after the run: (a) actually CONTAIN the BTC hedge position, and (b) be
+    dollar-neutral within tolerance.
+
+    FAILS pre-fix: `cycle_prep` builds geometries only over the universe, so there is NO BTC
+    geometry -> no BTC mark -> `apply_fills` silently SKIPS the hedge leg. The held book is then
+    missing the entire hedge and goes net-short by the hedge notional (BTC absent, |long-short| is a
+    large fraction of gross). The fix always prices the configured hedge/beta symbol so the hedge
+    leg fills and marks, restoring a dollar-neutral HELD book."""
+    monkeypatch.setattr("scripts.scout_cli.build_ccxt", lambda settings: _AltsOnlyScout())
+    monkeypatch.setattr("futures_fund.exchange.FuturesExchange.from_settings",
+                        staticmethod(lambda settings: _HedgeOnlyBtcExchange()))
+    monkeypatch.chdir(tmp_path)
+
+    from futures_fund.account import load_account
+    from scripts.run_paper_cli import _geometry_cost_maps, main
+
+    main(["--now", NOW_ISO])
+    state = tmp_path / "state"
+
+    # BTC was NOT a tradable-alpha name (not in the scout universe), yet the optimizer's hedge leg
+    # put a BTC position on the book — so the hedge actually FILLED (it had a mark).
+    account = load_account(state, default_cash=-1.0)
+    assert account.positions, "the wired loop must have opened a held book"
+    assert _BTC in account.positions, (
+        "the BTC hedge leg must be HELD — pre-fix it was silently skipped (no BTC mark)")
+
+    # held book is dollar-neutral at the run marks (the hedge restores neutrality).
+    marks_w, *_ = _geometry_cost_maps(load_output(state, 1, "geometries", cadence="weekly"))
+    marks_d, *_ = _geometry_cost_maps(load_output(state, 1, "geometries", cadence="daily"))
+    marks = {**marks_w, **marks_d}
+    held_long = sum(p.qty * marks[s] for s, p in account.positions.items() if p.direction == "long")
+    held_short = sum(
+        p.qty * marks[s] for s, p in account.positions.items() if p.direction == "short")
+    gross = held_long + held_short
+    assert gross > 0.0
+    assert abs(held_long - held_short) <= 0.03 * gross, (
+        f"held book not dollar-neutral (hedge missing?): "
+        f"long={held_long:.2f} short={held_short:.2f}")

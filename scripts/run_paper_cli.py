@@ -225,6 +225,10 @@ def _run_cadence(
     prev_ts = account.last_funding_ts or now             # the per-account funding clock
     opening_equity = account.equity(marks)
     account.settle_funding(prev_ts, now, funding_by_symbol, intervals, marks)
+    # LOUD GUARD: every non-flat leg of the FULL intended book must be priced before we reconcile —
+    # a non-flat leg with no mark would be silently skipped by apply_fills, leaving the HELD book
+    # non-neutral (the live BTC-hedge bug). Fail loudly here instead of producing a broken book.
+    _assert_legs_priced(reviewed, marks)
     intended = _intended_fills(reviewed)
     account.apply_fills(
         intended, marks, costs,
@@ -258,6 +262,30 @@ def _run_cadence(
     save_account(state_dir, account)
     _run_reflect(state_dir, cadence, cycle, memory_dir)
     return True
+
+
+def _assert_legs_priced(book: TargetWeights, marks: dict[str, float]) -> None:
+    """LOUD GUARD against the market-neutrality bug class: every NON-FLAT leg of the intended book
+    MUST have a (positive) mark before `apply_fills`.
+
+    `apply_fills` silently SKIPS a leg whose `marks.get(sym)` is None/<=0 (it cannot size qty), so a
+    non-flat leg with no mark would never open — most insidiously the BTC hedge leg when BTC is not
+    in the priced universe — and the HELD book would silently go non-neutral while the leg-level
+    book the reviewer audits stays correct. Rather than let that recur silently, fail LOUDLY here
+    naming the unpriced symbol(s). Flat (zero-notional) legs are nothing to open, so a missing mark
+    there is harmless and ignored."""
+    missing = sorted({
+        leg.symbol
+        for leg in book.legs
+        if abs(leg.target_notional) > 0.0
+        and not (marks.get(leg.symbol) or 0.0) > 0.0
+    })
+    if missing:
+        raise RuntimeError(
+            "market-neutrality guard: non-flat intended legs have NO mark and would be silently "
+            f"skipped by apply_fills (held book would be non-neutral): {missing}. The configured "
+            "hedge/beta symbol must always be priced (see cycle_prep_cli) — refusing to fill."
+        )
 
 
 def _intended_fills(book: TargetWeights) -> list[dict]:

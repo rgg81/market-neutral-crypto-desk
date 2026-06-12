@@ -60,16 +60,32 @@ def main(argv: list[str] | None = None) -> None:
     settings = load_settings()
     ex = FuturesExchange.from_settings(settings)
     rows = _universe_rows(args.state_dir, args.cycle, cadence, settings)
-    symbols = [r["symbol"] for r in rows if r.get("symbol")]
+    # ALPHA universe — the scout's tradable top-N (BTC is in here ONLY if the scout selected it).
+    alpha_symbols = [r["symbol"] for r in rows if r.get("symbol")]
     rows_by_sym = {r["symbol"]: r for r in rows if r.get("symbol")}
 
+    # The configured BTC hedge/beta symbol is INFRASTRUCTURE, not tradable alpha: `optimize_book`
+    # ALWAYS appends a BTC hedge leg (the beta-neutralizing instrument) and beta is measured against
+    # BTC. It must therefore ALWAYS get a priced CoinGeometry — even when the scout universe is
+    # all-alts and excludes BTC — so the hedge leg's mark reaches `apply_fills` and the HELD book
+    # stays market-neutral (else the hedge leg is silently skipped and the book goes net-short). We
+    # price BTC for the GEOMETRY build, but keep it OUT of the alpha pair/sleeve selection below.
+    btc_symbol = settings.beta.btc_symbol
+    geometry_symbols = list(alpha_symbols)
+    if btc_symbol not in geometry_symbols:
+        geometry_symbols.append(btc_symbol)
+
     bundle = build_geometries(
-        ex, symbols, now=now, btc_symbol=settings.beta.btc_symbol,
+        ex, geometry_symbols, now=now, btc_symbol=btc_symbol,
         beta_lookback=settings.beta.lookback_days, universe_rows=rows_by_sym,
     )
-    pairs, spreads = build_pairs_and_spreads(ex, symbols, cycle=args.cycle, now=now)
+    # Sleeves run on the ALPHA geometries ONLY — never force the hedge-only BTC geometry into the
+    # carry/factor/sentiment cross-section (not tradable alpha when absent from the universe).
+    alpha_set = set(alpha_symbols)
+    alpha_geometries = [g for g in bundle.geometries if g.symbol in alpha_set]
+    pairs, spreads = build_pairs_and_spreads(ex, alpha_symbols, cycle=args.cycle, now=now)
     carry_cap = (settings.sleeves.get("carry") or {}).get("max_abs_apr")
-    sleeves = build_sleeves(bundle.geometries, pairs=pairs, spreads=spreads, now=now,
+    sleeves = build_sleeves(alpha_geometries, pairs=pairs, spreads=spreads, now=now,
                             max_abs_apr=carry_cap)
 
     save_output(args.state_dir, args.cycle, "geometries", bundle, cadence=cadence)
@@ -79,7 +95,8 @@ def main(argv: list[str] | None = None) -> None:
                 {"pairs": [p.model_dump(mode="json") for p in pairs]}, cadence=cadence)
     save_output(args.state_dir, args.cycle, "spreads",
                 {"spreads": [s.model_dump(mode="json") for s in spreads]}, cadence=cadence)
-    print(json.dumps({"cycle": args.cycle, "cadence": cadence, "symbols": len(symbols),
+    print(json.dumps({"cycle": args.cycle, "cadence": cadence, "symbols": len(alpha_symbols),
+                      "geometries": len(bundle.geometries),
                       "pairs": len(pairs), "spreads": len(spreads)}, indent=2))
 
 
