@@ -236,6 +236,49 @@ def test_apply_fills_same_symbol_both_sides_that_net_to_flat_is_no_position():
     assert pos is None or abs(pos.qty * mark) < 1e-6    # net flat -> no real exposure
 
 
+def test_apply_fills_closes_symbols_absent_from_the_new_book():
+    """A symbol HELD from a prior cycle that is ABSENT from the new full book must be FLATTENED
+    (realizing its PnL + a close fee/slippage), not left lingering. This is the reselection/drop
+    path: a name dropped at rebalance must be closed so the held book tracks the new intended book.
+
+    FAILS pre-fix: apply_fills only touches symbols PRESENT in the fed legs, so a dropped symbol
+    keeps its position and silently breaks neutrality."""
+    acct = PaperAccount(cash=20_000.0)
+    costs = {
+        "ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0),
+        "SOL/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0),
+    }
+    marks = {"ETH/USDT:USDT": 2000.0, "SOL/USDT:USDT": 100.0}
+    # cycle 1: hold ETH long + SOL short
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 4000.0},
+         {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 4000.0}],
+        marks, costs, opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
+    assert "SOL/USDT:USDT" in acct.positions
+    fees_before = acct.fees_paid
+    # cycle 2: a new full book that DROPS SOL (only ETH remains).
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 4000.0}],
+        marks, costs, opened_ts=datetime(2026, 6, 17, tzinfo=UTC))
+    assert "SOL/USDT:USDT" not in acct.positions        # dropped symbol was CLOSED, not lingering
+    assert acct.positions["ETH/USDT:USDT"].qty == 2.0    # untouched ETH leg -> no churn
+    assert acct.fees_paid > fees_before                  # a close fee was charged on the SOL close
+    # the SOL close snapshots a ClosedLeg (for the "at close" journal patch).
+    assert any(cl.symbol == "SOL/USDT:USDT" for cl in acct.closed_legs)
+
+
+def test_apply_fills_empty_book_closes_all_held_symbols():
+    """An EMPTY new book flattens the WHOLE held book (every held symbol is absent from it)."""
+    acct = PaperAccount(cash=20_000.0)
+    costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 4000.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs, opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
+    acct.apply_fills([], {"ETH/USDT:USDT": 2000.0}, costs,
+                     opened_ts=datetime(2026, 6, 17, tzinfo=UTC))
+    assert acct.positions == {}                          # everything flattened
+
+
 def test_settle_funding_short_positive_rate_is_a_credit_and_advances_clock():
     acct = PaperAccount(cash=20_000.0)
     acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)

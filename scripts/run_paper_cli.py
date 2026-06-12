@@ -37,7 +37,7 @@ from futures_fund.account import CostInputs, load_account, save_account
 from futures_fund.config import load_settings
 from futures_fund.contracts import TargetWeights, WeightLeg
 from futures_fund.control_loop import cadence_due
-from futures_fund.cycle_io import cycle_dir, load_output, save_output
+from futures_fund.cycle_io import load_output, save_output
 from futures_fund.journal import patch_outcome
 from futures_fund.models import Cadence
 from futures_fund.pnl_attribution import append_ledger, build_cycle_pnl
@@ -206,25 +206,31 @@ def _run_cadence(
     # Step 6a — execute boundary (re-checks reviewer_gate_ok) -> report.json.
     _run_execute(state_dir, cadence, cycle)
     # Step 7a — REALISTIC P&L: load the account, settle funding since the account's OWN funding
-    # clock (NOT the cycle-collided equity series), reconcile THIS cycle's executed book to target
-    # (weekly re-emits the full book -> delta 0 on unchanged legs; daily nudges the changed legs —
-    # no double-count, convergent across weeks), mark-to-market, record the REAL equity (replaces
-    # the old flat settings.account_size_usdt), write pnl.json + ledger, patch each CLOSED leg's
-    # realized costs onto the journal Decision that opened it, then save the account.
-    # settle_funding runs BEFORE apply_fills so a position opened this cycle earns no funding for a
-    # pre-existence window (Task 8a pins this).
+    # clock (NOT the cycle-collided equity series), reconcile the ACCOUNT to the FULL intended book
+    # (`reviewed.legs` — the consolidated, neutral, hedge-correct book the reviewer validated), NOT
+    # the sparse execution deltas. apply_fills computes delta = target - current internally and
+    # charges frictions only on the delta, so feeding the full book each cycle trades ONLY what
+    # changed (unchanged symbols -> delta 0 -> no-op; no churn) while keeping the HELD book correct
+    # and market-neutral. A symbol DROPPED from the new book is FLATTENED (apply_fills closes any
+    # held symbol absent from the fed legs). The gate/report.json/rebalance_trades.json execution
+    # record is unchanged — that stays the "what we traded this cycle" view; only the ACCOUNT feed
+    # changed. Then mark-to-market, record the REAL equity (replaces the old flat
+    # settings.account_size_usdt), write pnl.json + ledger, patch each CLOSED leg's realized costs
+    # onto the journal Decision that opened it, then save the account. settle_funding runs BEFORE
+    # apply_fills so a position opened this cycle earns no funding for a pre-existence window
+    # (Task 8a pins this).
     account = load_account(state_dir, equity)  # `equity` is the default cash on a cold dir
     bundle = _load_geometries(state_dir, cadence, cycle)
     marks, funding_by_symbol, intervals, costs = _geometry_cost_maps(bundle)
     prev_ts = account.last_funding_ts or now             # the per-account funding clock
     opening_equity = account.equity(marks)
     account.settle_funding(prev_ts, now, funding_by_symbol, intervals, marks)
-    executed = _read_executed(state_dir, cadence, cycle)
+    intended = _intended_fills(reviewed)
     account.apply_fills(
-        executed, marks, costs,
+        intended, marks, costs,
         opened_ts=now, opened_cycle=cycle, opened_cadence=cadence,
     )
-    turnover = sum(abs(float(t.get("target_notional", 0.0))) for t in executed)
+    turnover = sum(abs(float(t.get("target_notional", 0.0))) for t in intended)
     equity_now = account.equity(marks)
     equity_log.record_equity(state_dir, now, equity_now, cycle)
     rec = build_cycle_pnl(
@@ -254,13 +260,20 @@ def _run_cadence(
     return True
 
 
-def _read_executed(state_dir, cadence: Cadence, cycle: int) -> list:
-    """Best-effort read of a cadence cycle's executed report legs (for the run summary)."""
-    try:
-        path = cycle_dir(state_dir, cycle, cadence=cadence) / "report.json"
-        return json.loads(path.read_text()).get("executed", [])
-    except (OSError, json.JSONDecodeError):
-        return []
+def _intended_fills(book: TargetWeights) -> list[dict]:
+    """The FULL intended-holdings book as apply_fills leg dicts (symbol/direction/target_notional).
+
+    This is the ACCOUNT feed: the consolidated, dollar+beta-neutral, hedge-correct book the reviewer
+    validated — NOT the sparse execution deltas. Reconciling the account to this FULL book every
+    cycle keeps the held positions market-neutral (apply_fills charges frictions only on the per-
+    symbol delta, so unchanged legs are no-ops and a dropped symbol is flattened). Zero-notional
+    legs are dropped (nothing to hold); same-symbol legs are consolidated inside apply_fills."""
+    return [
+        {"symbol": leg.symbol, "direction": leg.direction,
+         "target_notional": abs(leg.target_notional)}
+        for leg in book.legs
+        if abs(leg.target_notional) > 0.0
+    ]
 
 
 def _leg_cost_patches(account) -> list[tuple[int | None, str | None, str, str, dict]]:

@@ -192,7 +192,13 @@ class PaperAccount(BaseModel):
         opened_cycle: int | None = None,
         opened_cadence: str | None = None,
     ) -> None:
-        """RECONCILE each touched symbol to its NET signed target across all of its legs.
+        """RECONCILE the WHOLE held book to the new FULL intended book.
+
+        `executed_trades` is the FULL consolidated (neutral, hedge-correct) target book — NOT a
+        sparse execution delta — so the held positions always track the intended book. Each touched
+        symbol is reconciled to its NET signed target across all of its legs, and any HELD symbol
+        ABSENT from the new book is FLATTENED (target 0): a name dropped at reselection/rebalance
+        must be closed, not left lingering (else the held book silently breaks neutrality).
 
         The optimizer legitimately emits the SAME symbol on BOTH sides (e.g. a factor SHORT and a
         hedge LONG): those legs NET to a single per-symbol position. We therefore CONSOLIDATE the
@@ -224,15 +230,32 @@ class PaperAccount(BaseModel):
             leg_sign = 1.0 if direction == "long" else -1.0
             net_signed_notional[sym] = (
                 net_signed_notional.get(sym, 0.0) + leg_sign * target_notional)
+        # CLOSE any currently-HELD symbol ABSENT from the new (full intended) book — a name dropped
+        # at reselection/rebalance must be FLATTENED (realizing its PnL + a close fee/slippage), not
+        # left lingering. Without this the dropped leg silently survives and breaks neutrality. We
+        # synthesize a target-0 leg for it so it routes the SAME consolidated reconcile/close path
+        # as an explicit zero-target leg (no special-casing). Snapshot the keys first — the
+        # reconcile loop below mutates `positions`.
+        dropped = [sym for sym in self.positions if sym not in net_signed_notional]
+        for sym in dropped:
+            net_signed_notional[sym] = 0.0
         for sym, net_notional in net_signed_notional.items():
+            existing = self.positions.get(sym)
             mark = marks.get(sym)
             if mark is None or mark <= 0:
-                continue
+                # A DROPPED symbol (target 0) whose mark vanished with its universe slot must still
+                # be FLATTENED — close it at its own entry_price (the only price we hold), realizing
+                # ~0 incremental price-PnL but removing the exposure so the held book stays neutral.
+                # A symbol with no mark AND a non-zero target can't be sized -> skip (as before).
+                if existing is None or abs(net_notional) > 1e-9:
+                    continue
+                mark = existing.entry_price
+                if mark <= 0:
+                    continue
             direction = "long" if net_notional >= 0.0 else "short"
             ci = costs.get(sym) or CostInputs()
             sign = 1.0 if direction == "long" else -1.0
             target_signed_qty = sign * (abs(net_notional) / mark)
-            existing = self.positions.get(sym)
             current_signed_qty = _signed_qty(existing)
             delta_signed_qty = target_signed_qty - current_signed_qty
             if abs(delta_signed_qty) <= 1e-12:

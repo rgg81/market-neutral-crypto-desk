@@ -90,6 +90,121 @@ def test_held_book_is_dollar_and_beta_neutral_with_a_same_symbol_hedge_alpha_pai
     assert btc.direction == "long" and abs(btc.qty * marks["BTC/USDT:USDT"] - 13.0) < 1e-6
 
 
+def _held_long_short(acct, marks):
+    """(Sum long $, Sum short $) over the HELD positions at `marks`."""
+    long_usd = sum(p.qty * marks[s] for s, p in acct.positions.items() if p.direction == "long")
+    short_usd = sum(p.qty * marks[s] for s, p in acct.positions.items() if p.direction == "short")
+    return long_usd, short_usd
+
+
+def _held_beta_resid(acct, marks, betas):
+    """Beta residual = Sum(signed notional * beta) over the HELD positions."""
+    return sum(
+        (p.qty * marks[s] if p.direction == "long" else -p.qty * marks[s]) * betas[s]
+        for s, p in acct.positions.items())
+
+
+def test_full_neutral_book_held_then_dropped_symbol_closed_and_still_neutral():
+    """HARD INVARIANT (the live market-neutrality bug). Feed the FULL intended (consolidated,
+    dollar+beta-neutral, BTC-hedged) book into apply_fills; the HELD positions must reconstruct the
+    SAME neutrality (|Sum long$ - Sum short$| < $5 AND beta-neutral) and each held per-symbol net
+    must equal the intended per-symbol net. Then a SECOND cycle's FULL book that DROPS a symbol and
+    re-hedges must CLOSE the dropped symbol (gone from positions) and STILL be dollar+beta-neutral,
+    equal to the new intended book.
+
+    Pre-fix FAILS: feeding the full book each cycle is not the live wiring (the live loop fed the
+    sparse daily deltas), and even at the apply_fills level a symbol DROPPED from the new book is
+    never flattened — it lingers, so the held book is net-imbalanced and keeps the dropped name."""
+    marks = {"BTC/USDT:USDT": 60_000.0, "ETH/USDT:USDT": 3000.0,
+             "SOL/USDT:USDT": 150.0, "XRP/USDT:USDT": 0.6}
+    betas = {"BTC/USDT:USDT": 1.0, "ETH/USDT:USDT": 1.0, "SOL/USDT:USDT": 1.0, "XRP/USDT:USDT": 1.0}
+    costs = {s: CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0) for s in marks}
+
+    # CYCLE 1 — full neutral book: $9000 long / $9000 short, BTC hedge included on BOTH sides.
+    #   BTC factor-short $3000 + BTC hedge-long $3000 -> net BTC flat (0)
+    #   ETH long $6000 | SOL short $3000 + XRP short $3000
+    book1 = [
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 3000.0},  # factor
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 3000.0},   # hedge
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 6000.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 3000.0},
+        {"symbol": "XRP/USDT:USDT", "direction": "short", "target_notional": 3000.0},
+    ]
+    intended1 = _net_intended(book1)                   # {sym: signed $} the book intends to HOLD
+    acct = PaperAccount(cash=100_000.0)
+    acct.apply_fills(book1, marks, costs, opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
+
+    long1, short1 = _held_long_short(acct, marks)
+    assert abs(long1 - short1) < 5.0                   # held book dollar-neutral
+    assert abs(_held_beta_resid(acct, marks, betas)) < 5.0   # held book beta-neutral
+    # held per-symbol net == intended per-symbol net
+    for sym, signed in intended1.items():
+        held = _signed_held(acct, sym, marks)
+        assert abs(held - signed) < 1e-6, f"{sym}: held {held} != intended {signed}"
+
+    # CYCLE 2 — full neutral book that DROPS XRP and RE-HEDGES: $9000 long / $9000 short.
+    #   BTC factor-short $2000 + BTC hedge-long $2000 -> net BTC flat
+    #   ETH long $7000 | SOL short $7000      (XRP absent -> must be CLOSED)
+    book2 = [
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2000.0},
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2000.0},
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 7000.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 7000.0},
+    ]
+    intended2 = _net_intended(book2)
+    acct.apply_fills(book2, marks, costs, opened_ts=datetime(2026, 6, 17, tzinfo=UTC))
+
+    assert "XRP/USDT:USDT" not in acct.positions       # DROPPED symbol was flattened
+    long2, short2 = _held_long_short(acct, marks)
+    assert abs(long2 - short2) < 5.0                   # STILL dollar-neutral after the drop
+    assert abs(_held_beta_resid(acct, marks, betas)) < 5.0   # STILL beta-neutral
+    for sym, signed in intended2.items():
+        held = _signed_held(acct, sym, marks)
+        assert abs(held - signed) < 1e-6, f"{sym}: held {held} != intended {signed}"
+
+
+def test_refeeding_identical_full_book_trades_nothing():
+    """No-churn: re-feeding the IDENTICAL full book reconciles to delta 0 on every leg -> no new
+    fees/slippage, positions unchanged (the account stays put)."""
+    marks = {"BTC/USDT:USDT": 60_000.0, "ETH/USDT:USDT": 3000.0, "SOL/USDT:USDT": 150.0}
+    costs = {s: CostInputs(adv_usd=5_000_000.0, half_spread_bps=1.0) for s in marks}
+    book = [
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 3000.0},
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 3000.0},
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 6000.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 6000.0},
+    ]
+    acct = PaperAccount(cash=100_000.0)
+    acct.apply_fills(book, marks, costs, opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
+    qty1 = {s: (p.direction, p.qty) for s, p in acct.positions.items()}
+    fees1, slip1 = acct.fees_paid, acct.slippage_paid
+    cash1 = acct.cash
+
+    acct.apply_fills(book, marks, costs, opened_ts=datetime(2026, 6, 17, tzinfo=UTC))  # identical
+    qty2 = {s: (p.direction, p.qty) for s, p in acct.positions.items()}
+    assert qty2 == qty1                                # positions unchanged
+    assert acct.fees_paid == fees1                     # 0 new fee
+    assert acct.slippage_paid == slip1                 # 0 new slippage
+    assert acct.cash == cash1                          # account stayed put
+
+
+def _net_intended(book):
+    """Net signed $ per symbol the leg-level book intends to HOLD (long +, short -)."""
+    net = {}
+    for leg in book:
+        sign = 1.0 if leg["direction"] == "long" else -1.0
+        net[leg["symbol"]] = net.get(leg["symbol"], 0.0) + sign * leg["target_notional"]
+    return {s: v for s, v in net.items() if abs(v) > 1e-9}
+
+
+def _signed_held(acct, sym, marks):
+    """Signed held $ for a symbol (0 if flat/absent)."""
+    pos = acct.positions.get(sym)
+    if pos is None:
+        return 0.0
+    return (pos.qty if pos.direction == "long" else -pos.qty) * marks[sym]
+
+
 def test_two_cycle_equity_moves_off_constant_with_funding_and_fees():
     acct = PaperAccount(cash=20_000.0)
     costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=1.0)}

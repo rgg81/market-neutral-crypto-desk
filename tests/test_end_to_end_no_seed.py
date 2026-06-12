@@ -204,6 +204,133 @@ def test_wired_loop_writes_ledger_account_and_real_equity(no_seed_env):
     assert abs(last_ledger["closing_equity"] - expected_equity) < 1e-6
 
 
+def test_wired_loop_held_account_book_is_dollar_neutral(no_seed_env):
+    """REGRESSION GUARD for the market-neutrality bug: after a full wired run the HELD account book
+    (the REAL positions on account.json) must be dollar-neutral within tolerance.
+
+    This is the assertion that would have caught the live bug: the loop used to feed the SPARSE
+    daily rebalance DELTAS into the account, so the held positions DRIFTED off the intended neutral
+    book (net short, BTC hedge missing). The fix reconciles the account to the FULL intended book
+    (reviewed.legs) every cycle. The intended books are dollar+beta-neutral, so the HELD book — the
+    consolidated net of those legs — must be dollar-neutral too."""
+    from futures_fund.account import load_account
+    from scripts.run_paper_cli import _geometry_cost_maps, main
+
+    main(["--now", NOW_ISO])
+    state = no_seed_env / "state"
+
+    account = load_account(state, default_cash=-1.0)
+    assert account.positions, "the wired loop must have opened a held book"
+    # marks for every held symbol (the universe is identical across cadences here).
+    marks_w, *_ = _geometry_cost_maps(load_output(state, 1, "geometries", cadence="weekly"))
+    marks_d, *_ = _geometry_cost_maps(load_output(state, 1, "geometries", cadence="daily"))
+    marks = {**marks_w, **marks_d}
+    held_long = sum(p.qty * marks[s] for s, p in account.positions.items() if p.direction == "long")
+    held_short = sum(
+        p.qty * marks[s] for s, p in account.positions.items() if p.direction == "short")
+    gross = held_long + held_short
+    assert gross > 0.0
+    # |Sum long$ - Sum short$| is a small fraction of gross — the held book is market-neutral.
+    # (Pre-fix the held book went net short ~$1.7k on a ~$18k gross; this guard would have failed.)
+    assert abs(held_long - held_short) <= 0.03 * gross, (
+        f"held book not dollar-neutral: long={held_long:.2f} short={held_short:.2f}")
+
+
+# A 7th name the week-2 reselection swaps DOGE for — extends the balanced beta~1 cross-section.
+_AVAX = "AVAX/USDT:USDT"
+_ALL_MARKS = {**_MARKS, _AVAX: 30.0}
+_ALL_FUNDING = {**_FUNDING, _AVAX: -0.0002}
+_ALL_ORDER = list(_ALL_MARKS)  # stable RNG-seed index across both universes
+
+
+def _drifting_universe_fakes(universe_cell):
+    """Build (scout, cycle_prep) fakes that read the CURRENT universe from `universe_cell['now']`,
+    so a run can SWAP the selected universe between cycles (week-2 drops DOGE, adds AVAX)."""
+
+    class _Scout:
+        def load_markets(self):
+            return {s: {"info": {"underlyingType": "COIN", "onboardDate": "1567965300000"}}
+                    for s in universe_cell["now"]}
+
+        def fetch_tickers(self):
+            return {s: {"last": _ALL_MARKS[s], "quoteVolume": 1e9, "percentage": 0.0}
+                    for s in universe_cell["now"]}
+
+    class _CyclePrep:
+        def ohlcv(self, symbol, timeframe="4h", limit=500):
+            rng = np.random.default_rng(_ALL_ORDER.index(symbol) + 1)
+            factor = np.cumsum(np.random.default_rng(0).normal(0, 0.02, 120))
+            idio = rng.normal(0, 0.0003, 120)
+            closes = _ALL_MARKS[symbol] * np.exp(factor + idio)
+            ts = pd.date_range("2026-01-01", periods=120, freq="4h", tz="UTC")
+            return pd.DataFrame({"timestamp": ts, "open": closes, "high": closes,
+                                 "low": closes, "close": closes, "volume": 1.0})
+
+        def funding(self, symbol):
+            return FundingInfo(symbol=symbol, current_rate=_ALL_FUNDING[symbol],
+                               next_funding_ts=pd.Timestamp(NOW_ISO).to_pydatetime(),
+                               interval_hours=8.0, mark_price=_ALL_MARKS[symbol],
+                               index_price=_ALL_MARKS[symbol])
+
+        def mark_price(self, symbol):
+            return _ALL_MARKS[symbol]
+
+        def depth(self, symbol, limit=20):
+            mark = _ALL_MARKS[symbol]
+            qty = 5_000_000.0 / mark
+            return {"bids": [(mark * 0.999, qty)], "asks": [(mark * 1.001, qty)]}
+
+    return _Scout(), _CyclePrep()
+
+
+def test_two_weekly_runs_drop_a_symbol_and_keep_the_held_book_neutral(tmp_path, monkeypatch):
+    """BINDING loop-level regression for the live market-neutrality bug. Two weekly runs a week
+    apart: run 2 RESELECTS a different universe (DOGE dropped, AVAX added), so the week-2 intended
+    book is dollar+beta-neutral but its symbol set DIFFERS. Through the REAL `_run_cadence` the HELD
+    account book must, after run 2: (a) NOT retain the dropped DOGE (flattened — even though its
+    mark vanished with its universe slot), and (b) stay dollar-neutral, equal to the new book.
+
+    FAILS pre-fix: the loop fed the SPARSE daily/weekly delta into the account (and never closed a
+    dropped symbol whose mark is gone), so the held book drifts net-imbalanced by the dropped leg's
+    notional and KEEPS the dropped DOGE — the desk is silently NOT market-neutral. The fix
+    reconciles the account to the FULL intended book each cycle and flattens dropped names."""
+    universe_cell = {"now": list(_UNIVERSE)}                 # week 1: the 6-name base universe
+    scout, cycle_prep = _drifting_universe_fakes(universe_cell)
+    monkeypatch.setattr("scripts.scout_cli.build_ccxt", lambda settings: scout)
+    monkeypatch.setattr("futures_fund.exchange.FuturesExchange.from_settings",
+                        staticmethod(lambda settings: cycle_prep))
+    monkeypatch.chdir(tmp_path)
+
+    from datetime import UTC, datetime, timedelta
+
+    from futures_fund.account import load_account
+    from scripts.run_paper_cli import _geometry_cost_maps, main
+
+    base = datetime(2026, 6, 11, tzinfo=UTC)
+    main(["--now", base.isoformat()])                       # run 1: open the 6-name neutral book
+    state = tmp_path / "state"
+    acct1 = load_account(state, default_cash=-1.0)
+    assert "DOGE/USDT:USDT" in acct1.positions              # DOGE held after run 1
+
+    # run 2 (a week later): RESELECT — drop DOGE, add AVAX. Weekly fires cycle 2 (fresh candle).
+    universe_cell["now"] = [s for s in _UNIVERSE if s != "DOGE/USDT:USDT"] + [_AVAX]
+    main(["--now", (base + timedelta(days=8)).isoformat()])
+
+    account = load_account(state, default_cash=-1.0)
+    assert "DOGE/USDT:USDT" not in account.positions        # DROPPED symbol was flattened
+    assert _AVAX in account.positions                       # the new name was opened
+    # held book is dollar-neutral at the week-2 marks (DOGE's mark is GONE — it must be closed at
+    # entry, not skipped). Use the week-2 weekly marks (the universe actually held now).
+    marks, *_ = _geometry_cost_maps(load_output(state, 2, "geometries", cadence="weekly"))
+    held_long = sum(p.qty * marks[s] for s, p in account.positions.items() if p.direction == "long")
+    held_short = sum(
+        p.qty * marks[s] for s, p in account.positions.items() if p.direction == "short")
+    gross = held_long + held_short
+    assert gross > 0.0
+    assert abs(held_long - held_short) <= 0.03 * gross, (
+        f"held book not dollar-neutral after a drop: long={held_long:.2f} short={held_short:.2f}")
+
+
 def test_fabricated_pair_pnl_halts_the_wired_loop(no_seed_env):
     # LOOP-LEVEL C2 (not just unit-level): run the producers once to get an HONEST built book, then
     # TAMPER a produced spread's realized_pnl to a large value and re-run the reviewer in the fully
