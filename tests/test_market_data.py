@@ -5,6 +5,7 @@ from futures_fund.market_data import (
     liquidity_floor,
     parse_funding,
     parse_ohlcv,
+    parse_onboard_date_ms,
     parse_symbol_spec,
     scan_universe,
 )
@@ -216,3 +217,15 @@ def test_scan_universe_carries_onboard_date_ms_int_or_none():
     assert by_sym["NEW/USDT:USDT"]["onboard_date"] is None
     # existing fields unchanged
     assert by_sym["NEW/USDT:USDT"]["chg_24h_pct"] == 130.0
+
+
+def test_parse_onboard_date_ms_parses_string_epoch():
+    assert parse_onboard_date_ms({"info": {"onboardDate": "1567965300000"}}) == 1567965300000
+
+
+def test_parse_onboard_date_ms_none_when_absent_or_unparseable():
+    assert parse_onboard_date_ms({"info": {}}) is None
+    assert parse_onboard_date_ms({}) is None
+    assert parse_onboard_date_ms(None) is None
+    assert parse_onboard_date_ms({"info": {"onboardDate": None}}) is None
+    assert parse_onboard_date_ms({"info": {"onboardDate": "not-a-number"}}) is None

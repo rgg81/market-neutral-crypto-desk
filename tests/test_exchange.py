@@ -86,20 +86,3 @@ def test_depth_levels_are_price_qty_tuples():
     book = ex.depth("BTC/USDT:USDT")
     for px, qty in book["asks"] + book["bids"]:
         assert isinstance(px, float) and isinstance(qty, float)
-
-
-class _OnboardCcxt:
-    def market(self, symbol):
-        if symbol == "BTC/USDT:USDT":
-            return {"info": {"onboardDate": "1567965300000"}}
-        return {"info": {}}
-
-
-def test_onboard_date_ms_parses_string_epoch():
-    ex = FuturesExchange(_OnboardCcxt(), keyless=True)
-    assert ex.onboard_date_ms("BTC/USDT:USDT") == 1567965300000
-
-
-def test_onboard_date_ms_none_when_absent():
-    ex = FuturesExchange(_OnboardCcxt(), keyless=True)
-    assert ex.onboard_date_ms("FOO/USDT:USDT") is None

@@ -27,6 +27,19 @@ def _filter_field(filters: list[dict], filter_type: str, field: str) -> float | 
     return None
 
 
+def parse_onboard_date_ms(market: dict | None) -> int | None:
+    """Binance listing timestamp (ms-epoch) from a ccxt market dict's `info.onboardDate`, or None.
+
+    The single home for the onboard-date parsing rule: `info.onboardDate` is a string after
+    load_markets(); coerce to int, fail-soft to None when absent/None/unparseable. Both the
+    universe scan and any age-fallback consumer share this one parser so the rule never drifts."""
+    raw = ((market or {}).get("info") or {}).get("onboardDate")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_symbol_spec(market: dict, tiers: list[dict]) -> SymbolSpec:
     """ccxt market dict + leverage tiers -> SymbolSpec, preferring exchangeInfo filters."""
     filters = (market.get("info") or {}).get("filters") or []
@@ -123,14 +136,10 @@ def scan_universe(client, top_n: int = 30) -> list[dict]:
         qv = t.get("quoteVolume") or 0.0
         last = t.get("last")
         if qv and last:
-            raw_onboard = (market.get("info") or {}).get("onboardDate")
-            try:
-                onboard_ms = int(raw_onboard) if raw_onboard is not None else None
-            except (TypeError, ValueError):
-                onboard_ms = None
             rows.append({"symbol": sym, "last": float(last),
                          "chg_24h_pct": round(float(t.get("percentage") or 0.0), 2),
-                         "vol_24h_usd": float(qv), "onboard_date": onboard_ms})
+                         "vol_24h_usd": float(qv),
+                         "onboard_date": parse_onboard_date_ms(market)})
     rows.sort(key=lambda r: r["vol_24h_usd"], reverse=True)
     return rows[:top_n]
 
