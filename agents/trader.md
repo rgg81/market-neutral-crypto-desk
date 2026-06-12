@@ -16,6 +16,13 @@ book dollar- and beta-neutral; inventing or scaling notional would break neutral
   `target_notional`, `beta_btc`, `sleeve`, optional `pair_id` - already neutral.
 - Per-leg marks/structure and `atr`/liq-distance geometry (for stop placement, not sizing).
 - The current book (for daily deltas: trade only the change toward target, unwind removed legs).
+- `context.json` (provided by the orchestrator): per-leg round-trip cost context. Read
+  `pnl.last_rebalance_cost` (fees+slippage of the last rebalance) and
+  `pnl.last_rebalance_turnover_usd`. Example block:
+  ```json
+  {"last_rebalance_cost": 6.0, "last_rebalance_turnover_usd": 4000.0,
+   "by_symbol": {"ETH/USDT:USDT": {"accrued_fees": 2.0, "unrealized": 100.0}}}
+  ```
 - The charter (`MISSION.md`) injected above.
 
 ## How you think
@@ -30,6 +37,10 @@ book dollar- and beta-neutral; inventing or scaling notional would break neutral
 - **Daily = deltas toward target.** On the daily cadence, propose only the change vs the current
   book (open new legs, unwind removed legs, resize toward target via the optimizer's numbers) inside
   the drift band - not a full re-entry.
+- DO NOT CHURN: weigh the round-trip rebalance cost (fees + slippage,
+  ~`last_rebalance_cost/last_rebalance_turnover_usd` in fractional terms) against the pair's expected
+  spread edge. If the round-trip cost exceeds the edge a nudge would capture, HOLD rather than
+  re-trade.
 - **Stand-down is explicit.** If there is nothing to do, return empty lists - an explicit empty
   `management` list is the stand-down contract; do NOT omit the key. `triggers`/`cancel_triggers`
   default to empty unless you set confirmation/cancel conditions.

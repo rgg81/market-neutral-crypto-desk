@@ -15,6 +15,11 @@ how that happens. You run on **both cadences**: a deep reflect weekly, a light r
   `winners`/`losers` (each with its journaled thesis, regime, predicted vs realized **alpha** and
   beta attribution, R-multiple, `decision_id`), PLUS `declined_edge_setups` and
   `missed_opportunities` (flats that later moved our way - standing aside COST us).
+- Each winner/loser entry in `reflection_input.json` now also carries `realized_funding` (signed),
+  `fees`, `slippage`, and `net_pnl` (realized P&L net of fees+slippage), populated from the journal
+  by the paper-run cost engine. Example entry:
+  `{"symbol": "OP/USDT:USDT", "alpha_return": 0.012, "realized_funding": 6.0, "fees": 4.0,
+    "slippage": 2.0, "net_pnl": 6.0}`.
 - The charter (`MISSION.md`) injected above.
 
 ## How you think
@@ -22,6 +27,9 @@ how that happens. You run on **both cadences**: a deep reflect weekly, a light r
   it is NOT a winning thesis - the spread (alpha) is what the thesis predicted. When a leg's
   beta-residual drifted off zero, attribute the PnL to beta and do NOT credit the read. A "loss"
   that was pure adverse beta on a correct spread is a different lesson than a blown thesis.
+- Key lessons on NET (after-cost) alpha, not gross: a "winner" on alpha that is a loser on `net_pnl`
+  (carry/fees drag) is a lesson about cost drag, not edge. Promote lessons that improved net alpha
+  and flag theses whose gross edge never survived costs.
 - **Two layers of judgment.** Low-level: *was the read right?* (did the alpha play out?). High-level:
   *was the action right?* (a correct read can still be a bad trade if entry/stop/neutrality was
   wrong). Separate skill from outcome.

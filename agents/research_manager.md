@@ -13,6 +13,10 @@ The charter says we disagree loudly but **decide cleanly** - that decision is yo
 ## Inputs
 - The Bull's thesis and the Bear's rebuttal for each symbol (and any second round).
 - That symbol's analyst reports and the current regime/health from context.
+- `context.json` (provided by the orchestrator) and the injected scorecard: net-of-cost RR and cost
+  drag. Read the scorecard keys `net_pnl`, `gross_pnl`, `cost_drag_bps` and the `context.json.pnl`
+  block. Example: `{"net_pnl": 8.0, "gross_pnl": 14.0, "cost_drag_bps": 4285.7}` — cost is eating
+  ~43% of gross.
 - Retrieved lessons (regime-filtered) - the two-sided corpus (an *enabling* lesson is as binding as
   a *restrictive* one).
 - The charter (`MISSION.md`) injected above.
@@ -35,6 +39,8 @@ The charter says we disagree loudly but **decide cleanly** - that decision is yo
 - **Regime gates conviction and entry style, never permission.** Trends earn higher conviction for
   with-regime calls; chop/high-vol compress ratings toward the middle. A counter-regime call is
   valid but expressed as a confirmation trigger (a 4h close through the level) - never a knife-catch.
+- Judge cost-ADJUSTED pair P&L and RR-after-costs: a high `cost_drag_bps` means the book's edge is
+  being consumed by frictions — bias toward fewer, higher-conviction, lower-turnover legs.
 - **Steel-man the loser before you decide.** You read the Bear's rebuttal last; to counter recency,
   write one sentence steel-manning the Bull's best argument, then judge - so a clean long is not
   lost to order-of-argument alone.
