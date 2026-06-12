@@ -14,6 +14,8 @@ import argparse
 import json
 import sys
 
+from futures_fund.account import load_account
+from futures_fund.config import load_settings
 from futures_fund.control_loop import latest_cadence_cycle
 from futures_fund.cycle_io import cycle_dir, load_output, save_output
 from futures_fund.models import Cadence
@@ -47,6 +49,37 @@ def build_briefs(universe: list[dict], held: list[str]) -> list[dict]:
     return [{"symbol": s, "held": s in held_set} for s in syms]
 
 
+def build_pnl_block(state_dir, *, marks: dict[str, float], last_pnl: dict,
+                    default_cash: float) -> dict:
+    """The realized cost/carry/PnL block folded into context.json (an ARTIFACT the external SKILL.md
+    orchestrator reads when assembling prompts — there is no Python prompt-injection path here).
+
+    Per-symbol realized funding carry (signed accrued_funding, + = received), current unrealized
+    PnL, and accrued fees; plus the last rebalance's cost (fees+slippage) vs its turnover so the
+    trader can weigh round-trip cost against the spread edge before churning a pair."""
+    acct = load_account(state_dir, default_cash)
+    upnl = acct.mark_to_market(marks)
+    by_symbol = {
+        sym: {
+            "unrealized": upnl.get(sym, 0.0),
+            "realized_funding": pos.accrued_funding,
+            "accrued_fees": pos.accrued_fees,
+        }
+        for sym, pos in acct.positions.items()
+    }
+    return {
+        "equity": acct.equity(marks),
+        "total_fees": acct.fees_paid,
+        "total_slippage": acct.slippage_paid,
+        "total_funding_received": acct.funding_received,
+        "total_funding_paid": acct.funding_paid,
+        "last_rebalance_cost": float(last_pnl.get("fees_paid", 0.0))
+        + float(last_pnl.get("slippage_paid", 0.0)),
+        "last_rebalance_turnover_usd": float(last_pnl.get("turnover_usd", 0.0)),
+        "by_symbol": by_symbol,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Fold held symbols + build per-symbol briefs (W3).")
     ap.add_argument("--cycle", type=int, required=True)
@@ -60,7 +93,30 @@ def main(argv: list[str] | None = None) -> None:
     except FileNotFoundError:
         universe = []
     held = _held_symbols(args.state_dir, cadence)
-    ctx = {"briefs": build_briefs(universe, held), "held": held}
+    # Fold the realized cost/carry/PnL block (Phase 9) so the artifact context.json carries cost
+    # data for the external orchestrator. load_settings() is safe with no config.yaml in cwd
+    # (account_size_usdt defaults to 20000); default_cash is passed explicitly regardless.
+    marks: dict[str, float] = {}
+    try:
+        bundle = load_output(args.state_dir, args.cycle, "geometries", cadence=cadence)
+        marks = {g["symbol"]: float(g["mark"]) for g in bundle.get("geometries", [])
+                 if g.get("symbol") and g.get("mark") is not None}
+    except FileNotFoundError:
+        marks = {}
+    try:
+        last_pnl = load_output(args.state_dir, args.cycle, "pnl", cadence=cadence)
+    except FileNotFoundError:
+        last_pnl = {}
+    settings = load_settings()
+    pnl_block = build_pnl_block(
+        args.state_dir, marks=marks, last_pnl=last_pnl,
+        default_cash=settings.account_size_usdt)
+    briefs = build_briefs(universe, held)
+    for b in briefs:
+        per = pnl_block["by_symbol"].get(b["symbol"])
+        if per is not None:
+            b["pnl"] = per                          # per-symbol realized cost/carry on the brief
+    ctx = {"briefs": briefs, "held": held, "pnl": pnl_block}
     save_output(args.state_dir, args.cycle, "context", ctx, cadence=cadence)
     print(json.dumps(ctx, indent=2, default=str))
 
