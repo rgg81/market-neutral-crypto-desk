@@ -143,6 +143,85 @@ def liquidity_floor(rows: list[dict], *, min_adv_usd: float, symbol_count: int) 
     return kept[:symbol_count]
 
 
+def _book_depth_usd(levels: list[tuple[float, float]]) -> float:
+    """FULL dollar notional of all `levels` (top-N book on one side). No cap — the depth floor is
+    measured against this summed value, NOT clipped to depth_ref_usd."""
+    acc = 0.0
+    for price, qty in levels:
+        acc += float(price) * float(qty)
+    return acc
+
+
+def _age_days(row: dict, *, now: datetime, exchange) -> float | None:
+    """Listing age in days. Prefer onboard_date (ms-epoch); else derive from the earliest OHLCV
+    kline timestamp (now - earliest). Returns None only when neither source is available (caller
+    keeps the name, recording it under 'age_unknown' — a sane fallback, never a silent drop)."""
+    onboard = row.get("onboard_date")
+    if onboard is not None:
+        return (now.timestamp() * 1000.0 - float(onboard)) / 86_400_000.0
+    try:
+        df = exchange.ohlcv(row["symbol"])
+    except Exception:
+        return None
+    if df is None or df.empty or "timestamp" not in df:
+        return None
+    earliest = pd.to_datetime(df["timestamp"].iloc[0], utc=True).to_pydatetime()
+    return (now - earliest).total_seconds() / 86_400.0
+
+
+def quality_filter(
+    rows: list[dict], *, now: datetime, exchange,
+    min_adv_usd: float, min_age_days: int, max_abs_chg_24h_pct: float,
+    min_depth_usd: float, depth_ref_usd: float, symbol_count: int,
+) -> tuple[list[dict], dict[str, int]]:
+    """'Liquid + established only': apply, in order, age -> 24h-mover -> depth -> ADV gates to a
+    vol-ranked universe, then cap to symbol_count. Returns (kept_rows, drop_counts) so the scout
+    can log EXACTLY how many names each gate removed (no silent truncation).
+
+    - age: exclude names listed < min_age_days ago (onboard_date, else earliest-kline fallback);
+      unknown age keeps the name (counted under 'age_unknown').
+    - chg_24h: exclude |chg_24h_pct| > max_abs_chg_24h_pct (extreme movers are reversal traps).
+    - depth: require the FULL top-of-book notional on the THINNER side >= min_depth_usd via
+      exchange.depth(); missing/erroring/empty depth keeps the name ('depth_unavailable').
+    - adv: the existing 24h-quote-volume floor (>= min_adv_usd).
+
+    depth_ref_usd is accepted for config symmetry (it documents the slippage-model clip) but is NOT
+    used as a cap inside the depth floor.
+    """
+    _ = depth_ref_usd  # reserved: slippage-model reference clip, not a floor cap
+    drops = {"age": 0, "age_unknown": 0, "chg_24h": 0, "depth": 0,
+             "depth_unavailable": 0, "adv": 0}
+    kept: list[dict] = []
+    for r in rows:
+        age = _age_days(r, now=now, exchange=exchange)
+        if age is None:
+            drops["age_unknown"] += 1
+        elif age < min_age_days:
+            drops["age"] += 1
+            continue
+        if abs(float(r.get("chg_24h_pct") or 0.0)) > max_abs_chg_24h_pct:
+            drops["chg_24h"] += 1
+            continue
+        try:
+            book = exchange.depth(r["symbol"])
+            bid_usd = _book_depth_usd(book.get("bids") or [])
+            ask_usd = _book_depth_usd(book.get("asks") or [])
+            side_usd = min(bid_usd, ask_usd)
+            if side_usd <= 0.0:
+                raise ValueError("empty book")
+        except Exception:
+            drops["depth_unavailable"] += 1
+            side_usd = None
+        if side_usd is not None and side_usd < min_depth_usd:
+            drops["depth"] += 1
+            continue
+        if float(r.get("vol_24h_usd") or 0.0) < min_adv_usd:
+            drops["adv"] += 1
+            continue
+        kept.append(r)
+    return kept[:symbol_count], drops
+
+
 def parse_ohlcv(rows: list[list]) -> pd.DataFrame:
     """ccxt OHLCV rows [[ts_ms,o,h,l,c,v], ...] -> sorted UTC-timestamped DataFrame."""
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
