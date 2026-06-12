@@ -73,11 +73,19 @@ class ClosedLeg(BaseModel):
 class CostInputs(BaseModel):
     """Per-symbol frictions the paper executor needs but the executed proposal does not carry.
 
-    `depth` is the optional crossing-side book; in paper we leave it None so `estimate_slippage`
-    uses the ADV+half-spread fallback (which is NEVER flat 2bps)."""
+    `depth_asks`/`depth_bids` are the two crossing sides of the live book; `apply_fills` selects
+    the ASK side for a BUY (delta>0) and the BID side for a SELL (delta<0). When both are empty
+    `estimate_slippage` uses the ADV + half-spread fallback (which is NEVER flat 2bps). `depth` is
+    retained for back-compat (a pre-selected single side); it wins when set.
+
+    CAVEAT: costs.vwap_fill prices slippage on the PARTIAL fill (up to visible book depth) while
+    apply_fills opens the FULL target qty. For a clip that exceeds the book, realized slippage is
+    UNDER-stated — treat depth slippage as a floor for over-depth clips, not an exact cost."""
     adv_usd: float = 0.0
     half_spread_bps: float = 1.0
     depth: list[tuple[float, float]] | None = None
+    depth_bids: list[tuple[float, float]] = Field(default_factory=list)
+    depth_asks: list[tuple[float, float]] = Field(default_factory=list)
     maker: bool = False                          # paper opens are market -> taker
 
 
@@ -213,8 +221,14 @@ class PaperAccount(BaseModel):
                 continue  # already at target -> no-op (re-sent unchanged book)
             delta_notional = abs(delta_signed_qty) * mark
             fee = trade_fee(delta_notional, maker=ci.maker)
+            if ci.depth is not None:
+                side = ci.depth                                 # pre-selected (back-compat)
+            elif delta_signed_qty > 0:
+                side = ci.depth_asks or None                    # BUY crosses the ASKS
+            else:
+                side = ci.depth_bids or None                    # SELL crosses the BIDS
             slip = estimate_slippage(
-                sym, abs(delta_signed_qty), mark, depth=ci.depth, adv_usd=ci.adv_usd,
+                sym, abs(delta_signed_qty), mark, depth=side, adv_usd=ci.adv_usd,
                 half_spread_bps=ci.half_spread_bps)
 
             if existing is not None and (

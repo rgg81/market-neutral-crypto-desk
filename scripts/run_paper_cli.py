@@ -287,6 +287,18 @@ def _leg_cost_patches(account) -> list[tuple[int | None, str | None, str, str, d
     return out
 
 
+def _half_spread_bps(bids: list, asks: list, default: float) -> float:
+    """Observed top-of-book half-spread in bps; `default` when a side is missing/degenerate."""
+    if not bids or not asks:
+        return default
+    best_bid = float(bids[0][0])
+    best_ask = float(asks[0][0])
+    mid = (best_bid + best_ask) / 2.0
+    if mid <= 0 or best_ask < best_bid:
+        return default
+    return (best_ask - best_bid) / 2.0 / mid * 1e4
+
+
 def _geometry_cost_maps(bundle: dict) -> tuple[dict, dict, dict, dict]:
     """From a geometries.json bundle build (marks, funding_by_symbol, intervals, costs).
 
@@ -304,7 +316,13 @@ def _geometry_cost_maps(bundle: dict) -> tuple[dict, dict, dict, dict]:
         marks[sym] = float(mark)
         funding[sym] = float(g.get("funding_rate", 0.0))
         intervals[sym] = int(g.get("funding_interval_hours", 8) or 8)
-        costs[sym] = CostInputs(adv_usd=float(g.get("adv_usd", 0.0)))
+        bids = [(float(p), float(q)) for p, q in (g.get("depth_bids") or [])]
+        asks = [(float(p), float(q)) for p, q in (g.get("depth_asks") or [])]
+        costs[sym] = CostInputs(
+            adv_usd=float(g.get("adv_usd", 0.0)),
+            half_spread_bps=_half_spread_bps(bids, asks, 1.0),
+            depth_bids=bids, depth_asks=asks,
+        )
     return marks, funding, intervals, costs
 
 
