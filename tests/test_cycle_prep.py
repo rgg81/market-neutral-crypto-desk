@@ -170,3 +170,18 @@ def test_build_pairs_round_trips_through_artifact_shape():
     spreads_payload = {"spreads": [s.model_dump(mode="json") for s in spreads]}
     assert [Pair.model_validate(p) for p in pairs_payload["pairs"]] == pairs
     assert [Spread.model_validate(s) for s in spreads_payload["spreads"]] == spreads
+
+
+def test_coin_geometry_has_depth_and_quality_fields():
+    g = _CG(
+        symbol="BTC/USDT:USDT", mark=60000.0, adv_usd=2e9,
+        depth_bids=[(60000.0, 5.0)], depth_asks=[(60001.0, 4.0)],
+        onboard_date=1567965300000, chg_24h_pct=1.0,
+    )
+    assert g.depth_bids == [(60000.0, 5.0)]
+    assert g.depth_asks == [(60001.0, 4.0)]
+    assert g.onboard_date == 1567965300000
+    assert g.chg_24h_pct == 1.0
+    # defaults: a geometry built with no depth has empty books, not None crashes
+    assert _CG(symbol="X/USDT:USDT", mark=1.0).depth_bids == []
+    assert _CG(symbol="X/USDT:USDT", mark=1.0).onboard_date is None

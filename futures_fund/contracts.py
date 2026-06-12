@@ -118,6 +118,13 @@ class CoinGeometry(BaseModel):
     sentiment_conf: float = Field(default=0.0, ge=0.0, le=1.0)
     # liquidity / filters
     adv_usd: float = 0.0
+    chg_24h_pct: float = 0.0            # 24h % change carried from the universe row (audit/filter)
+    onboard_date: int | None = None    # Binance onboardDate, ms-epoch (None when unavailable)
+    # Phase 10 depth-aware slippage: the two crossing sides of the live L2 book at build time.
+    # `depth_asks` is the crossing side for a BUY (delta>0), `depth_bids` for a SELL (delta<0).
+    # Empty lists (not None) when depth was unavailable -> estimate_slippage uses the ADV fallback.
+    depth_bids: list[tuple[float, float]] = Field(default_factory=list)
+    depth_asks: list[tuple[float, float]] = Field(default_factory=list)
     spec: SymbolSpec | None = None
     # crypto-only universe audit: the exchange `market["info"]` (carries `underlyingType` /
     # `contractType`) the reviewer feeds to `market_data.is_crypto_perp` to reject TradFi-wrapper
