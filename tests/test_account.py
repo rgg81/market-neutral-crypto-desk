@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from futures_fund.account import CostInputs, PaperAccount, Position
+from futures_fund.account import (
+    CostInputs,
+    PaperAccount,
+    Position,
+    load_account,
+    save_account,
+)
 from futures_fund.costs import count_funding_events
 
 
@@ -205,3 +211,26 @@ def test_settle_funding_no_events_still_advances_clock():
     assert acct.cash == 20_000.0
     assert acct.positions["ETH/USDT:USDT"].accrued_funding == 0.0
     assert acct.last_funding_ts == now             # clock advances even with 0 events
+
+
+def test_load_account_fresh_inits_at_default_cash(tmp_path):
+    acct = load_account(tmp_path / "state", default_cash=20_000.0)
+    assert acct.cash == 20_000.0
+    assert acct.positions == {}
+    assert acct.realized_pnl == 0.0
+    assert acct.last_funding_ts is None
+
+
+def test_save_then_load_round_trips_at_state_root(tmp_path):
+    state = tmp_path / "state"
+    acct = PaperAccount(cash=15_000.0)
+    acct.positions["ETH/USDT:USDT"] = _pos()
+    acct.fees_paid = 7.0
+    acct.last_funding_ts = datetime(2026, 6, 10, 8, tzinfo=UTC)
+    save_account(state, acct)
+    assert (state / "account.json").exists()
+    restored = load_account(state, default_cash=99_999.0)
+    assert restored.cash == 15_000.0               # NOT the default — the file wins
+    assert restored.fees_paid == 7.0
+    assert restored.last_funding_ts == datetime(2026, 6, 10, 8, tzinfo=UTC)
+    assert restored.positions["ETH/USDT:USDT"].qty == 2.0

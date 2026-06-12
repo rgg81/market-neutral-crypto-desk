@@ -17,7 +17,10 @@ weekly one in a single run.
 """
 from __future__ import annotations
 
+import json
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -238,3 +241,29 @@ class PaperAccount(BaseModel):
             self.positions[sym] = Position(
                 symbol=sym, direction=direction, qty=residual_new_qty, entry_price=mark,
                 opened_ts=ts, accrued_fees=0.0, accrued_slippage=0.0)
+
+
+def _account_path(state_dir) -> Path:
+    return Path(state_dir) / "account.json"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """tmp + os.replace — a crash mid-write leaves the PRIOR account.json intact (same discipline
+    as cycle_io.save_output / equity_log.record_equity)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def load_account(state_dir, default_cash: float) -> PaperAccount:
+    """Load the single account.json at the state root, or init a fresh account at `default_cash`
+    (zero positions, no funding clock) on a clean state dir — the restart-from-scratch path."""
+    p = _account_path(state_dir)
+    if p.exists():
+        return PaperAccount.from_dict(json.loads(p.read_text()))
+    return PaperAccount(cash=default_cash)
+
+
+def save_account(state_dir, account: PaperAccount) -> None:
+    _atomic_write_text(_account_path(state_dir), json.dumps(account.to_dict(), indent=2))
