@@ -10,3 +10,5 @@ uv.lock
 live_tick.py
 live_state/
 live_memory/
+.claude/
+real_run.py
