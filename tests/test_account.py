@@ -381,8 +381,11 @@ def test_patch_outcome_no_journaled_leg_is_a_fail_soft_noop(tmp_path):
 def test_invariant_account_equity_reconciles():
     acct = PaperAccount(cash=20_000.0)
     acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)
-    marks = {"ETH/USDT:USDT": 1950.0}              # upnl = 100
-    recorded = acct.equity(marks)                  # 20100
+    marks = {"ETH/USDT:USDT": 1950.0}              # short upnl = 2*(2000-1950) = 100
+    recorded = 20_100.0                             # INDEPENDENT literal: cash 20000 + upnl 100.
+    # recorded is hand-computed, NOT acct.equity(marks): re-using the recomputed call would make
+    # this abs(equity - equity) <= tol == always True, so a buggy equity() would still pass.
+    assert acct.equity(marks) == recorded          # the live computation matches the literal
     assert invariant_account_equity_reconciles(acct, marks, recorded)
     assert not invariant_account_equity_reconciles(acct, marks, recorded + 5.0)
 

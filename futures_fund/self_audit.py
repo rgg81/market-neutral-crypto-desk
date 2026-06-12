@@ -179,9 +179,13 @@ def _checks() -> list[tuple[str, bool, str]]:
         symbol="ETH/USDT:USDT", direction="short", qty=2.0, entry_price=2000.0,
         opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
     _marks = {"ETH/USDT:USDT": 1950.0}
+    # Independent hand-computed expected: cash 20000 + short upnl 2*(2000-1950)=100 -> 20100.0.
+    # MUST be a literal, NOT account.equity(marks): re-using the recomputed call makes the check
+    # abs(equity - equity) <= tol == always True, so a buggy equity() would still pass.
+    _recorded_equity = 20_100.0
     add("account_equity_reconciles",
-        invariant_account_equity_reconciles(_acct, _marks, _acct.equity(_marks)),
-        "recorded equity must equal cash + unrealized PnL")
+        invariant_account_equity_reconciles(_acct, _marks, _recorded_equity),
+        f"recorded equity {_recorded_equity} must equal cash + unrealized PnL")
 
     # 5. PAIR LEGS sized by the cointegration hedge ratio (no residual single-name exposure).
     add("pair_legs_hedge_ratio_sized",
