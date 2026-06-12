@@ -121,6 +121,65 @@ def test_full_run_builds_a_neutral_deployed_book_without_seeding(no_seed_env):
     assert not (state / ".run.lock").exists()
 
 
+def test_wired_loop_writes_ledger_account_and_real_equity(no_seed_env):
+    # CENTRAL-CHANGE GUARD (run_paper_cli._run_cadence Step 7a): the wired loop must load the
+    # account, settle funding, reconcile-apply this cycle's executed book, mark-to-market, and
+    # write pnl.json + ledger.jsonl + account.json with the REAL account equity — not the old flat
+    # settings.account_size_usdt. The two pre-existing E2E tests stop at "equity-history.jsonl
+    # exists", so nothing else in the suite asserts these artifacts' CONTENTS through main()->
+    # _run_cadence. This test pins them with INDEPENDENT expecteds derived from the account itself.
+    from futures_fund.account import load_account
+    from scripts.run_paper_cli import _geometry_cost_maps, main
+
+    main(["--now", NOW_ISO])
+    state = no_seed_env / "state"
+
+    # 1) account.json was written and round-trips a POST-FILL book (the reconcile actually ran).
+    assert (state / "account.json").exists()
+    account = load_account(state, default_cash=-1.0)   # file wins; -1.0 proves it's not the default
+    assert account.cash != -1.0
+    assert account.positions, "the reconcile must have opened positions from the executed book"
+    # frictions were charged on the fills (fees+slippage are never flat/zero here, §11).
+    assert account.fees_paid > 0.0
+    assert account.slippage_paid > 0.0
+
+    # 2) The recorded equity is the REAL account equity at THIS cycle's marks (account.equity),
+    #    NOT the hardcoded 20_000 settings.account_size_usdt recorded before. Fills are at
+    #    the mark (0 unrealized at entry) and cost fees+slippage, so the real equity is STRICTLY
+    #    below the flat account size; the regression (recording 20_000) would fail this.
+    bundle = load_output(state, 1, "geometries", cadence="daily")
+    marks, _funding, _intervals, _costs = _geometry_cost_maps(bundle)
+    expected_equity = account.equity(marks)
+    assert expected_equity < 20_000.0                  # NOT the flat settings.account_size_usdt
+    points = [json.loads(line) for line in (state / "equity-history.jsonl").read_text().splitlines()
+              if line.strip()]
+    assert points
+    # the LAST recorded point (daily ran after weekly under the same lock) is the real equity.
+    assert abs(points[-1]["equity"] - expected_equity) < 1e-6
+
+    # 3) pnl.json was written per cadence; the ACCOUNT is carried across cadences (weekly
+    #    cold-starts at 20_000, daily opens at the weekly close — NOT reset), and the cumulative
+    #    cost totals + closing equity are the real account values.
+    weekly_pnl = load_output(state, 1, "pnl", cadence="weekly")
+    daily_pnl = load_output(state, 1, "pnl", cadence="daily")
+    assert weekly_pnl["cadence"] == "weekly" and daily_pnl["cadence"] == "daily"
+    assert weekly_pnl["opening_equity"] == 20_000.0    # cold-start cash this run
+    assert weekly_pnl["fees_paid"] > 0.0 and weekly_pnl["slippage_paid"] > 0.0
+    # carried, not reset: daily opens where weekly closed (account persisted across cadences).
+    assert abs(daily_pnl["opening_equity"] - weekly_pnl["closing_equity"]) < 1e-6
+    assert daily_pnl["opening_equity"] < 20_000.0
+    assert abs(daily_pnl["closing_equity"] - expected_equity) < 1e-6
+
+    # 4) ledger.jsonl gained exactly ONE line per cadence that ran (weekly + daily = 2 — no
+    #    double-append, no skipped append).
+    ledger_lines = [line for line in (state / "ledger.jsonl").read_text().splitlines()
+                    if line.strip()]
+    assert len(ledger_lines) == 2
+    last_ledger = json.loads(ledger_lines[-1])
+    assert last_ledger["cadence"] == "daily"
+    assert abs(last_ledger["closing_equity"] - expected_equity) < 1e-6
+
+
 def test_fabricated_pair_pnl_halts_the_wired_loop(no_seed_env):
     # LOOP-LEVEL C2 (not just unit-level): run the producers once to get an HONEST built book, then
     # TAMPER a produced spread's realized_pnl to a large value and re-run the reviewer in the fully
