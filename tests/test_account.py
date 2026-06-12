@@ -177,6 +177,65 @@ def test_apply_fills_opposite_target_flips_side():
     assert pos.entry_price == 2000.0
 
 
+def test_apply_fills_same_symbol_both_sides_nets_to_a_single_position():
+    """A market-neutrality guard: the optimizer legitimately emits the SAME symbol on BOTH sides —
+    a factor SHORT and a hedge LONG. apply_fills must CONSOLIDATE them into a single NET signed
+    target (long $2129 - short $2116 = +$13 net long), NOT process them sequentially (which flips
+    the held position to a full +$2129 long and silently loses the offsetting factor-short).
+
+    FAILS pre-fix: the per-leg-overwrite code reconciles BTC to short $2116, then FLIPS it to
+    long $2129 — yielding a ~+$2129 position, not the ~+$13 net."""
+    acct = PaperAccount(cash=20_000.0)
+    mark = 60_000.0
+    costs = {"BTC/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    book = [
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2129.0},   # hedge
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2116.0},  # factor
+    ]
+    acct.apply_fills(book, {"BTC/USDT:USDT": mark}, costs)
+
+    pos = acct.positions["BTC/USDT:USDT"]
+    assert pos.direction == "long"                      # net is long (2129 > 2116)
+    net_notional = pos.qty * mark
+    assert abs(net_notional - 13.0) < 1e-6              # SINGLE net position ~+$13, NOT $2129
+    # leg-order independent: the same book in the opposite order nets to the same +$13.
+    acct2 = PaperAccount(cash=20_000.0)
+    acct2.apply_fills(list(reversed(book)), {"BTC/USDT:USDT": mark}, costs)
+    pos2 = acct2.positions["BTC/USDT:USDT"]
+    assert pos2.direction == "long"
+    assert abs(pos2.qty * mark - 13.0) < 1e-6
+
+
+def test_apply_fills_consolidates_frictions_on_the_net_delta_not_per_leg():
+    """Fees/slippage are charged on the |NET delta| of the consolidated reconcile, NOT twice (once
+    per same-symbol leg). Net open is ~$13 notional from flat -> a taker fee of 13 * 0.0005."""
+    acct = PaperAccount(cash=20_000.0)
+    mark = 60_000.0
+    costs = {"BTC/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    book = [
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2129.0},
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2116.0},
+    ]
+    acct.apply_fills(book, {"BTC/USDT:USDT": mark}, costs)
+    # fee on the NET $13 delta only (not on 2129 + 2116) — the bug double-charged per leg.
+    assert abs(acct.fees_paid - 13.0 * 0.0005) < 1e-9
+
+
+def test_apply_fills_same_symbol_both_sides_that_net_to_flat_is_no_position():
+    """When the two same-symbol legs net to ~0 (equal-and-opposite), the symbol holds no position
+    (or a dust-sized one), never a full one-sided leg."""
+    acct = PaperAccount(cash=20_000.0)
+    mark = 60_000.0
+    costs = {"BTC/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    book = [
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2000.0},
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2000.0},
+    ]
+    acct.apply_fills(book, {"BTC/USDT:USDT": mark}, costs)
+    pos = acct.positions.get("BTC/USDT:USDT")
+    assert pos is None or abs(pos.qty * mark) < 1e-6    # net flat -> no real exposure
+
+
 def test_settle_funding_short_positive_rate_is_a_credit_and_advances_clock():
     acct = PaperAccount(cash=20_000.0)
     acct.positions["ETH/USDT:USDT"] = _pos(direction="short", qty=2.0, entry=2000.0)

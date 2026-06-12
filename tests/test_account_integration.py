@@ -47,6 +47,49 @@ def test_weekly_cycle2_resend_does_not_double_qty():
     assert acct.slippage_paid == slip1             # 0 extra slippage on the re-send
 
 
+def test_held_book_is_dollar_and_beta_neutral_with_a_same_symbol_hedge_alpha_pair():
+    """Book-level market-neutrality: a leg-level dollar+beta-neutral book whose legs include the
+    SAME symbol on both sides (a BTC factor-short AND a BTC hedge-long) must, AFTER apply_fills,
+    hold positions that are STILL dollar-neutral (|Sum long$ - Sum short$| ~ 0) and beta-neutral.
+
+    Pre-fix, apply_fills overwrites BTC per-leg (the hedge-long flips out the factor-short), so the
+    HELD book goes net long ~$2118 even though the leg-level book sums to a perfect $9k/$9k — the
+    desk is silently NOT market-neutral in its actual positions."""
+    # leg-level book: $9013 long / $9013 short, beta-neutral, with BTC on BOTH sides.
+    #   BTC factor-short $2116 (beta 1.0) + BTC hedge-long $2129 (beta 1.0)  -> net BTC +$13 long
+    #   ETH long  $6884 (beta 1.0)  | SOL short $6871 (beta 1.0) + a hedge short $26 (beta 1.0)
+    marks = {"BTC/USDT:USDT": 60_000.0, "ETH/USDT:USDT": 3000.0, "SOL/USDT:USDT": 150.0}
+    betas = {"BTC/USDT:USDT": 1.0, "ETH/USDT:USDT": 1.0, "SOL/USDT:USDT": 1.0}
+    legs = [
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2116.0},  # factor
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2129.0},   # hedge
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 6884.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 6871.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 26.0},    # hedge
+    ]
+    # leg-level book is balanced: long 2129+6884 = 9013 ; short 2116+6871+26 = 9013.
+    long_legs = sum(lg["target_notional"] for lg in legs if lg["direction"] == "long")
+    short_legs = sum(lg["target_notional"] for lg in legs if lg["direction"] == "short")
+    assert abs(long_legs - short_legs) < 1e-6          # leg-level book IS dollar-neutral ($9013)
+
+    acct = PaperAccount(cash=100_000.0)
+    costs = {s: CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0) for s in marks}
+    acct.apply_fills(legs, marks, costs, opened_ts=datetime(2026, 6, 10, tzinfo=UTC))
+
+    # HELD positions must reconstruct the SAME neutrality the leg-level book had.
+    held_long = sum(p.qty * marks[s] for s, p in acct.positions.items() if p.direction == "long")
+    held_short = sum(p.qty * marks[s] for s, p in acct.positions.items() if p.direction == "short")
+    assert abs(held_long - held_short) < 1.0           # dollar-neutral held book (~$26 net, < $1k)
+    # beta residual = Sum(signed notional * beta) / equity ~ 0
+    beta_resid = sum(
+        (p.qty * marks[s] if p.direction == "long" else -p.qty * marks[s]) * betas[s]
+        for s, p in acct.positions.items())
+    assert abs(beta_resid) < 1.0                        # beta-neutral held book
+    # BTC is a SINGLE consolidated net position (~+$13), not a full $2129 flip.
+    btc = acct.positions["BTC/USDT:USDT"]
+    assert btc.direction == "long" and abs(btc.qty * marks["BTC/USDT:USDT"] - 13.0) < 1e-6
+
+
 def test_two_cycle_equity_moves_off_constant_with_funding_and_fees():
     acct = PaperAccount(cash=20_000.0)
     costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=1.0)}

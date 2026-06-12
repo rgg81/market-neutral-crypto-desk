@@ -8,6 +8,7 @@ independent guards on overlapping properties and must NOT be aligned by renaming
 """
 from futures_fund.self_audit import (
     invariant_both_sides_deployment_floor,
+    invariant_consolidated_book_dollar_neutral,
     invariant_funding_sign_correct,
     invariant_no_tokenized_stock_leg,
     invariant_pair_legs_hedge_ratio_sized,
@@ -82,6 +83,26 @@ def test_sentiment_within_cap_range_conformant_vs_broken():
     assert not invariant_sentiment_within_cap_range(
         weight=0.10, score=1.0, conf=1.0, cap=0.25, claimed_delta=0.05
     )
+
+
+def test_consolidated_book_dollar_neutral_conformant_vs_broken():
+    # SAME symbol on BOTH sides: net BTC = long 2129 - short 2116 = +13 ; book nets $6897/$6897.
+    good = [
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2116.0},
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2129.0},
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 6884.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 6897.0},
+    ]
+    assert invariant_consolidated_book_dollar_neutral(good)
+    # BROKEN: a leg-level-neutral book ($9013/$9013) whose BTC short is dropped from the
+    # consolidation holds net long ~$2129 — the exact apply_fills per-leg-overwrite bug. Drop the
+    # factor short to simulate the held book and the net goes badly one-sided.
+    broken = [
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2129.0},  # short lost
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 6884.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 6897.0},
+    ]
+    assert not invariant_consolidated_book_dollar_neutral(broken)
 
 
 def test_no_tokenized_stock_leg_conformant_vs_broken():

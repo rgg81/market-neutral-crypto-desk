@@ -55,6 +55,29 @@ def invariant_residuals_in_band(
     return abs(d_resid) <= _DOLLAR_BAND_USDT + _TOL, abs(b_resid) <= _BETA_BAND + _TOL
 
 
+def invariant_consolidated_book_dollar_neutral(
+    legs: list[dict], *, band: float = _DOLLAR_BAND_USDT
+) -> bool:
+    """CONSOLIDATED-by-symbol dollar neutrality: the optimizer legitimately emits the SAME symbol on
+    BOTH sides (a factor short AND a hedge long). The HELD book is the per-symbol NET of those legs,
+    so a leg-level book that sums to $X/$X can still hold a badly one-sided NET book if a symbol's
+    two sides do not net inside the band. Collapse the legs by symbol into one net signed notional
+    (+target if long, -target if short) and require |Sum net-long$ - Sum net-short$| within the §4
+    band — the held-position invariant the reviewer's leg-level dollar check does NOT catch.
+
+    `legs` are `{symbol, direction, target_notional}` dicts (the executed/target book)."""
+    net_signed: dict[str, float] = {}
+    for leg in legs:
+        sym = leg["symbol"]
+        signed = abs(float(leg["target_notional"]))
+        if leg["direction"] != "long":
+            signed = -signed
+        net_signed[sym] = net_signed.get(sym, 0.0) + signed
+    longs = sum(n for n in net_signed.values() if n > 0.0)
+    shorts = sum(-n for n in net_signed.values() if n < 0.0)
+    return abs(longs - shorts) <= band + _TOL
+
+
 def invariant_both_sides_deployment_floor(
     side_gross: dict[str, float], side_budget: float, floor: float
 ) -> bool:
@@ -161,6 +184,19 @@ def _checks() -> list[tuple[str, bool, str]]:
         f"|long$ - short$| = {d_resid:.4f} vs band {_DOLLAR_BAND_USDT}")
     add("beta_residual_in_band", beta_ok,
         f"|Sum w*beta| = {abs(beta_residual(weights, betas)):.4f} vs band {_BETA_BAND}")
+
+    # 2b. CONSOLIDATED-by-symbol dollar neutrality: a book with the SAME symbol on BOTH sides (a
+    # factor short + a hedge long) must NET to a dollar-neutral HELD book — the per-symbol-NET
+    # property that a per-leg check (and the per-leg apply_fills bug) misses.
+    consolidated_legs = [
+        {"symbol": "BTC/USDT:USDT", "direction": "short", "target_notional": 2116.0},  # factor
+        {"symbol": "BTC/USDT:USDT", "direction": "long", "target_notional": 2129.0},   # hedge
+        {"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 6884.0},
+        {"symbol": "SOL/USDT:USDT", "direction": "short", "target_notional": 6897.0},
+    ]
+    add("consolidated_book_dollar_neutral",
+        invariant_consolidated_book_dollar_neutral(consolidated_legs),
+        "per-symbol-net (consolidated) held book must be dollar-neutral within band")
 
     # 3. DEPLOYMENT FLOOR on BOTH sides (no one-sided under-deployment).
     side_gross = {"long": 9500.0, "short": 9500.0}

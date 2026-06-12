@@ -192,28 +192,46 @@ class PaperAccount(BaseModel):
         opened_cycle: int | None = None,
         opened_cadence: str | None = None,
     ) -> None:
-        """RECONCILE each touched symbol to its leg's target_notional (signed by direction).
+        """RECONCILE each touched symbol to its NET signed target across all of its legs.
 
-        Each executed leg's `target_notional` is the optimizer's per-symbol TARGET; this fills only
+        The optimizer legitimately emits the SAME symbol on BOTH sides (e.g. a factor SHORT and a
+        hedge LONG): those legs NET to a single per-symbol position. We therefore CONSOLIDATE the
+        executed legs by symbol into one net signed target_notional —
+        `net_signed[sym] = Sum over that symbol's legs of (+target_notional if long else -target)`
+        — and reconcile each symbol exactly ONCE (direction = sign of the net; |net|/mark qty).
+        Processing the legs sequentially instead would let the second leg FLIP out the first
+        (a BTC short $2116 then a BTC long $2129 -> held +$2129, losing the offsetting short), so
+        the held book is silently NOT market-neutral even when the leg-level book is.
+
+        Each leg's `target_notional` is the optimizer's TARGET; this fills only
         `delta = target_signed_qty - current_signed_qty`, so re-sending the identical book is an
         exact no-op (delta 0, 0 frictions). A positive delta opens/increases the SAME side (blending
         entry VWAP); a negative delta reduces/closes/flips (Task 4). Fill at the mark; charge a
-        taker/maker fee + depth slippage on the |delta notional| actually traded. qty is derived
-        from notional/mark because the executed proposal carries no fill price/qty.
+        taker/maker fee + depth slippage on the |NET delta notional| actually traded (once per
+        symbol, NOT per leg). qty is derived from notional/mark because the executed proposal
+        carries no fill price/qty.
 
         Convergent across weeks (weekly re-emits the full book -> delta 0 on unchanged legs) and
         correct for daily (each rebalance_trades leg carries that symbol's NEW target_notional)."""
         ts = opened_ts or datetime.now(tz=UTC)
+        # Consolidate by symbol into a single NET signed target_notional, preserving first-seen
+        # order (so a single-leg book is processed exactly as before — an exact no-op on a re-send).
+        net_signed_notional: dict[str, float] = {}
         for trade in executed_trades:
             sym = trade["symbol"]
             direction: Direction = trade["direction"]
             target_notional = abs(float(trade["target_notional"]))
+            leg_sign = 1.0 if direction == "long" else -1.0
+            net_signed_notional[sym] = (
+                net_signed_notional.get(sym, 0.0) + leg_sign * target_notional)
+        for sym, net_notional in net_signed_notional.items():
             mark = marks.get(sym)
             if mark is None or mark <= 0:
                 continue
+            direction = "long" if net_notional >= 0.0 else "short"
             ci = costs.get(sym) or CostInputs()
             sign = 1.0 if direction == "long" else -1.0
-            target_signed_qty = sign * (target_notional / mark)
+            target_signed_qty = sign * (abs(net_notional) / mark)
             existing = self.positions.get(sym)
             current_signed_qty = _signed_qty(existing)
             delta_signed_qty = target_signed_qty - current_signed_qty
