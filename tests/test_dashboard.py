@@ -185,3 +185,18 @@ def test_dashboard_empty_state_is_fail_safe(tmp_path):
     assert d["max_drawdown"] == 0.0
     assert d["no_losing_month"] == 0.0
     assert math.isnan(d["carry_capture"])
+
+
+def test_dashboard_carries_cost_rows(tmp_path):
+    state = tmp_path / "state"
+    memory = tmp_path / "memory"
+    save_output(state, 1, "pnl", {
+        "net_pnl": 8.0, "gross_pnl": 14.0, "fees_paid": 4.0, "slippage_paid": 2.0,
+        "funding_net": 6.0, "cycle": 1, "ts": "2026-06-10T00:00:00+00:00"}, cadence="weekly")
+    dash = build_kpi_dashboard(state, memory)
+    assert dash["net_pnl"] == 8.0
+    assert dash["gross_pnl"] == 14.0
+    assert dash["total_fees"] == 4.0
+    assert dash["total_slippage"] == 2.0
+    assert dash["total_funding"] == 6.0
+    assert abs(dash["cost_drag_bps"] - (6.0 / 14.0 * 1e4)) < 1e-6

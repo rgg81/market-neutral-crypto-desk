@@ -29,6 +29,12 @@ _ROWS: tuple[tuple[str, str], ...] = (
     ("carry_capture", "Carry-capture rate"),
     ("sentiment_hit_rate", "Sentiment hit-rate"),
     ("reviewer_veto_rate", "Reviewer veto-rate"),
+    ("net_pnl", "Net P&L (after costs)"),
+    ("gross_pnl", "Gross P&L (incl. carry)"),
+    ("total_fees", "Fees paid (cumulative)"),
+    ("total_slippage", "Slippage cost (cumulative)"),
+    ("total_funding", "Funding (signed net, + = received)"),
+    ("cost_drag_bps", "Cost drag (bps of gross)"),
 )
 
 

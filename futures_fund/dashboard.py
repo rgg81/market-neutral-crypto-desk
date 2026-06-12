@@ -36,6 +36,7 @@ from futures_fund.metrics import (
     sharpe,
 )
 from futures_fund.neutrality import NeutralityConfig
+from futures_fund.scorecard import _latest_pnl
 
 
 def _no_losing_month(series: list[tuple[str, float]]) -> float:
@@ -99,6 +100,11 @@ def build_kpi_dashboard(state_dir, memory_dir, *, last_n: int = 10) -> dict:
     series = equity_series(state_dir)
     equity = [e for _, e in series]
     rets = returns_series(state_dir)
+    pnl = _latest_pnl(state_dir)
+    gross = float(pnl.get("gross_pnl", 0.0))
+    fees = float(pnl.get("fees_paid", 0.0))
+    slip = float(pnl.get("slippage_paid", 0.0))
+    cost_drag_bps = (fees + slip) / max(abs(gross), 1.0) * 1e4 if pnl else float("nan")
     return {
         # success KPIs
         "no_losing_month": _no_losing_month(series),
@@ -111,4 +117,11 @@ def build_kpi_dashboard(state_dir, memory_dir, *, last_n: int = 10) -> dict:
         "carry_capture": carry_capture_rate(memory_dir, last_n=last_n),
         "sentiment_hit_rate": sentiment_hit_rate(memory_dir, last_n=last_n),
         "reviewer_veto_rate": reviewer_veto_rate(state_dir, last_n=last_n),
+        # cost-transparency KPIs (Phase 9 — read off the latest pnl.json)
+        "gross_pnl": gross if pnl else float("nan"),
+        "net_pnl": float(pnl.get("net_pnl", 0.0)) if pnl else float("nan"),
+        "total_fees": fees,
+        "total_slippage": slip,
+        "total_funding": float(pnl.get("funding_net", 0.0)) if pnl else float("nan"),
+        "cost_drag_bps": cost_drag_bps,
     }
