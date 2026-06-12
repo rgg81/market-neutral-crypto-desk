@@ -120,6 +120,21 @@ def test_full_run_builds_a_neutral_deployed_book_without_seeding(no_seed_env):
     # lock released
     assert not (state / ".run.lock").exists()
 
+    # Phase 9 — REALISTIC P&L: per-cycle pnl.json exists and equity MOVES (not flat 20000)
+    import json as _json
+
+    from futures_fund.equity_log import equity_series
+    wk_pnl = state / "weekly" / "cycle" / "1" / "pnl.json"
+    assert wk_pnl.exists()
+    pnl_rec = _json.loads(wk_pnl.read_text())
+    assert "closing_equity" in pnl_rec and "fees_paid" in pnl_rec and "funding_net" in pnl_rec
+    # the account ledger + cumulative jsonl were persisted at the state root
+    assert (state / "account.json").exists()
+    assert (state / "ledger.jsonl").exists()
+    # equity is no longer the flat constant: at least one recorded point differs from 20000
+    equities = [v for _, v in equity_series(state)]
+    assert any(abs(e - 20_000.0) > 1e-9 for e in equities), "equity must move off the flat constant"
+
 
 def test_wired_loop_writes_ledger_account_and_real_equity(no_seed_env):
     # CENTRAL-CHANGE GUARD (run_paper_cli._run_cadence Step 7a): the wired loop must load the
@@ -205,3 +220,47 @@ def test_fabricated_pair_pnl_halts_the_wired_loop(no_seed_env):
     verdict = json.loads((state / "weekly" / "cycle" / "1" / "reviewer.json").read_text())
     assert verdict["passed"] is False
     assert "pair_pnl_attribution" in verdict["mismatches"]
+
+
+def test_two_runs_one_day_apart_prove_nonzero_funding_in_pnl(no_seed_env):
+    """The user's headline requirement: pnl.json carries NON-ZERO funding through the WIRED loop.
+
+    Run main twice on the SAME state-dir, one sim-day apart. Run 1 opens the book (its funding
+    clock starts at the first `now`; 0 events settled). Run 2 (+1 sim-day) settles funding over the
+    elapsed day on the still-held book -> pnl.json funding fields are non-zero. Funding is NON-ZERO
+    at the account level (funding_received + funding_paid > 0), independent of net sign on the book.
+
+    The two `--now` instants are anchored to wall-clock-FUTURE midnights (not the fixed past
+    NOW_ISO) so the daily due-gate is deterministic regardless of the real date: the daily
+    `cadence_due` floors the report's wall-clock `ran_at` to find the served candle, so run 2's
+    daily boundary must sit on a strictly later calendar day than run 1's wall-clock `ran_at`.
+    Anchoring both runs to future days guarantees run 2's DAILY cadence fires a FRESH cycle-2 that
+    settles the elapsed-day funding (weekly stays in the same week and SKIPs run 2, as expected)."""
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from scripts.run_paper_cli import main
+
+    base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=2)
+    run1_now = base.isoformat()
+    run2_now = (base + timedelta(days=1)).isoformat()
+
+    main(["--now", run1_now])                         # run 1: open the book, clock starts here
+    state = no_seed_env / "state"
+    acct1 = _json.loads((state / "account.json").read_text())
+    assert acct1["last_funding_ts"] is not None      # clock advanced on run 1
+
+    main(["--now", run2_now])                         # run 2: a sim-day later -> funding settles
+
+    # across ALL cycle-2 pnl.json files written on run 2, at least one must carry non-zero funding
+    # over the elapsed day (robust to which cadence cadence_due fires one day later).
+    pnls = list(state.glob("*/cycle/2/pnl.json"))
+    activity = [
+        _json.loads(p.read_text())["funding_received"] + _json.loads(p.read_text())["funding_paid"]
+        for p in pnls
+    ]
+    assert any(a > 0.0 for a in activity), "wired loop must settle non-zero funding over a sim-day"
+    # and the account clock advanced to the second run instant
+    acct2 = _json.loads((state / "account.json").read_text())
+    assert acct2["last_funding_ts"] is not None
+    assert acct2["last_funding_ts"] != acct1["last_funding_ts"]
