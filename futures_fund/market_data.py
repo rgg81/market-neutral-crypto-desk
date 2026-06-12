@@ -106,7 +106,8 @@ def is_crypto_perp(market: dict | None) -> bool:
 
 def scan_universe(client, top_n: int = 30) -> list[dict]:
     """Rank the live USD-M linear perp universe by 24h quote volume. Public/keyless. Returns up to
-    top_n rows {symbol, last, chg_24h_pct, vol_24h_usd}, most-liquid first. Skips non-USDT-perps,
+    top_n rows {symbol, last, chg_24h_pct, vol_24h_usd, onboard_date}, most-liquid first. Skips
+    non-USDT-perps,
     zero vol/price, and (CRYPTO-ONLY) every non-cryptocurrency TradFi-wrapper perp."""
     tickers = client.fetch_tickers()
     markets = getattr(client, "markets", None) or {}
@@ -122,9 +123,14 @@ def scan_universe(client, top_n: int = 30) -> list[dict]:
         qv = t.get("quoteVolume") or 0.0
         last = t.get("last")
         if qv and last:
+            raw_onboard = (market.get("info") or {}).get("onboardDate")
+            try:
+                onboard_ms = int(raw_onboard) if raw_onboard is not None else None
+            except (TypeError, ValueError):
+                onboard_ms = None
             rows.append({"symbol": sym, "last": float(last),
                          "chg_24h_pct": round(float(t.get("percentage") or 0.0), 2),
-                         "vol_24h_usd": float(qv)})
+                         "vol_24h_usd": float(qv), "onboard_date": onboard_ms})
     rows.sort(key=lambda r: r["vol_24h_usd"], reverse=True)
     return rows[:top_n]
 

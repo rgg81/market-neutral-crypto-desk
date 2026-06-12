@@ -194,3 +194,25 @@ def test_parse_symbol_spec_maps_filters_and_brackets():
     assert spec.step_size == pytest.approx(0.001)
     assert spec.min_notional == pytest.approx(5.0)
     assert spec.mmr_brackets[0].max_leverage == pytest.approx(125.0)
+
+
+class _FakeOnboardClient:
+    markets = {
+        "BTC/USDT:USDT": {"info": {"underlyingType": "COIN", "onboardDate": "1567965300000"}},
+        "NEW/USDT:USDT": {"info": {"underlyingType": "COIN"}},  # no onboardDate -> None
+    }
+
+    def fetch_tickers(self):
+        return {
+            "BTC/USDT:USDT": {"last": 60000.0, "quoteVolume": 2e9, "percentage": 1.0},
+            "NEW/USDT:USDT": {"last": 1.0, "quoteVolume": 1e9, "percentage": 130.0},
+        }
+
+
+def test_scan_universe_carries_onboard_date_ms_int_or_none():
+    rows = scan_universe(_FakeOnboardClient(), top_n=10)
+    by_sym = {r["symbol"]: r for r in rows}
+    assert by_sym["BTC/USDT:USDT"]["onboard_date"] == 1567965300000
+    assert by_sym["NEW/USDT:USDT"]["onboard_date"] is None
+    # existing fields unchanged
+    assert by_sym["NEW/USDT:USDT"]["chg_24h_pct"] == 130.0
