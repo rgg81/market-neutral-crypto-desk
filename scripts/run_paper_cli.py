@@ -209,7 +209,8 @@ def _run_cadence(
     # clock (NOT the cycle-collided equity series), reconcile THIS cycle's executed book to target
     # (weekly re-emits the full book -> delta 0 on unchanged legs; daily nudges the changed legs —
     # no double-count, convergent across weeks), mark-to-market, record the REAL equity (replaces
-    # the old flat settings.account_size_usdt), write pnl.json + ledger, save the account.
+    # the old flat settings.account_size_usdt), write pnl.json + ledger, patch each CLOSED leg's
+    # realized costs onto the journal Decision that opened it, then save the account.
     # settle_funding runs BEFORE apply_fills so a position opened this cycle earns no funding for a
     # pre-existence window (Task 8a pins this).
     account = load_account(state_dir, equity)  # `equity` is the default cash on a cold dir
@@ -219,7 +220,10 @@ def _run_cadence(
     opening_equity = account.equity(marks)
     account.settle_funding(prev_ts, now, funding_by_symbol, intervals, marks)
     executed = _read_executed(state_dir, cadence, cycle)
-    account.apply_fills(executed, marks, costs, opened_ts=now)
+    account.apply_fills(
+        executed, marks, costs,
+        opened_ts=now, opened_cycle=cycle, opened_cadence=cadence,
+    )
     turnover = sum(abs(float(t.get("target_notional", 0.0))) for t in executed)
     equity_now = account.equity(marks)
     equity_log.record_equity(state_dir, now, equity_now, cycle)
@@ -228,16 +232,24 @@ def _run_cadence(
         cycle=cycle, cadence=cadence, now=now)
     save_output(state_dir, cycle, "pnl", rec, cadence=cadence)
     append_ledger(state_dir, rec)
-    save_account(state_dir, account)
-    # Patch each held leg's realized fees/slippage/funding/price-pnl onto the journal Decision so
-    # the Reflector keys lessons on NET (after-cost) alpha. Decision is extra="allow", so
-    # realized_funding round-trips. patch_outcome returns False (fail-soft) for an unrecorded leg.
-    for sym, direction, outcome in _leg_cost_patches(account, cycle):
+    # Patch each CLOSED leg's realized fees/slippage/funding/price-pnl onto the Decision that OPENED
+    # it (keyed on its OWN open cycle+cadence, NOT the current cycle — a leg held over from an
+    # earlier cycle keys on that earlier cycle, and weekly/daily cycle-N never collide). "At close":
+    # we patch legs that were fully closed this cycle, draining the account's closed-leg buffer so a
+    # leg is patched exactly once. The one genuine consumer is `improvement.carry_capture_rate`,
+    # which reads `realized_funding` off the closed Decision (paired with the `projected_funding`
+    # journaled at entry under the SAME open cycle+cadence key). Decision is extra="allow" so the
+    # cost fields round-trip; these are NOT the six alpha fields, so they do not make a Decision
+    # "closed" for the Reflector. patch_outcome returns False (fail-soft) for an un-journaled leg.
+    for cyc, cad, sym, direction, outcome in _leg_cost_patches(account):
         try:
-            patch_outcome(memory_dir, cycle=cycle, symbol=sym, direction=direction, outcome=outcome)
+            patch_outcome(memory_dir, cycle=cyc, symbol=sym, direction=direction,
+                          outcome=outcome, cadence=cad)
         except Exception as exc:  # noqa: BLE001 — cost bookkeeping must not unwind an executed cycle
             print(f"WARNING: journal cost-patch failed for {sym} {direction}: {exc!r}",
                   file=sys.stderr)
+    # Persist AFTER draining so an already-patched closed leg is not re-patched on a later run.
+    save_account(state_dir, account)
     _run_reflect(state_dir, cadence, cycle, memory_dir)
     return True
 
@@ -251,21 +263,25 @@ def _read_executed(state_dir, cadence: Cadence, cycle: int) -> list:
         return []
 
 
-def _leg_cost_patches(account, cycle: int) -> list[tuple[str, str, dict]]:
-    """Per-held-leg realized cost patches for the journal (Reflector net-alpha keying source).
+def _leg_cost_patches(account) -> list[tuple[int | None, str | None, str, str, dict]]:
+    """Realized-cost journal patches for legs CLOSED this cycle ("at close").
 
-    Returns (symbol, direction, outcome_dict) tuples carrying the leg's realized fees/slippage/
-    funding/price-pnl. `cycle` is accepted for symmetry with the journal key (the caller pairs it
-    with the cycle the leg was opened in); patches are matched on (cycle, symbol, direction)."""
-    out: list[tuple[str, str, dict]] = []
-    for pos in account.positions.values():
+    DRAINS `account.closed_legs` — the legs fully closed (popped from `positions`) since the last
+    drain — and emits one (open_cycle, open_cadence, symbol, direction, outcome_dict) tuple per leg.
+    The key is the cycle+cadence the leg was OPENED in (carried on the ClosedLeg), so a held-over
+    leg lands on the Decision that opened it (NOT the current cycle, which is finding 1's no-op) and
+    a daily close never mis-keys onto a weekly Decision at the same cycle number (finding 1's
+    cadence collision). Open positions are deliberately NOT patched — their P&L is still
+    unrealized; "at close" means the leg is done (finding 2)."""
+    out: list[tuple[int | None, str | None, str, str, dict]] = []
+    for leg in account.drain_closed_legs():
         out.append((
-            pos.symbol, pos.direction,
+            leg.opened_cycle, leg.opened_cadence, leg.symbol, leg.direction,
             {
-                "fees": pos.accrued_fees,
-                "slippage": pos.accrued_slippage,
-                "realized_funding": pos.accrued_funding,
-                "realized_pnl": pos.realized_pnl,
+                "fees": leg.fees,
+                "slippage": leg.slippage,
+                "realized_funding": leg.realized_funding,
+                "realized_pnl": leg.realized_pnl,
             },
         ))
     return out

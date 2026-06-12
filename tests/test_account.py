@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from futures_fund.account import (
+    ClosedLeg,
     CostInputs,
     PaperAccount,
     Position,
@@ -10,6 +11,7 @@ from futures_fund.account import (
     save_account,
 )
 from futures_fund.costs import count_funding_events
+from futures_fund.journal import append_decision, patch_outcome, read_all_decisions
 from scripts.run_paper_cli import _geometry_cost_maps, _leg_cost_patches
 
 
@@ -251,16 +253,122 @@ def test_geometry_cost_maps_from_bundle():
     assert costs["ETH/USDT:USDT"].adv_usd == 5_000_000.0
 
 
-def test_leg_cost_patches_from_account():
+def test_leg_cost_patches_drains_closed_legs_keyed_on_open_cycle():
+    """`_leg_cost_patches` emits ONE tuple per CLOSED leg (not per open position), keyed on the
+    cycle+cadence the leg was OPENED in — and drains the buffer so it is patched exactly once."""
     acct = PaperAccount(cash=20_000.0)
-    p = _pos(symbol="ETH/USDT:USDT", direction="short", qty=2.0, entry=2000.0)
-    p.accrued_fees = 4.0
-    p.accrued_slippage = 2.0
-    p.accrued_funding = 6.0
-    p.realized_pnl = 12.0
-    acct.positions["ETH/USDT:USDT"] = p
-    patches = _leg_cost_patches(acct, cycle=1)
+    # an OPEN position must NOT be patched (its P&L is still unrealized — "at close" only).
+    acct.positions["BTC/USDT:USDT"] = _pos(symbol="BTC/USDT:USDT", direction="long")
+    acct.closed_legs.append(ClosedLeg(
+        symbol="ETH/USDT:USDT", direction="short", opened_cycle=3, opened_cadence="weekly",
+        fees=4.0, slippage=2.0, realized_funding=6.0, realized_pnl=12.0))
+    patches = _leg_cost_patches(acct)
     assert patches == [
-        ("ETH/USDT:USDT", "short",
+        (3, "weekly", "ETH/USDT:USDT", "short",
          {"fees": 4.0, "slippage": 2.0, "realized_funding": 6.0, "realized_pnl": 12.0}),
     ]
+    # drained -> a second call yields nothing (patched exactly once).
+    assert _leg_cost_patches(acct) == []
+    assert acct.closed_legs == []
+
+
+def test_apply_fills_full_close_records_a_closed_leg_with_open_cycle():
+    """A fully-closed leg is snapshotted into `closed_legs` carrying its OPEN cycle/cadence and its
+    realized fees/slippage/funding/price-pnl — the realized outcome the 'at close' patch needs and
+    that would otherwise be lost when the Position is popped (finding 2)."""
+    acct = PaperAccount(cash=20_000.0)
+    costs = {"ETH/USDT:USDT": CostInputs(adv_usd=5_000_000.0, half_spread_bps=0.0)}
+    # open a long at cycle 3 weekly, accrue some funding on it.
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 4000.0}],
+        {"ETH/USDT:USDT": 2000.0}, costs,
+        opened_ts=datetime(2026, 6, 10, tzinfo=UTC), opened_cycle=3, opened_cadence="weekly")
+    acct.positions["ETH/USDT:USDT"].accrued_funding = 1.5
+    open_fees = acct.positions["ETH/USDT:USDT"].accrued_fees
+    # close it flat at cycle 5 daily (target 0); profit on the 2000->2200 move.
+    acct.apply_fills(
+        [{"symbol": "ETH/USDT:USDT", "direction": "long", "target_notional": 0.0}],
+        {"ETH/USDT:USDT": 2200.0}, costs,
+        opened_ts=datetime(2026, 6, 12, tzinfo=UTC), opened_cycle=5, opened_cadence="daily")
+    assert "ETH/USDT:USDT" not in acct.positions
+    assert len(acct.closed_legs) == 1
+    cl = acct.closed_legs[0]
+    assert cl.symbol == "ETH/USDT:USDT" and cl.direction == "long"
+    assert cl.opened_cycle == 3 and cl.opened_cadence == "weekly"   # the OPEN cycle, not the close
+    assert abs(cl.realized_pnl - 2.0 * (2200.0 - 2000.0)) < 1e-6     # 2 qty * 200
+    assert abs(cl.realized_funding - 1.5) < 1e-9
+    assert cl.fees > open_fees                                       # open + close fees accrued
+
+
+def test_closed_leg_survives_account_round_trip():
+    acct = PaperAccount(cash=20_000.0)
+    acct.closed_legs.append(ClosedLeg(
+        symbol="ETH/USDT:USDT", direction="short", opened_cycle=2, opened_cadence="daily",
+        fees=1.0, slippage=0.5, realized_funding=-0.25, realized_pnl=-3.0))
+    restored = PaperAccount.from_dict(acct.to_dict())
+    assert len(restored.closed_legs) == 1
+    assert restored.closed_legs[0].opened_cycle == 2
+    assert restored.closed_legs[0].opened_cadence == "daily"
+
+
+# --------------------------------------------------------------------------------------------------
+# Integration: a close-time cost patch ACTUALLY lands on the journaled Decision (finding 4).
+# --------------------------------------------------------------------------------------------------
+def _patch_closed_legs(memory_dir, account):
+    """Mirror the run_paper_cli close-time loop: drain + patch each closed leg on its OPEN key."""
+    for cyc, cad, sym, direction, outcome in _leg_cost_patches(account):
+        patch_outcome(memory_dir, cycle=cyc, symbol=sym, direction=direction,
+                      outcome=outcome, cadence=cad)
+
+
+def test_held_over_leg_patches_onto_its_OPEN_cycle_decision(tmp_path):
+    """The leg is OPENED at cycle 3 (journaled there) and CLOSED at cycle 7. The patch must land on
+    the cycle-3 Decision — keying on the current (7) cycle would be a silent no-op (finding 1)."""
+    memory = tmp_path / "memory"
+    append_decision(memory, cycle=3, symbol="ETH/USDT:USDT", direction="short",
+                    payload={"rationale": "carry"}, cadence="weekly")
+    acct = PaperAccount(cash=20_000.0)
+    acct.closed_legs.append(ClosedLeg(
+        symbol="ETH/USDT:USDT", direction="short", opened_cycle=3, opened_cadence="weekly",
+        fees=4.0, slippage=2.0, realized_funding=6.0, realized_pnl=12.0))
+
+    _patch_closed_legs(memory, acct)
+
+    rows = [d for d in read_all_decisions(memory)
+            if d["cycle"] == 3 and d["symbol"] == "ETH/USDT:USDT"]
+    assert len(rows) == 1
+    assert rows[0]["realized_funding"] == 6.0       # landed on the OPEN-cycle decision
+    assert rows[0]["fees"] == 4.0 and rows[0]["slippage"] == 2.0
+    assert rows[0]["realized_pnl"] == 12.0
+
+
+def test_daily_close_does_not_mis_key_onto_weekly_decision_at_same_cycle(tmp_path):
+    """Weekly cycle-1 and daily cycle-1 share a cycle number (account.py:15). A DAILY close patch
+    must land on the DAILY decision, never bleed onto the same-numbered WEEKLY one (finding 1)."""
+    memory = tmp_path / "memory"
+    append_decision(memory, cycle=1, symbol="ETH/USDT:USDT", direction="long",
+                    payload={"rationale": "weekly book"}, cadence="weekly")
+    append_decision(memory, cycle=1, symbol="ETH/USDT:USDT", direction="long",
+                    payload={"rationale": "daily book"}, cadence="daily")
+    acct = PaperAccount(cash=20_000.0)
+    acct.closed_legs.append(ClosedLeg(
+        symbol="ETH/USDT:USDT", direction="long", opened_cycle=1, opened_cadence="daily",
+        fees=1.0, slippage=0.5, realized_funding=-0.3, realized_pnl=9.0))
+
+    _patch_closed_legs(memory, acct)
+
+    by_cad = {d["cadence"]: d for d in read_all_decisions(memory)}
+    assert by_cad["daily"].get("realized_funding") == -0.3      # patched the DAILY decision
+    assert by_cad["daily"].get("realized_pnl") == 9.0
+    assert by_cad["weekly"].get("realized_funding") is None     # weekly untouched (no mis-key)
+    assert by_cad["weekly"].get("realized_pnl") is None
+
+
+def test_patch_outcome_no_journaled_leg_is_a_fail_soft_noop(tmp_path):
+    """A closed leg whose open was never journaled patches nothing (returns False) and does not
+    raise — cost bookkeeping must never unwind an executed cycle."""
+    memory = tmp_path / "memory"
+    landed = patch_outcome(memory, cycle=9, symbol="DOGE/USDT:USDT", direction="long",
+                           outcome={"realized_funding": 1.0}, cadence="daily")
+    assert landed is False
+    assert read_all_decisions(memory) == []

@@ -14,6 +14,13 @@ Funding clock (load-bearing): the account carries its OWN `last_funding_ts`, adv
 `settle_funding`. The equity series is NOT a safe `prev_ts` source — `equity_log.record_equity` keys
 only on `cycle`, so weekly cycle 1 and daily cycle 1 collide and the daily point overwrites the
 weekly one in a single run.
+
+Closed-leg carrier (load-bearing): the realized outcome of a FULLY closed leg survives in the
+account-level aggregates but NOT on any Position (it is popped). To patch each closed leg's realized
+costs onto the Decision that OPENED it ("at close"), `_reconcile_opposite` snapshots a `ClosedLeg`
+(carrying its open cycle+cadence and realized fees/slippage/funding/price-pnl) into `closed_legs`
+before popping. The close-time journal patch keys each on its OWN open cycle+cadence — never the
+current cycle — and `drain_closed_legs` empties the buffer so a leg is patched exactly once.
 """
 from __future__ import annotations
 
@@ -36,10 +43,31 @@ class Position(BaseModel):
     qty: float                                   # absolute contract qty (>= 0)
     entry_price: float                           # avg entry (VWAP of accumulated fills)
     opened_ts: datetime
+    opened_cycle: int | None = None              # the cycle this leg was OPENED in (journal key)
+    opened_cadence: str | None = None            # weekly|daily opened in (journal discriminator)
     accrued_funding: float = 0.0                 # signed, + = received, - = paid (this leg's life)
     accrued_fees: float = 0.0                    # >= 0 taker/maker fees charged to this leg
     accrued_slippage: float = 0.0                # >= 0 depth slippage charged to this leg
     realized_pnl: float = 0.0                    # signed price P&L realized on this leg so far
+
+
+class ClosedLeg(BaseModel):
+    """A leg that has been FULLY closed (popped from `positions`) this run, retaining its realized
+    fees/slippage/funding/price-pnl AND the (cycle, cadence) it was OPENED in.
+
+    The realized outcome of a closed leg survives ONLY in the account-level aggregates otherwise —
+    the Position is gone — so it could never reach the journal "at close". This record is the
+    carrier the close-time journal patch keys on its OPEN cycle/cadence (NOT the current cycle).
+    Drained by `drain_closed_legs` once the patch has consumed it so a leg is patched exactly once.
+    """
+    symbol: str
+    direction: Direction
+    opened_cycle: int | None = None
+    opened_cadence: str | None = None
+    fees: float = 0.0
+    slippage: float = 0.0
+    realized_funding: float = 0.0
+    realized_pnl: float = 0.0
 
 
 class CostInputs(BaseModel):
@@ -70,9 +98,22 @@ class PaperAccount(BaseModel):
     slippage_paid: float = 0.0                    # >= 0
     funding_received: float = 0.0                 # >= 0 (sum of positive settlements)
     funding_paid: float = 0.0                     # >= 0 (sum of |negative settlements|)
+    # legs fully closed (popped) but not yet patched onto the journal — the "at close" carrier.
+    closed_legs: list[ClosedLeg] = Field(default_factory=list)
 
     def to_dict(self) -> dict:
         return self.model_dump(mode="json")
+
+    def drain_closed_legs(self) -> list[ClosedLeg]:
+        """Return the legs closed since the last drain and clear the buffer.
+
+        The close-time journal patch consumes these (keying each on its OPEN cycle/cadence), so they
+        must be drained AFTER the patch so a fully-closed leg is patched exactly once and never
+        re-patched on a later cycle. Persisted between runs so a leg closed in one run is still
+        patched even if the process restarts before the patch lands."""
+        drained = list(self.closed_legs)
+        self.closed_legs = []
+        return drained
 
     @classmethod
     def from_dict(cls, data: dict) -> PaperAccount:
@@ -140,6 +181,8 @@ class PaperAccount(BaseModel):
         costs: dict[str, CostInputs],
         *,
         opened_ts: datetime | None = None,
+        opened_cycle: int | None = None,
+        opened_cadence: str | None = None,
     ) -> None:
         """RECONCILE each touched symbol to its leg's target_notional (signed by direction).
 
@@ -183,7 +226,8 @@ class PaperAccount(BaseModel):
                 # `delta_signed_qty * sign < 0` predicate came out POSITIVE and let a
                 # short leg silently grow a long position; route every non-increase here.
                 self._reconcile_opposite(
-                    existing, sym, direction, target_signed_qty, mark, fee, slip, ts)
+                    existing, sym, direction, target_signed_qty, mark, fee, slip, ts,
+                    opened_cycle=opened_cycle, opened_cadence=opened_cadence)
                 continue
 
             # same-side open/increase: fill |delta| at the mark, blend entry VWAP.
@@ -192,7 +236,8 @@ class PaperAccount(BaseModel):
             if existing is None:
                 self.positions[sym] = Position(
                     symbol=sym, direction=direction, qty=fill_qty, entry_price=mark,
-                    opened_ts=ts, accrued_fees=fee, accrued_slippage=slip)
+                    opened_ts=ts, opened_cycle=opened_cycle, opened_cadence=opened_cadence,
+                    accrued_fees=fee, accrued_slippage=slip)
             else:
                 total_qty = existing.qty + fill_qty
                 existing.entry_price = (
@@ -212,11 +257,17 @@ class PaperAccount(BaseModel):
     def _reconcile_opposite(
         self, existing: Position, sym: str, direction: Direction,
         target_signed_qty: float, mark: float, fee: float, slip: float, ts: datetime,
+        *, opened_cycle: int | None = None, opened_cadence: str | None = None,
     ) -> None:
         """Drive the held qty TOWARD `target_signed_qty` when the delta opposes the held side:
         reduce -> (close) -> (flip). Realize P&L on the closed portion, charge the
         (already-computed) frictions, and open the residual the other way on a flip. Frictions were
-        sized on the FULL |delta notional| by `apply_fills`, so they are charged once here."""
+        sized on the FULL |delta notional| by `apply_fills`, so they are charged once here.
+
+        On a FULL close the leg is popped from `positions`, so its realized fees/slippage/funding/
+        price-pnl would otherwise be lost to the per-leg journal patch — we snapshot it into
+        `closed_legs` (keyed on its OPEN cycle/cadence) BEFORE popping so the close-time patch can
+        land it on the Decision that opened it."""
         self._charge_frictions(sym, fee, slip, existing)
         current_signed_qty = _signed_qty(existing)
         # qty being closed on the held side = min(|delta|, held qty), capped at a full close.
@@ -234,13 +285,19 @@ class PaperAccount(BaseModel):
         if residual_held > 1e-12:
             existing.qty = residual_held
             return
-        # fully closed this side -> pop it; reopen the residual on the target side if flipping.
+        # fully closed this side -> snapshot its realized outcome (for the journal patch), then pop.
+        self.closed_legs.append(ClosedLeg(
+            symbol=existing.symbol, direction=existing.direction,
+            opened_cycle=existing.opened_cycle, opened_cadence=existing.opened_cadence,
+            fees=existing.accrued_fees, slippage=existing.accrued_slippage,
+            realized_funding=existing.accrued_funding, realized_pnl=existing.realized_pnl))
         self.positions.pop(sym, None)
         residual_new_qty = abs(target_signed_qty)
         if residual_new_qty > 1e-12:                # FLIP: open to reach the opposite-side target
             self.positions[sym] = Position(
                 symbol=sym, direction=direction, qty=residual_new_qty, entry_price=mark,
-                opened_ts=ts, accrued_fees=0.0, accrued_slippage=0.0)
+                opened_ts=ts, opened_cycle=opened_cycle, opened_cadence=opened_cadence,
+                accrued_fees=0.0, accrued_slippage=0.0)
 
 
 def _account_path(state_dir) -> Path:

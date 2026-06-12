@@ -122,13 +122,31 @@ def read_all_decisions(memory_dir) -> list[dict]:
     return out
 
 
-def _find(memory_dir, cycle: int, symbol: str, direction: str) -> dict | None:
+def _matches(
+    record: dict, cycle: int, symbol: str, direction: str, cadence: str | None
+) -> bool:
+    """Identity match on ``(cycle, symbol, direction)``, optionally narrowed by ``cadence``.
+
+    ``cadence`` disambiguates the documented weekly/daily cycle-N collision (account.py:15): when
+    supplied, a record matches only if its own ``cadence`` agrees (a record that never recorded a
+    cadence still matches, so legacy/cadence-less decisions keep working). When ``cadence`` is
+    ``None`` the match is the historical 3-tuple."""
+    if (
+        record.get("cycle") != cycle
+        or record.get("symbol") != symbol
+        or record.get("direction") != direction
+    ):
+        return False
+    if cadence is not None and record.get("cadence") not in (None, cadence):
+        return False
+    return True
+
+
+def _find(
+    memory_dir, cycle: int, symbol: str, direction: str, cadence: str | None = None
+) -> dict | None:
     for d in read_all_decisions(memory_dir):
-        if (
-            d.get("cycle") == cycle
-            and d.get("symbol") == symbol
-            and d.get("direction") == direction
-        ):
+        if _matches(d, cycle, symbol, direction, cadence):
             return d
     return None
 
@@ -141,18 +159,22 @@ def append_decision(
     direction: str,
     payload: dict | None = None,
     ts: datetime | None = None,
+    cadence: str | None = None,
 ) -> str:
     """Validate and append a Phase-1 decision keyed on ``(cycle, symbol, direction)``; return id.
 
-    IDEMPOTENT per ``(cycle, symbol, direction)``: a DUE RETRY re-running the same cycle re-journals
-    the same opens — without this guard that double-counts the open in hit-rate / per-agent stats /
-    reflection. If a decision for this key already exists, its id is returned and nothing is
-    appended. The key is unique per cycle (one open per symbol+direction per cycle; cycle numbers
-    are monotonic), so this never collides two legitimate decisions."""
-    existing = _find(memory_dir, cycle, symbol, direction)
+    IDEMPOTENT per ``(cycle, symbol, direction[, cadence])``: a DUE RETRY re-running the same cycle
+    re-journals the same opens — without this guard that double-counts the open in hit-rate /
+    per-agent stats / reflection. If a decision for this key already exists, its id is returned and
+    nothing is appended. ``cadence`` (``weekly``|``daily``), when supplied, is STORED on the record
+    and narrows the key so weekly cycle N and daily cycle N (which share a cycle number,
+    account.py:15) never collide — the close-time cost patch keys on the same ``cadence``."""
+    existing = _find(memory_dir, cycle, symbol, direction, cadence)
     if existing is not None:
         return existing["id"]  # already journaled this cycle's open -> reuse, don't duplicate
     data: dict = dict(payload or {})
+    if cadence is not None:
+        data["cadence"] = cadence
     data.update(
         id=data.get("id") or uuid.uuid4().hex,
         ts=ts or data.get("ts") or datetime.now(UTC),
@@ -175,21 +197,20 @@ def patch_outcome(
     symbol: str,
     direction: str,
     outcome: dict,
+    cadence: str | None = None,
 ) -> bool:
     """Merge Phase-2 outcome fields into the decision keyed by ``(cycle, symbol, direction)``.
 
     Rewrites the containing monthly file. The merged record is re-validated through ``Decision``
     (``extra="allow"``) so the alpha-vs-beta outcome fields round-trip while typed Phase-1 fields
-    stay coerced. Returns ``False`` if no decision matches the key."""
+    stay coerced. ``cadence``, when supplied, narrows the match so a daily patch at cycle N cannot
+    mis-key onto a weekly Decision at cycle N (account.py:15). Returns ``False`` if no decision
+    matches the key — an outcome for a leg that was never journaled is a silent fail-soft no-op."""
     for f in _all_files(memory_dir):
         records = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
         hit = False
         for r in records:
-            if (
-                r.get("cycle") == cycle
-                and r.get("symbol") == symbol
-                and r.get("direction") == direction
-            ):
+            if _matches(r, cycle, symbol, direction, cadence):
                 merged = Decision.model_validate({**r, **outcome})
                 r.clear()
                 r.update(json.loads(merged.model_dump_json()))
