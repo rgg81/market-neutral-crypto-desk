@@ -63,6 +63,18 @@ def _momentum_20(series: pd.Series) -> float:
     return float(series.iloc[-1] / series.iloc[-21] - 1.0)
 
 
+def _safe_depth(exchange, symbol: str) -> tuple[list, list]:
+    """(bids, asks) from exchange.depth, fail-soft to ([], []) when unavailable/raising."""
+    fn = getattr(exchange, "depth", None)
+    if not callable(fn):
+        return [], []
+    try:
+        book = fn(symbol)
+        return list(book.get("bids") or []), list(book.get("asks") or [])
+    except Exception:
+        return [], []
+
+
 def build_geometries(
     exchange,
     symbols: list[str],
@@ -70,6 +82,7 @@ def build_geometries(
     now: datetime,
     btc_symbol: str = "BTC/USDT:USDT",
     beta_lookback: int = 45,
+    universe_rows: dict[str, dict] | None = None,
 ) -> GeometryBundle:
     """One `CoinGeometry` per symbol from live (or faked) exchange reads.
 
@@ -91,6 +104,9 @@ def build_geometries(
             continue
         interval = funding_interval_hours(sym, exchange)
         rate = clamp_funding_rate(sym, raw_rate)
+        rows = universe_rows or {}
+        row = rows.get(sym, {})
+        bids, asks = _safe_depth(exchange, sym)
         geometries.append(CoinGeometry(
             symbol=sym,
             mark=mark,
@@ -101,7 +117,11 @@ def build_geometries(
             funding_rate=rate,
             funding_interval_hours=interval,
             funding_apr=funding_apr(rate, interval),
-            adv_usd=0.0,
+            adv_usd=float(row.get("vol_24h_usd") or 0.0),
+            chg_24h_pct=float(row.get("chg_24h_pct") or 0.0),
+            onboard_date=row.get("onboard_date"),
+            depth_bids=bids,
+            depth_asks=asks,
         ))
     return GeometryBundle(geometries=geometries, as_of_ts=now)
 

@@ -13,6 +13,7 @@ from futures_fund.cycle_prep import (
     build_pairs_and_spreads,
     build_sleeves,
 )
+from futures_fund.market_data import FundingInfo
 
 NOW = datetime(2026, 6, 11, tzinfo=UTC)
 
@@ -185,3 +186,46 @@ def test_coin_geometry_has_depth_and_quality_fields():
     # defaults: a geometry built with no depth has empty books, not None crashes
     assert _CG(symbol="X/USDT:USDT", mark=1.0).depth_bids == []
     assert _CG(symbol="X/USDT:USDT", mark=1.0).onboard_date is None
+
+
+_NOW_T7 = datetime(2026, 6, 12, tzinfo=UTC)
+
+
+class _GeoExchange:
+    def ohlcv(self, symbol, timeframe="4h", limit=500):
+        ts = pd.date_range("2025-01-01", periods=60, freq="4h", tz="UTC")
+        return pd.DataFrame({"timestamp": ts, "open": 100.0, "high": 100.0,
+                             "low": 100.0, "close": 100.0, "volume": 1.0})
+
+    def funding(self, symbol):
+        return FundingInfo(symbol=symbol, current_rate=0.0001,
+                           next_funding_ts=_NOW_T7, interval_hours=8.0,
+                           mark_price=100.0, index_price=100.0)
+
+    def mark_price(self, symbol):
+        return 100.0
+
+    def depth(self, symbol, limit=20):
+        return {"bids": [(99.0, 10.0)], "asks": [(101.0, 8.0)]}
+
+
+def test_build_geometries_stamps_adv_depth_and_quality_metadata():
+    rows = {"BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "vol_24h_usd": 2e9,
+                              "chg_24h_pct": 1.5, "onboard_date": 1567965300000}}
+    bundle = build_geometries(_GeoExchange(), ["BTC/USDT:USDT"], now=_NOW_T7,
+                              universe_rows=rows)
+    g = bundle.geometries[0]
+    assert g.adv_usd == 2e9
+    assert g.depth_asks == [(101.0, 8.0)]
+    assert g.depth_bids == [(99.0, 10.0)]
+    assert g.chg_24h_pct == 1.5
+    assert g.onboard_date == 1567965300000
+
+
+def test_build_geometries_fail_soft_without_depth_method():
+    class _NoDepth(_GeoExchange):
+        depth = None  # attribute present but not callable -> guarded
+    bundle = build_geometries(_NoDepth(), ["BTC/USDT:USDT"], now=_NOW_T7)
+    g = bundle.geometries[0]
+    assert g.depth_bids == [] and g.depth_asks == []
+    assert g.adv_usd == 0.0  # no universe_rows -> default

@@ -36,16 +36,15 @@ def _parse_now(raw: str | None) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
-def _symbols(state_dir, cycle: int, cadence: Cadence, settings) -> list[str]:
-    """Symbol set from this cycle's universe.json (scout output); fall back to settings.symbols."""
+def _universe_rows(state_dir, cycle: int, cadence: Cadence, settings) -> list[dict]:
+    """This cycle's universe.json rows (scout output); fall back to bare settings.symbols rows."""
     try:
         rows = load_output(state_dir, cycle, "universe", cadence=cadence)["universe"]
-        syms = [r["symbol"] for r in rows if r.get("symbol")]
-        if syms:
-            return syms
+        if rows:
+            return rows
     except FileNotFoundError:
         pass
-    return list(settings.symbols)
+    return [{"symbol": s} for s in settings.symbols]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -60,11 +59,13 @@ def main(argv: list[str] | None = None) -> None:
 
     settings = load_settings()
     ex = FuturesExchange.from_settings(settings)
-    symbols = _symbols(args.state_dir, args.cycle, cadence, settings)
+    rows = _universe_rows(args.state_dir, args.cycle, cadence, settings)
+    symbols = [r["symbol"] for r in rows if r.get("symbol")]
+    rows_by_sym = {r["symbol"]: r for r in rows if r.get("symbol")}
 
     bundle = build_geometries(
         ex, symbols, now=now, btc_symbol=settings.beta.btc_symbol,
-        beta_lookback=settings.beta.lookback_days,
+        beta_lookback=settings.beta.lookback_days, universe_rows=rows_by_sym,
     )
     pairs, spreads = build_pairs_and_spreads(ex, symbols, cycle=args.cycle, now=now)
     sleeves = build_sleeves(bundle.geometries, pairs=pairs, spreads=spreads, now=now)
