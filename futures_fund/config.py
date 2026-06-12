@@ -67,6 +67,11 @@ class UniverseSettings(BaseModel):
     symbol_count: int = 30
     min_adv_usd: float = 50_000_000.0
     crypto_only: bool = True
+    # Phase 10 quality filter (liquid + established only)
+    min_age_days: int = 30                 # exclude names listed < this many days ago
+    max_abs_chg_24h_pct: float = 25.0      # exclude extreme 24h movers (|chg| > this)
+    min_depth_usd: float = 250_000.0       # floor on FULL top-of-book notional (thinner side)
+    depth_ref_usd: float = 100_000.0       # reference clip for the slippage model (NOT a floor cap)
 
 
 class FeeSettings(BaseModel):

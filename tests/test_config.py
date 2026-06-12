@@ -4,6 +4,7 @@ from futures_fund.config import (
     DataSettings,
     ExchangeSettings,
     LoopSettings,
+    Settings,
     _default_loops,
     load_env_file,
     load_settings,
@@ -224,3 +225,44 @@ def test_load_settings_loads_dotenv_secrets_into_accessors(tmp_path, monkeypatch
     assert s.exchange.api_key == "env-key"
     assert s.exchange.api_secret == "env-secret"
     assert s.data.fred_api_key == "fred-key"
+
+
+def test_universe_settings_have_quality_knobs():
+    u = Settings().universe
+    assert u.min_age_days == 30
+    assert u.max_abs_chg_24h_pct == 25.0
+    assert u.min_depth_usd == 250_000.0
+    assert u.depth_ref_usd == 100_000.0
+
+
+def test_universe_quality_knobs_load_from_yaml(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "universe:\n"
+        "  symbol_count: 30\n"
+        "  min_adv_usd: 50000000\n"
+        "  min_age_days: 45\n"
+        "  max_abs_chg_24h_pct: 20\n"
+        "  min_depth_usd: 300000\n"
+        "  depth_ref_usd: 120000\n"
+    )
+    s = load_settings(cfg)
+    assert s.universe.min_age_days == 45
+    assert s.universe.max_abs_chg_24h_pct == 20.0
+    assert s.universe.min_depth_usd == 300_000.0
+    assert s.universe.depth_ref_usd == 120_000.0
+
+
+def test_carry_funding_cap_default_none_and_loads():
+    # default Settings() has an EMPTY sleeves dict -> no strategy cap (opt-in), so existing carry
+    # behavior is unchanged.
+    assert Settings().sleeves.get("carry", {}).get("max_abs_apr") is None
+
+
+def test_repo_config_yaml_carry_cap_is_nested_correctly():
+    # GUARD a YAML indent mistake: the carry block MUST be a sibling of factor:/pairs: under
+    # sleeves:, not a child of factor:. Reads the REPO config.yaml (not a tmp fixture).
+    s = load_settings("config.yaml")
+    assert s.sleeves["carry"]["max_abs_apr"] == 2.0
+    # factor: must still be its own sub-block (carry did not get nested inside it)
+    assert "carry" not in s.sleeves.get("factor", {})

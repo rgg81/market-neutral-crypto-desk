@@ -63,6 +63,11 @@ sleeves:
     min_half_life_cycles: 1.0
     max_half_life_cycles: 40.0
     rolling_retest_cycles: 7
+  carry:
+    # Extreme funding is a REVERSAL TRAP, not free alpha: clamp the |funding_apr| the carry sleeve
+    # ranks/sizes on so a blow-off name is treated as capped, not maximally attractive. null = no
+    # strategy cap (per-symbol realized clamp still applies upstream). 2.0 APR ~= a 0.0018/8h rate.
+    max_abs_apr: 2.0
 
 # --- sentiment ---
 sentiment:
@@ -71,11 +76,15 @@ sentiment:
   halflife_days: 3
   refresh_daily: true
 
-# --- universe ---
+# --- universe (liquid + established only, Phase 10) ---
 universe:
   symbol_count: 30
   min_adv_usd: 50000000
   crypto_only: true
+  min_age_days: 30            # exclude symbols listed < 30 days ago (reversal/illiquidity risk)
+  max_abs_chg_24h_pct: 25     # exclude extreme 24h movers (a +130% pump is not a tradeable edge)
+  min_depth_usd: 250000       # floor on the FULL top-of-book notional on the thinner side
+  depth_ref_usd: 100000       # reference clip the slippage model is measured at (not a floor cap)
 
 # --- fees / funding / slippage realism ---
 fees:
