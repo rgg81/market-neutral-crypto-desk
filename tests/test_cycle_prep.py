@@ -229,3 +229,15 @@ def test_build_geometries_fail_soft_without_depth_method():
     g = bundle.geometries[0]
     assert g.depth_bids == [] and g.depth_asks == []
     assert g.adv_usd == 0.0  # no universe_rows -> default
+
+
+def test_build_sleeves_threads_carry_cap_into_carry_signal():
+    geos = [_CG(symbol=f"{c}/USDT:USDT", mark=100.0, funding_apr=apr)
+            for c, apr in zip("ABCDEF", [20.0, 1.0, 0.5, -0.5, -1.0, -20.0], strict=True)]
+    sleeves = build_sleeves(geos, pairs=[], spreads=[], now=NOW, max_abs_apr=2.0)
+    carry = next(s for s in sleeves if s.sleeve == "carry")
+    scores = {t.symbol: t.raw_score for t in carry.tilts}
+    # the extreme +20 APR name is shorted with a CAPPED +2.0 raw_score (bounded by the cap)
+    assert scores["A/USDT:USDT"] == 2.0
+    assert scores["F/USDT:USDT"] == -2.0
+    assert carry.diagnostics["max_abs_apr"] == 2.0

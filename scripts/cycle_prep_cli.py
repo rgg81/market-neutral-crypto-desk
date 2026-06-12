@@ -68,7 +68,9 @@ def main(argv: list[str] | None = None) -> None:
         beta_lookback=settings.beta.lookback_days, universe_rows=rows_by_sym,
     )
     pairs, spreads = build_pairs_and_spreads(ex, symbols, cycle=args.cycle, now=now)
-    sleeves = build_sleeves(bundle.geometries, pairs=pairs, spreads=spreads, now=now)
+    carry_cap = (settings.sleeves.get("carry") or {}).get("max_abs_apr")
+    sleeves = build_sleeves(bundle.geometries, pairs=pairs, spreads=spreads, now=now,
+                            max_abs_apr=carry_cap)
 
     save_output(args.state_dir, args.cycle, "geometries", bundle, cadence=cadence)
     save_output(args.state_dir, args.cycle, "sleeves",

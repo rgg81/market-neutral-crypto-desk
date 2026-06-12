@@ -132,16 +132,17 @@ def build_sleeves(
     spreads: list[Spread],
     *,
     now: datetime,
+    max_abs_apr: float | None = None,
 ) -> list[SleeveSignal]:
     """Run all four alpha sleeves over the geometries (+ pairs/spreads), then assign risk-parity
     budgets across them via `neutrality.risk_parity_budgets` (the contract's single home for the
     budget split). `risk_budget_frac` starts at 0.0 on each sleeve and is filled in place by
-    `risk_parity_budgets`, which sums to 1.0 across the four. Closes the C1 gap: this is the only
-    producer that invokes the sleeve builders outside tests."""
+    `risk_parity_budgets`, which sums to 1.0 across the four. `max_abs_apr` bounds the extreme-
+    funding signal in BOTH carry exposures (the carry sleeve and the factor sleeve's carry leg)."""
     sleeves = [
-        carry_signal(geometries, risk_budget_frac=0.0, now=now),
+        carry_signal(geometries, risk_budget_frac=0.0, now=now, max_abs_apr=max_abs_apr),
         pairs_signal(pairs, spreads, risk_budget_frac=0.0, now=now),
-        factor_signal(geometries, risk_budget_frac=0.0, now=now),
+        factor_signal(geometries, risk_budget_frac=0.0, now=now, max_abs_apr=max_abs_apr),
         sentiment_factor_signal(geometries, risk_budget_frac=0.0, now=now),
     ]
     budgets = risk_parity_budgets(sleeves)
