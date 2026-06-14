@@ -12,3 +12,4 @@ live_state/
 live_memory/
 .claude/
 real_run.py
+cycle_detail.py

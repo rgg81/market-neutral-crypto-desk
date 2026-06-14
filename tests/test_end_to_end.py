@@ -91,7 +91,7 @@ def paper_env(tmp_path, monkeypatch):
     # overwrite. The dedicated no-seed E2E (test_end_to_end_no_seed.py) exercises the real
     # producers.
     monkeypatch.setattr("scripts.run_paper_cli._run_producers",
-                        lambda state_dir, cadence, cycle, now: None)
+                        lambda state_dir, cadence, cycle, now, memory_dir="memory": None)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
