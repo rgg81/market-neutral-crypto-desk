@@ -12,11 +12,12 @@ from futures_fund.account import (
 )
 from futures_fund.costs import count_funding_events
 from futures_fund.journal import append_decision, patch_outcome, read_all_decisions
+from futures_fund.learning import close_alpha_outcomes
 from futures_fund.self_audit import (
     invariant_account_equity_reconciles,
     invariant_cycle_funding_reconciles,
 )
-from scripts.run_paper_cli import _geometry_cost_maps, _leg_cost_patches
+from scripts.run_paper_cli import _geometry_cost_maps
 
 
 def _pos(symbol="ETH/USDT:USDT", direction="long", qty=2.0, entry=2000.0):
@@ -359,23 +360,27 @@ def test_geometry_cost_maps_from_bundle():
     assert costs["ETH/USDT:USDT"].adv_usd == 5_000_000.0
 
 
-def test_leg_cost_patches_drains_closed_legs_keyed_on_open_cycle():
-    """`_leg_cost_patches` emits ONE tuple per CLOSED leg (not per open position), keyed on the
-    cycle+cadence the leg was OPENED in — and drains the buffer so it is patched exactly once."""
+def test_close_alpha_outcomes_drains_closed_legs_keyed_on_open_cycle(tmp_path):
+    """`close_alpha_outcomes` emits ONE tuple per CLOSED leg (not per open position), keyed on the
+    cycle+cadence the leg was OPENED in. With NO opening Decision the patch is cost-only (historical
+    behaviour). Draining (`account.drain_closed_legs`) means it is patched exactly once."""
+    mem = tmp_path / "memory"
     acct = PaperAccount(cash=20_000.0)
     # an OPEN position must NOT be patched (its P&L is still unrealized — "at close" only).
     acct.positions["BTC/USDT:USDT"] = _pos(symbol="BTC/USDT:USDT", direction="long")
     acct.closed_legs.append(ClosedLeg(
         symbol="ETH/USDT:USDT", direction="short", opened_cycle=3, opened_cadence="weekly",
         fees=4.0, slippage=2.0, realized_funding=6.0, realized_pnl=12.0))
-    patches = _leg_cost_patches(acct)
+    patches = close_alpha_outcomes(mem, acct.drain_closed_legs(), marks={},
+                                   btc_symbol="BTC/USDT:USDT")
     assert patches == [
         (3, "weekly", "ETH/USDT:USDT", "short",
          {"fees": 4.0, "slippage": 2.0, "realized_funding": 6.0, "realized_pnl": 12.0}),
     ]
     # drained -> a second call yields nothing (patched exactly once).
-    assert _leg_cost_patches(acct) == []
     assert acct.closed_legs == []
+    assert close_alpha_outcomes(mem, acct.drain_closed_legs(), marks={},
+                                btc_symbol="BTC/USDT:USDT") == []
 
 
 def test_apply_fills_full_close_records_a_closed_leg_with_open_cycle():
@@ -422,7 +427,8 @@ def test_closed_leg_survives_account_round_trip():
 # --------------------------------------------------------------------------------------------------
 def _patch_closed_legs(memory_dir, account):
     """Mirror the run_paper_cli close-time loop: drain + patch each closed leg on its OPEN key."""
-    for cyc, cad, sym, direction, outcome in _leg_cost_patches(account):
+    for cyc, cad, sym, direction, outcome in close_alpha_outcomes(
+            memory_dir, account.drain_closed_legs(), marks={}, btc_symbol="BTC/USDT:USDT"):
         patch_outcome(memory_dir, cycle=cyc, symbol=sym, direction=direction,
                       outcome=outcome, cadence=cad)
 

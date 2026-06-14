@@ -39,6 +39,7 @@ from futures_fund.contracts import TargetWeights, WeightLeg
 from futures_fund.control_loop import cadence_due
 from futures_fund.cycle_io import load_output, save_output
 from futures_fund.journal import patch_outcome
+from futures_fund.learning import close_alpha_outcomes, journal_open_legs
 from futures_fund.models import Cadence
 from futures_fund.pnl_attribution import append_ledger, build_cycle_pnl
 from scripts.cycle_prep_cli import main as cycle_prep_main
@@ -167,21 +168,25 @@ def _run_reflect(state_dir, cadence: Cadence, cycle: int, memory_dir) -> None:
         print(f"WARNING: reflect step failed for {cadence} cycle {cycle}: {exc!r}", file=sys.stderr)
 
 
-def _run_producers(state_dir, cadence: Cadence, cycle: int, now: datetime) -> None:
+def _run_producers(
+    state_dir, cadence: Cadence, cycle: int, now: datetime, memory_dir="memory"
+) -> None:
     """Step 3b — scout the universe then build the cycle's upstream artifacts (geometries / sleeves
     / pairs / spreads) BEFORE the control-loop step consumes them. Closes C1: the loop no longer
     depends on a hand-seeded `_seed_upstream`. Both CLIs are seams (monkeypatched in tests) so the
     driver's ladder runs offline against a faked exchange. Idempotent on RETRY (overwrites the
-    cycle's artifacts in place)."""
+    cycle's artifacts in place). `memory_dir` lets cycle-prep read the lessons corpus for the
+    READ-BACK overlay (link 4) — a no-op until the desk has learned a lesson."""
     scout_main(["--cycle", str(cycle), "--cadence", cadence, "--state-dir", str(state_dir)])
     cycle_prep_main([
         "--cycle", str(cycle), "--cadence", cadence, "--state-dir", str(state_dir),
-        "--now", now.isoformat(),
+        "--memory-dir", str(memory_dir), "--now", now.isoformat(),
     ])
 
 
 def _run_cadence(
-    cadence: Cadence, state_dir, memory_dir, now: datetime, equity: float
+    cadence: Cadence, state_dir, memory_dir, now: datetime, equity: float,
+    btc_symbol: str = "BTC/USDT:USDT",
 ) -> bool:
     """Run ONE cadence end-to-end (Steps 4a-7a). Returns True if the cadence executed a cycle, False
     if its current candle was already served (SKIP — Step 3a). HALTs (`SystemExit(2)`) on a reviewer
@@ -191,7 +196,7 @@ def _run_cadence(
         return False  # candle already served -> stand down (no re-run)
 
     # Step 3b — producers: scout + cycle-prep write geometries/sleeves/pairs/spreads.
-    _run_producers(state_dir, cadence, cycle, now)
+    _run_producers(state_dir, cadence, cycle, now, memory_dir)
     # Step 4a — cadence step: persist target_weights.json under state/<cadence>/cycle/<cycle>/. For
     # daily this is the FULL recomputed (intended-holdings) book PLUS a separate
     # rebalance_trades.json carrying the sparse trade deltas.
@@ -234,6 +239,19 @@ def _run_cadence(
         intended, marks, costs,
         opened_ts=now, opened_cycle=cycle, opened_cadence=cadence,
     )
+    # LEARNING link 1 — JOURNAL AT ENTRY. Record a Phase-1 Decision for every currently-held leg
+    # (idempotent per leg, keyed on its OWN open cycle/cadence), carrying the entry context the
+    # alpha attribution needs. Without this the journal stays empty and every reflection is empty.
+    # Best-effort: capture is learning bookkeeping, never a fill precondition.
+    try:
+        journal_open_legs(
+            memory_dir, account, cycle=cycle, cadence=cadence,
+            leg_meta=_leg_meta(reviewed, bundle), marks=marks,
+            funding_by_symbol=funding_by_symbol, btc_symbol=btc_symbol,
+        )
+    except Exception as exc:  # noqa: BLE001 — journaling must not unwind an executed cycle
+        print(f"WARNING: journal-at-entry failed for {cadence} cycle {cycle}: {exc!r}",
+              file=sys.stderr)
     turnover = sum(abs(float(t.get("target_notional", 0.0))) for t in intended)
     equity_now = account.equity(marks)
     equity_log.record_equity(state_dir, now, equity_now, cycle)
@@ -242,16 +260,20 @@ def _run_cadence(
         cycle=cycle, cadence=cadence, now=now)
     save_output(state_dir, cycle, "pnl", rec, cadence=cadence)
     append_ledger(state_dir, rec)
-    # Patch each CLOSED leg's realized fees/slippage/funding/price-pnl onto the Decision that OPENED
-    # it (keyed on its OWN open cycle+cadence, NOT the current cycle — a leg held over from an
-    # earlier cycle keys on that earlier cycle, and weekly/daily cycle-N never collide). "At close":
-    # we patch legs that were fully closed this cycle, draining the account's closed-leg buffer so a
-    # leg is patched exactly once. The one genuine consumer is `improvement.carry_capture_rate`,
-    # which reads `realized_funding` off the closed Decision (paired with the `projected_funding`
-    # journaled at entry under the SAME open cycle+cadence key). Decision is extra="allow" so the
-    # cost fields round-trip; these are NOT the six alpha fields, so they do not make a Decision
-    # "closed" for the Reflector. patch_outcome returns False (fail-soft) for an un-journaled leg.
-    for cyc, cad, sym, direction, outcome in _leg_cost_patches(account):
+    # LEARNING link 2 — ALPHA OUTCOME AT CLOSE. Drain the legs fully closed this cycle and patch
+    # each onto the Decision that OPENED it (keyed on its OWN open cycle+cadence, NOT the current
+    # cycle — a held-over leg keys on its earlier cycle, and weekly/daily cycle-N never collide).
+    # When that Decision is found, the patch carries the six market-neutral ALPHA outcome fields
+    # (return NET of BTC-beta and NET of costs) so the Decision becomes "closed" for the Reflector
+    # AND the realized cost fields `improvement.carry_capture_rate` reads; a leg with no opening
+    # Decision (opened before capture was live) degrades to the historical cost-only patch
+    # (patch_outcome is fail-soft for an un-journaled leg). The book was reconciled to the neutral,
+    # reviewer-passed target this cycle, so neutrality_in_band reads the dollar residual / band.
+    neutrality_in_band = abs(getattr(reviewed, "dollar_residual_frac", 0.0)) <= 0.05
+    for cyc, cad, sym, direction, outcome in close_alpha_outcomes(
+        memory_dir, account.drain_closed_legs(), marks=marks, btc_symbol=btc_symbol,
+        neutrality_in_band=neutrality_in_band,
+    ):
         try:
             patch_outcome(memory_dir, cycle=cyc, symbol=sym, direction=direction,
                           outcome=outcome, cadence=cad)
@@ -261,7 +283,25 @@ def _run_cadence(
     # Persist AFTER draining so an already-patched closed leg is not re-patched on a later run.
     save_account(state_dir, account)
     _run_reflect(state_dir, cadence, cycle, memory_dir)
+    # LEARNING link 3 — mine candidate lessons from the alpha-keyed closed decisions and DSR-gate
+    # their promotion (so a proven edge becomes a standing rule the next book reads back).
+    _run_mine_lessons(state_dir, cadence, cycle, memory_dir, now)
     return True
+
+
+def _run_mine_lessons(state_dir, cadence: Cadence, cycle: int, memory_dir, now: datetime) -> None:
+    """Step 7b — distil candidate lessons from closed (alpha-keyed) decisions and gate
+    candidate->validated promotion on the desk's measured DSR (`build_scorecard`). Best-effort:
+    learning bookkeeping, never a fill precondition, so a mine-time error never unwinds a cycle."""
+    try:
+        from futures_fund.lesson_miner import mine_lessons
+        from futures_fund.scorecard import build_scorecard
+
+        dsr = float(build_scorecard(state_dir, memory_dir).get("dsr_pvalue", 0.0) or 0.0)
+        mine_lessons(memory_dir, now=now, dsr_pvalue=dsr)
+    except Exception as exc:  # noqa: BLE001 — lesson mining must not unwind an executed cycle
+        print(f"WARNING: lesson-mine step failed for {cadence} cycle {cycle}: {exc!r}",
+              file=sys.stderr)
 
 
 def _assert_legs_priced(book: TargetWeights, marks: dict[str, float]) -> None:
@@ -304,28 +344,31 @@ def _intended_fills(book: TargetWeights) -> list[dict]:
     ]
 
 
-def _leg_cost_patches(account) -> list[tuple[int | None, str | None, str, str, dict]]:
-    """Realized-cost journal patches for legs CLOSED this cycle ("at close").
+def _leg_meta(book: TargetWeights, bundle: dict) -> dict[str, dict]:
+    """Per-symbol entry context for the journal-at-entry capture (`learning.journal_open_legs`).
 
-    DRAINS `account.closed_legs` — the legs fully closed (popped from `positions`) since the last
-    drain — and emits one (open_cycle, open_cadence, symbol, direction, outcome_dict) tuple per leg.
-    The key is the cycle+cadence the leg was OPENED in (carried on the ClosedLeg), so a held-over
-    leg lands on the Decision that opened it (NOT the current cycle, which is finding 1's no-op) and
-    a daily close never mis-keys onto a weekly Decision at the same cycle number (finding 1's
-    cadence collision). Open positions are deliberately NOT patched — their P&L is still
-    unrealized; "at close" means the leg is done (finding 2)."""
-    out: list[tuple[int | None, str | None, str, str, dict]] = []
-    for leg in account.drain_closed_legs():
-        out.append((
-            leg.opened_cycle, leg.opened_cadence, leg.symbol, leg.direction,
-            {
-                "fees": leg.fees,
-                "slippage": leg.slippage,
-                "realized_funding": leg.realized_funding,
-                "realized_pnl": leg.realized_pnl,
-            },
-        ))
-    return out
+    Seeds from the cycle's geometries (so a HELD-OVER symbol not in this cycle's book still gets a
+    `beta_btc`/sentiment fallback), then overlays the reviewed book's authoritative per-leg
+    `beta_btc`/`sleeve`/`pair_id`. The held Position is the NET of any same-symbol legs, so a symbol
+    on both sides resolves to its book-leg metadata (last leg wins) — fine for attribution tags."""
+    meta: dict[str, dict] = {}
+    for g in bundle.get("geometries", []):
+        sym = g.get("symbol")
+        if not sym:
+            continue
+        meta[sym] = {
+            "beta_btc": float(g.get("beta_btc", 0.0) or 0.0),
+            "sleeve": None,
+            "pair_id": g.get("pair_id"),
+            "sentiment_score": float(g.get("sentiment_score", 0.0) or 0.0),
+            "regime": None,
+        }
+    for leg in book.legs:
+        m = meta.setdefault(leg.symbol, {"sentiment_score": 0.0, "regime": None})
+        m["beta_btc"] = leg.beta_btc
+        m["sleeve"] = str(leg.sleeve)
+        m["pair_id"] = leg.pair_id
+    return meta
 
 
 def _half_spread_bps(bids: list, asks: list, default: float) -> float:
@@ -397,7 +440,8 @@ def main(argv: list[str] | None = None) -> None:
         summary: dict[str, object] = {"ran_at": now.isoformat(), "live": settings.live,
                                       "cadences": {}}
         for cadence in _CADENCES:  # WEEKLY-FIRST, serialized
-            ran = _run_cadence(cadence, args.state_dir, args.memory_dir, now, equity)
+            ran = _run_cadence(cadence, args.state_dir, args.memory_dir, now, equity,
+                               btc_symbol=settings.beta.btc_symbol)
             mode, cycle, _reason = cadence_due(args.state_dir, now, cadence)
             summary["cadences"][cadence] = {  # type: ignore[index]
                 "ran": ran,

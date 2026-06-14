@@ -24,6 +24,8 @@ from futures_fund.cycle_prep import (
     build_sleeves,
 )
 from futures_fund.exchange import FuturesExchange
+from futures_fund.lesson_overlay import apply_lesson_overlay
+from futures_fund.lessons import read_lessons
 from futures_fund.models import Cadence
 
 _STATE_DIR = "state"
@@ -52,6 +54,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--cycle", type=int, required=True)
     ap.add_argument("--cadence", choices=["weekly", "daily"], required=True)
     ap.add_argument("--state-dir", default=_STATE_DIR)
+    ap.add_argument("--memory-dir", default="memory")
     ap.add_argument("--now", default=None)
     args = ap.parse_args(argv)
     cadence: Cadence = args.cadence
@@ -87,6 +90,12 @@ def main(argv: list[str] | None = None) -> None:
     carry_cap = (settings.sleeves.get("carry") or {}).get("max_abs_apr")
     sleeves = build_sleeves(alpha_geometries, pairs=pairs, spreads=spreads, now=now,
                             max_abs_apr=carry_cap)
+    # LEARNING link 4 — READ-BACK: tilt the sleeve convictions by the lessons corpus (validated
+    # standing rules at full strength, candidates reduced). `optimize_book` re-projects the book
+    # the dollar+beta-neutral set and re-applies caps + the deployment floor AFTER this, so the
+    # overlay can only re-shape relative conviction within the alpha legs — never break neutrality.
+    # No-op until the desk has actually learned something (empty corpus -> sleeves unchanged).
+    sleeves = apply_lesson_overlay(sleeves, read_lessons(args.memory_dir))
 
     save_output(args.state_dir, args.cycle, "geometries", bundle, cadence=cadence)
     save_output(args.state_dir, args.cycle, "sleeves",
