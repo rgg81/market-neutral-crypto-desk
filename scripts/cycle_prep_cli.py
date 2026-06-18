@@ -21,12 +21,14 @@ from futures_fund.cycle_io import load_output, save_output
 from futures_fund.cycle_prep import (
     build_geometries,
     build_pairs_and_spreads,
+    build_returns,
     build_sleeves,
 )
 from futures_fund.exchange import FuturesExchange
 from futures_fund.lesson_overlay import apply_lesson_overlay
 from futures_fund.lessons import read_lessons
 from futures_fund.models import Cadence
+from futures_fund.returns_frame import frame_to_json
 
 _STATE_DIR = "state"
 
@@ -87,6 +89,10 @@ def main(argv: list[str] | None = None) -> None:
     alpha_set = set(alpha_symbols)
     alpha_geometries = [g for g in bundle.geometries if g.symbol in alpha_set]
     pairs, spreads = build_pairs_and_spreads(ex, alpha_symbols, cycle=args.cycle, now=now)
+    # Per-symbol return frame for the optimizer's covariance (HRP shaping + cluster cap). Built over
+    # the ALPHA symbols (the cross-section the optimizer shapes); the hedge-only BTC geometry is not
+    # part of the alpha covariance. Empty frame (too little history) -> optimizer uses merged split.
+    returns = build_returns(ex, alpha_symbols)
     carry_cap = (settings.sleeves.get("carry") or {}).get("max_abs_apr")
     sleeves = build_sleeves(alpha_geometries, pairs=pairs, spreads=spreads, now=now,
                             max_abs_apr=carry_cap)
@@ -104,6 +110,7 @@ def main(argv: list[str] | None = None) -> None:
                 {"pairs": [p.model_dump(mode="json") for p in pairs]}, cadence=cadence)
     save_output(args.state_dir, args.cycle, "spreads",
                 {"spreads": [s.model_dump(mode="json") for s in spreads]}, cadence=cadence)
+    save_output(args.state_dir, args.cycle, "returns", frame_to_json(returns), cadence=cadence)
     print(json.dumps({"cycle": args.cycle, "cadence": cadence, "symbols": len(alpha_symbols),
                       "geometries": len(bundle.geometries),
                       "pairs": len(pairs), "spreads": len(spreads)}, indent=2))

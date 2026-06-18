@@ -24,6 +24,7 @@ from futures_fund.funding_intervals import (
     funding_interval_hours,
 )
 from futures_fund.neutrality import risk_parity_budgets
+from futures_fund.returns_frame import build_returns_frame
 from futures_fund.sleeves import (
     carry_signal,
     factor_signal,
@@ -124,6 +125,19 @@ def build_geometries(
             depth_asks=asks,
         ))
     return GeometryBundle(geometries=geometries, as_of_ts=now)
+
+
+def build_returns(
+    exchange, symbols: list[str], *, min_obs: int = 20
+) -> pd.DataFrame:
+    """Per-symbol return frame (rows=returns, cols=symbols) for the optimizer's covariance.
+
+    Feeds ``optimize_book``'s Ledoit-Wolf/HRP shaping AND the cluster cap (both inert when the loop
+    passes ``returns=None``). Reuses the SAME close series ``build_geometries`` reads
+    (``_marks_frame``) so the covariance window matches the geometry beta/vol window. Returns an
+    EMPTY frame when too few symbols have enough history — the optimizer then degrades to the merged
+    split (the prior behaviour), so this is always safe to wire in."""
+    return build_returns_frame(_marks_frame(exchange, symbols), min_obs=min_obs)
 
 
 def build_sleeves(

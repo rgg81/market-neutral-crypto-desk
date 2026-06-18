@@ -28,6 +28,7 @@ from futures_fund.control_loop import (
 from futures_fund.cycle_io import load_output
 from futures_fund.models import Cadence
 from futures_fund.neutrality import NeutralityConfig
+from futures_fund.returns_frame import frame_from_json
 
 _STATE_DIR = "state"
 
@@ -70,6 +71,19 @@ def _load_sleeves(state_dir: str, cycle: int, cadence: Cadence) -> list[SleeveSi
     return [SleeveSignal.model_validate(s) for s in raw_sleeves["sleeves"]]
 
 
+def _load_returns(state_dir: str, cycle: int, cadence: Cadence):
+    """Load the cycle's per-symbol return frame for the optimizer's covariance, or an EMPTY frame.
+
+    OPTIONAL input (unlike geometries/sleeves, which fail closed): a missing/empty `returns.json`
+    means the optimizer degrades to the merged split (HRP/cluster cap dormant) — the exact prior
+    behaviour — so we fail SOFT to an empty frame rather than exiting. The daily Rebalance reuses
+    the daily cycle's own returns artifact (same fixed symbol set as the weekly target)."""
+    try:
+        return frame_from_json(load_output(state_dir, cycle, "returns", cadence=cadence))
+    except FileNotFoundError:
+        return frame_from_json(None)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Run one weekly Selection / daily Rebalance meeting of the control loop."
@@ -84,6 +98,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = _neutrality_config(settings)
     equity = settings.account_size_usdt
     bundle = _load_geometries(args.state_dir, args.cycle, cadence)
+    returns = _load_returns(args.state_dir, args.cycle, cadence)
 
     if cadence == "weekly":
         # Sleeves are a WEEKLY-only input: only the Selection Meeting merges sleeve tilts in
@@ -109,6 +124,7 @@ def main(argv: list[str] | None = None) -> None:
             prior=prior,
             cfg=cfg,
             cycle=args.cycle,
+            returns=returns,
         )
     else:
         # Daily Rebalance keeps the SAME symbol set as the MOST RECENT weekly target. Weekly and
@@ -135,6 +151,7 @@ def main(argv: list[str] | None = None) -> None:
             equity=equity,
             cfg=cfg,
             cycle=args.cycle,
+            returns=returns,
         )
 
     print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))

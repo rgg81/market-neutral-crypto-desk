@@ -145,12 +145,15 @@ def _run_reviewer(state_dir, cadence: Cadence, cycle: int, memory_dir) -> None:
     ])
 
 
-def _run_execute(state_dir, cadence: Cadence, cycle: int) -> None:
+def _run_execute(state_dir, cadence: Cadence, cycle: int, now: datetime) -> None:
     """Step 6a — the gate+execute boundary (W10/D7) -> `report.json`. Re-checks `reviewer_gate_ok`
-    and HALTs (`SystemExit(2)`) if no passing verdict exists for this cadence cycle."""
+    and HALTs (`SystemExit(2)`) if no passing verdict exists for this cadence cycle. Passes the
+    LOGICAL `now` so the report's `ran_at` (and thus the due-gate's served candle) keys on the
+    cycle's logical time, not the file's wall-clock mtime — correct for pinned / offline runs."""
     from scripts.gate_execute_cli import main as gate_execute_main
 
-    gate_execute_main(["--cadence", cadence, "--cycle", str(cycle), "--state-dir", str(state_dir)])
+    gate_execute_main(["--cadence", cadence, "--cycle", str(cycle), "--state-dir", str(state_dir),
+                       "--now", now.isoformat()])
 
 
 def _run_reflect(state_dir, cadence: Cadence, cycle: int, memory_dir) -> None:
@@ -209,7 +212,7 @@ def _run_cadence(
     # Step 5a — reviewer gate (HARD VETO -> SystemExit(2) on a failed verdict).
     _run_reviewer(state_dir, cadence, cycle, memory_dir)
     # Step 6a — execute boundary (re-checks reviewer_gate_ok) -> report.json.
-    _run_execute(state_dir, cadence, cycle)
+    _run_execute(state_dir, cadence, cycle, now)
     # Step 7a — REALISTIC P&L: load the account, settle funding since the account's OWN funding
     # clock (NOT the cycle-collided equity series), reconcile the ACCOUNT to the FULL intended book
     # (`reviewed.legs` — the consolidated, neutral, hedge-correct book the reviewer validated), NOT
