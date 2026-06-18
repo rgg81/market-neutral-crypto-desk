@@ -32,13 +32,17 @@ class _FakeCyclePrepExchange:
         # salted by PYTHONHASHSEED and would make the built betas — and thus optimizer feasibility —
         # flaky across pytest invocations). Deterministic across processes.
         rng = np.random.default_rng(_UNIVERSE.index(symbol) + 1)
-        # all names track a common BTC factor (beta~1) + a small idiosyncratic component. The
-        # factor vol dominates the idio noise so the OLS beta-to-BTC of every name clusters tightly
-        # near 1.0 over the 45-point lookback — the precondition for a feasible dollar+beta-neutral
-        # book respecting the per-name cap. (Per the plan's debug note: raise factor / lower idio
-        # until betas cluster near 1.0; a test-data concern, the cointegration math is untouched.)
+        # All names share a common BTC factor PLUS a MATERIAL idiosyncratic component. Two
+        # competing preconditions: (1) the shared factor keeps the per-name beta-to-BTC SIMILAR
+        # across names (the precondition for a feasible dollar+beta-neutral book under the per-name
+        # cap), while (2) the idio is large enough that the per-symbol returns DIVERSIFY (pairwise
+        # corr ~0.45 < the 0.70 cluster threshold) — now load-bearing, because the optimizer
+        # consumes this cycle's `returns.json` for its Ledoit-Wolf/HRP shaping and cluster cap. A
+        # near-zero idio (the old value) makes the cross-section ~rank-1 (corr ~0.999), and the
+        # now-active cluster cap then can't form a capped book (feasible=False). Test-data only; the
+        # cointegration / neutrality math is untouched.
         factor = np.cumsum(np.random.default_rng(0).normal(0, 0.02, 120))
-        idio = rng.normal(0, 0.0003, 120)
+        idio = rng.normal(0, 0.012, 120)
         closes = _MARKS[symbol] * np.exp(factor + idio)
         ts = pd.date_range("2026-01-01", periods=120, freq="4h", tz="UTC")
         return pd.DataFrame({"timestamp": ts, "open": closes, "high": closes,
@@ -239,7 +243,7 @@ def test_wired_loop_held_account_book_is_dollar_neutral(no_seed_env):
 # A 7th name the week-2 reselection swaps DOGE for — extends the balanced beta~1 cross-section.
 _AVAX = "AVAX/USDT:USDT"
 _ALL_MARKS = {**_MARKS, _AVAX: 30.0}
-_ALL_FUNDING = {**_FUNDING, _AVAX: -0.0002}
+_ALL_FUNDING = {**_FUNDING, _AVAX: -0.0010}  # decisively negative -> carry sleeve longs new name
 _ALL_ORDER = list(_ALL_MARKS)  # stable RNG-seed index across both universes
 
 
@@ -260,7 +264,7 @@ def _drifting_universe_fakes(universe_cell):
         def ohlcv(self, symbol, timeframe="4h", limit=500):
             rng = np.random.default_rng(_ALL_ORDER.index(symbol) + 1)
             factor = np.cumsum(np.random.default_rng(0).normal(0, 0.02, 120))
-            idio = rng.normal(0, 0.0003, 120)
+            idio = rng.normal(0, 0.012, 120)
             closes = _ALL_MARKS[symbol] * np.exp(factor + idio)
             ts = pd.date_range("2026-01-01", periods=120, freq="4h", tz="UTC")
             return pd.DataFrame({"timestamp": ts, "open": closes, "high": closes,
@@ -433,7 +437,7 @@ class _HedgeOnlyBtcExchange:
     def ohlcv(self, symbol, timeframe="4h", limit=500):
         rng = np.random.default_rng(_HEDGE_ORDER.index(symbol) + 1)
         factor = np.cumsum(np.random.default_rng(0).normal(0, 0.02, 120))
-        idio = rng.normal(0, 0.0003, 120)
+        idio = rng.normal(0, 0.012, 120)
         closes = _ALL_MARKS[symbol] * np.exp(factor + idio)
         ts = pd.date_range("2026-01-01", periods=120, freq="4h", tz="UTC")
         return pd.DataFrame({"timestamp": ts, "open": closes, "high": closes,

@@ -82,6 +82,42 @@ def test_weekly_selection_runs_optimizer(tmp_path):
     assert [leg.symbol for leg in reloaded.legs] == [leg.symbol for leg in tw.legs]
 
 
+def test_weekly_selection_threads_returns_into_optimizer_hrp(tmp_path):
+    """The cluster-cap/HRP fix: a returns frame passed to weekly_selection must reach optimize_book
+    and SHAPE the book (Ledoit-Wolf -> HRP), so a covariance-aware run differs from returns=None.
+    Without the threading the two books are identical (the live bug: returns never reached the
+    optimizer, so HRP/cluster cap were dormant)."""
+    import numpy as np
+
+    from futures_fund.returns_frame import build_returns_frame
+
+    cfg = NeutralityConfig()
+    geometries = _broad_geometries()
+    sleeves = _broad_sleeves(NOW)
+    rng = np.random.default_rng(7)
+    # ADA/DOGE high-vol -> HRP de-weights them, redistributing weight on each side.
+    vols = {"BTC/USDT:USDT": 0.02, "SOL/USDT:USDT": 0.02, "ADA/USDT:USDT": 0.12,
+            "ETH/USDT:USDT": 0.02, "XRP/USDT:USDT": 0.02, "DOGE/USDT:USDT": 0.12}
+    import pandas as pd
+    marks = {s: pd.Series(100.0 * np.cumprod(1 + rng.normal(0, v, 80))) for s, v in vols.items()}
+    returns = build_returns_frame(marks, min_obs=20)
+    assert not returns.empty
+
+    tw_plain = weekly_selection(tmp_path / "p", geometries, _broad_sleeves(NOW),
+                                equity=20000.0, prior=None, cfg=cfg, cycle=1, returns=None)
+    tw_hrp = weekly_selection(tmp_path / "h", geometries, sleeves,
+                              equity=20000.0, prior=None, cfg=cfg, cycle=1, returns=returns)
+
+    def notional(tw, sym):
+        return sum(leg.target_notional for leg in tw.legs
+                   if leg.symbol == sym and leg.sleeve != "hedge")
+    # HRP shifted at least one per-name notional materially vs the merged split.
+    assert any(abs(notional(tw_hrp, s) - notional(tw_plain, s)) > 1.0 for s in vols)
+    # and the HRP book is still dollar+beta neutral (the fix never weakens neutrality).
+    assert tw_hrp.dollar_residual_frac <= cfg.dollar_band + 1e-6
+    assert abs(tw_hrp.beta_residual) <= cfg.beta_band + 1e-6
+
+
 def test_cadence_due_weekly_delegates_with_weekly_root(tmp_path, monkeypatch):
     seen = {}
 

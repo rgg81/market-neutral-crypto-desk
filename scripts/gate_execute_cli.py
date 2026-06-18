@@ -42,6 +42,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--cadence", choices=["weekly", "daily"], required=True)
     ap.add_argument("--cycle", type=int, required=True)
     ap.add_argument("--state-dir", default=_STATE_DIR)
+    ap.add_argument("--now", default=None,
+                    help="ISO-8601 LOGICAL cycle instant (UTC); default wall-clock. Stamped as the "
+                         "report's `ran_at` so the due-gate keys scheduling on the cycle's logical "
+                         "time — NOT file mtime — for pinned / offline / replayed runs.")
     args = ap.parse_args(argv)
     cadence: Cadence = args.cadence
 
@@ -76,7 +80,14 @@ def main(argv: list[str] | None = None) -> None:
     triggers = payload.get("triggers") or []
     cancel_triggers = payload.get("cancel_triggers") or []  # retire decayed armed triggers
 
-    now = datetime.now(UTC)  # gate-START instant
+    # gate-START instant — the LOGICAL cycle time when pinned (`--now`), else wall-clock. The
+    # report's `ran_at` is stamped from this and `scheduling._served_candle` floors it to the served
+    # candle, so a pinned/offline run schedules on its logical clock, not the file's wall mtime.
+    now = datetime.now(UTC)
+    if args.now is not None:
+        now = datetime.fromisoformat(args.now.replace("Z", "+00:00"))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
     report = gate_execute_step(
         ex,
         settings,

@@ -14,6 +14,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 from futures_fund.contracts import (
     CoinGeometry,
     SleeveSignal,
@@ -82,6 +84,7 @@ def weekly_selection(
     prior: TargetWeights | None,
     cfg: NeutralityConfig,
     cycle: int,
+    returns: pd.DataFrame | None = None,
 ) -> TargetWeights:
     """Weekly Selection Meeting (§9): full re-selection of the symbol set + target weights.
 
@@ -89,7 +92,9 @@ def weekly_selection(
     deployment-floor-respecting `TargetWeights`, then persists it under the cadence-segmented root
     `state/weekly/cycle/<cycle>/target_weights.json` (the SAME root the weekly due-gate reads —
     CADENCE-ROOT INVARIANT). When a `prior` book is supplied its legs seed the optimizer's
-    turnover/no-trade band so only the deltas are traded (carry-over, §9)."""
+    turnover/no-trade band so only the deltas are traded (carry-over, §9). `returns` (the per-symbol
+    return frame) feeds the optimizer's Ledoit-Wolf/HRP shaping AND the cluster cap; None (or empty)
+    degrades to the merged split (the historical behaviour)."""
     risk_parity_budgets(sleeves)
     tw = optimize_book(
         sleeves,
@@ -97,6 +102,7 @@ def weekly_selection(
         equity=equity,
         prior_legs=prior.legs if prior else None,
         cfg=cfg,
+        returns=returns,
     )
     save_output(state_dir, cycle, "target_weights", tw, cadence="weekly")
     return tw
@@ -185,6 +191,7 @@ def daily_rebalance(
     equity: float,
     cfg: NeutralityConfig,
     cycle: int,
+    returns: pd.DataFrame | None = None,
 ) -> TargetWeights:
     """Daily Rebalance Meeting (§9): nudge the SAME symbol set back toward target within a band.
 
@@ -219,6 +226,7 @@ def daily_rebalance(
         equity=equity,
         prior_legs=target.legs,
         cfg=cfg,
+        returns=returns,
     )
 
     # base delta book: only names whose notional moved (carry-over excludes unchanged overlap)
